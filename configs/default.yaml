@@ -1,0 +1,192 @@
+# Data ingestion
+ingestion:
+  # S&P 500 stocks available as CEDEARs in BYMA (132 symbols)
+  symbols:
+    - AAPL
+    - ABBV
+    - ABNB
+    - ABT
+    - ACN
+    - ADBE
+    - ADI
+    - ADP
+    - AIG
+    - AMAT
+    - AMD
+    - AMGN
+    - AMZN
+    - AVY
+    - AXP
+    - BAC
+    - BG
+    - BKR
+    - BRK-B
+    - C
+    - CAH
+    - CAT
+    - CCL
+    - CEG
+    - CL
+    - COIN
+    - COST
+    - CRM
+    - CSCO
+    - CVS
+    - CVX
+    - DAL
+    - DD
+    - DE
+    - DECK
+    - DHR
+    - DIS
+    - DOW
+    - EA
+    - EBAY
+    - ECL
+    - EFX
+    - F
+    - FCX
+    - FDX
+    - FSLR
+    - GE
+    - GILD
+    - GLW
+    - GM
+    - GOOGL
+    - GRMN
+    - GS
+    - HAL
+    - HD
+    - HON
+    - HPQ
+    - HSY
+    - HWM
+    - IBM
+    - IFF
+    - INTC
+    - IP
+    - ISRG
+    - JCI
+    - JNJ
+    - JPM
+    - KMB
+    - KO
+    - LLY
+    - LMT
+    - LRCX
+    - LVS
+    - MA
+    - MCD
+    - MDLZ
+    - MDT
+    - META
+    - MMM
+    - MO
+    - MOS
+    - MRK
+    - MRNA
+    - MSFT
+    - MSI
+    - MU
+    - NEM
+    - NFLX
+    - NKE
+    - NOW
+    - NUE
+    - NVDA
+    - ORCL
+    - ORLY
+    - OXY
+    - PANW
+    - PCAR
+    - PEP
+    - PFE
+    - PG
+    - PLTR
+    - PM
+    - PSX
+    - PYPL
+    - QCOM
+    - ROST
+    - RTX
+    - SBUX
+    - SCHW
+    - SLB
+    - SPGI
+    - SYY
+    - T
+    - TGT
+    - TJX
+    - TMO
+    - TMUS
+    - TRV
+    - TSLA
+    - TXN
+    - UAL
+    - UBER
+    - UNH
+    - UNP
+    - USB
+    - V
+    - VRTX
+    - VST
+    - VZ
+    - WFC
+    - WMT
+    - XOM
+  start_years_back: 10  # dynamically computed as today - N years
+  end_date: null  # null = today
+
+# Feature engineering
+features:
+  windows: [5, 10, 20, 50, 200]
+  treasury_rates: true
+  vix: true
+  indicators:
+    - sma
+    - ema
+    - rsi
+    - macd
+    - bollinger_bands
+    - atr
+    - volume_sma
+
+# Target
+target:
+  horizon: 63        # trading days ahead (~3 months)
+  threshold: 0.03    # 3% minimum return for positive label
+
+# Model
+model:
+  type: lstm
+  input_size: null  # auto-calculated from features
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.3
+  sequence_length: 30
+
+# Training
+training:
+  batch_size: 64
+  max_epochs: 200
+  learning_rate: 0.001
+  weight_decay: 0.01
+  label_smoothing: 0.05
+  early_stopping_patience: 20
+  # Temporal splits (relative to today, with purge gaps)
+  test_years: 2        # last 2 years = test
+  val_years: 1         # 1 year before test = validation
+  purge_days: 63       # gap between splits = target horizon (avoids label leakage)
+
+# Evaluation & Risk Management
+evaluation:
+  initial_capital: 100000
+  commission_pct: 0.001
+  confidence_threshold: 0.6
+  benchmark: SPY
+  # Risk management
+  max_positions: 20            # max concurrent positions (equal-weight)
+  position_stop_loss: 0.08     # exit position if it drops 8% from entry
+  position_take_profit: 0.50   # exit position if it gains 20% from entry
+  max_drawdown_limit: 0.25     # stop trading if portfolio drawdown hits 25%
+  cooldown_days: 2            # days to wait after circuit breaker triggers

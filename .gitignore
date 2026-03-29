@@ -1,0 +1,37 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Docker volumes
+pgdata/
+mlruns/
+
+# Data artifacts
+data/
+
+# Model checkpoints
+*.ckpt
+lightning_logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+*.egg-info/
+dist/
+build/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# UV
+.python-version
