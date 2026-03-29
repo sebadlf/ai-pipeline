@@ -2,24 +2,66 @@
 
 ## Project overview
 
-Local ML pipeline for evaluating stock trading strategies on 132 S&P 500 stocks available as CEDEARs in the Argentine market. Runs on a Mac Mini M4 Pro (24GB RAM) using a hybrid architecture: infrastructure in Docker, compute native on macOS to leverage MPS GPU acceleration. Designed for daily retraining with fully relative date splits and purge gaps to prevent label leakage.
+Local ML pipeline for evaluating stock trading strategies on the full S&P 500 universe (~503 stocks, fetched dynamically from the FMP API). Runs on a Mac Mini M4 Pro (24GB RAM) using a hybrid architecture: infrastructure in Docker, compute native on macOS to leverage MPS GPU acceleration. The pipeline uses a 5-stage architecture: stock clustering, per-cluster model training, prediction aggregation, portfolio optimization, and regime-aware backtesting.
+
+## Architecture — 5-Stage Pipeline
+
+### Stage 1: Stock Clustering
+- Divides stocks first by GICS sector, then clusters within each sector using KMeans on behavioral features (return profile, volatility, volume, RSI, beta)
+- Output: cluster assignments (`data/clusters.parquet`, `cluster_assignments` table)
+
+### Stage 2: Per-Cluster Model Training
+- Trains one LSTM model per cluster for ternary classification: BUY/SELL/HOLD
+  - **BUY**: stock rises ≥ buy_threshold (default +5%) in 63 trading days
+  - **SELL**: stock drops ≥ sell_threshold (default -3%) in 63 trading days
+  - **HOLD**: neither condition met
+- Thresholds are configurable per cluster as hyperparameters
+- Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`)
+
+### Stage 3: Result Aggregation
+- Consolidates predictions from all per-cluster models into unified results
+- Output: predictions table with confidence scores and class probabilities (`data/predictions.parquet`)
+
+### Stage 4: Portfolio Design (3 profiles)
+
+**Aggressive Portfolio** (maximize return):
+- Primary: Sortino | Complementary: Omega | Validation: Information ratio
+- Allows short positions from SELL signals
+
+**Moderate Portfolio** (risk/return balance):
+- Primary: Sharpe | Complementary: Calmar | Validation: Sortino
+- Long-only
+
+**Conservative Portfolio** (capital preservation):
+- Primary: Calmar | Complementary: Sortino | Validation: Sharpe
+- Long-only, higher confidence threshold
+
+Output: portfolio allocations with optimized weights (`data/portfolios.parquet`)
+
+### Stage 5: Regime-Aware Backtesting
+- Detects market regimes (bull/bear/sideways) using SPY SMA crossover + trailing returns
+- Backtests each portfolio across each regime
+- Computes all metrics: Sharpe, Sortino, Calmar, Omega, Information ratio, max drawdown
+- Generates markdown reports in `data/backtest_reports/`
 
 ## Architecture decisions
 
 ### Hybrid Docker / Native split
 
 **Docker Compose** (infrastructure, stateful services):
-- PostgreSQL with TimescaleDB extension — stores OHLCV, treasury rates, VIX data and serves as MLflow backend store
+- PostgreSQL with TimescaleDB extension — stores OHLCV, treasury rates, VIX data, sectors, clusters, predictions, portfolios, backtest results. Serves as MLflow backend store
 - MLflow Tracking Server (v3.10.1) — experiment tracking, run comparison, model registry. Exposes UI on `localhost:5000`
 - Volumes: `./pgdata` for Postgres persistence, `./mlruns` for MLflow artifacts
 - All services share a Docker network called `ml-network`
 
 **Native macOS** (compute, leverages MPS):
-- Data ingestion scripts: FMP API → PostgreSQL (OHLCV, treasury rates, VIX)
+- Data ingestion scripts: FMP API → PostgreSQL (OHLCV, treasury rates, VIX, GICS sectors)
 - Feature engineering with Polars (technical indicators + macro features)
+- Stock clustering with scikit-learn (KMeans per sector)
 - Model training with PyTorch Lightning (`accelerator="mps"`)
-- Portfolio backtesting with risk management
-- Strategy execution: load champion model and generate BUY/HOLD signals
+- Portfolio optimization with scipy (SLSQP)
+- Regime-aware backtesting with comprehensive risk metrics
+- Strategy execution: load champion models and generate BUY/SELL/HOLD signals
 
 ### Why this split
 Docker on Apple Silicon runs Linux VMs — PyTorch inside Docker has NO access to MPS. Training natively gives us GPU acceleration. Infrastructure (Postgres, MLflow) runs perfectly in Docker and benefits from containerization (reproducibility, isolation, easy teardown).
@@ -38,11 +80,13 @@ Configured via relative durations in `configs/default.yaml`, computed by `comput
 
 | Layer | Tool | Purpose |
 |---|---|---|
-| Data source | financialmodelingprep.com API | OHLCV, treasury rates, VIX |
+| Data source | financialmodelingprep.com API | OHLCV, treasury rates, VIX, GICS sectors |
 | Database | PostgreSQL + TimescaleDB | Time-series storage, hypertables |
 | Feature engineering | Polars | Rolling windows, technical indicators, macro features |
-| ML framework | PyTorch | LSTM-based binary classifier (BUY/HOLD) |
+| Clustering | scikit-learn | KMeans per sector, silhouette score validation |
+| ML framework | PyTorch | LSTM-based ternary classifier (BUY/SELL/HOLD) |
 | Training wrapper | PyTorch Lightning | Training loop, MPS support, MLflow auto-logging |
+| Portfolio optimization | scipy | SLSQP optimizer for multi-objective portfolio design |
 | Experiment tracking | MLflow | Tracking, comparison, artifact storage, model registry |
 | Dependency management | UV | Fast Python package manager |
 | Orchestration | Makefile | Task runner for pipeline steps |
@@ -62,39 +106,65 @@ ai-pipeline/
 ├── configs/
 │   └── default.yaml               # All hyperparameters and experiment config
 ├── src/
-│   ├── config.py                  # Config loading, compute_split_dates(), SplitDates
-│   ├── db.py                      # SQLAlchemy schema (ohlcv_daily, treasury_rates, vix_daily)
+│   ├── config.py                  # Config loading, SplitDates, ClusterConfig, etc.
+│   ├── db.py                      # SQLAlchemy schema (9 tables)
 │   ├── keys.py                    # Environment variable loading
 │   ├── ingestion/
-│   │   └── fmp_loader.py          # FMP API → PostgreSQL (OHLCV, treasury, VIX)
+│   │   └── fmp_loader.py          # FMP API → PostgreSQL (OHLCV, treasury, VIX, sectors)
 │   ├── features/
-│   │   └── technical.py           # Polars feature engineering (indicators + macro)
+│   │   ├── technical.py           # Polars feature engineering (indicators + macro)
+│   │   └── clustering.py          # Stage 1: KMeans clustering by sector
 │   ├── models/
-│   │   ├── base_model.py          # LSTMForecaster (Lightning module)
-│   │   └── dataset.py             # TradingDataModule with temporal splits + purge gaps
+│   │   ├── base_model.py          # LSTMForecaster (3-class Lightning module)
+│   │   └── dataset.py             # TradingDataModule with per-cluster filtering
 │   ├── training/
-│   │   └── train.py               # Training with MLflow logging
+│   │   └── train.py               # Stage 2: Per-cluster training with MLflow
+│   ├── aggregation/
+│   │   └── consolidate.py         # Stage 3: Merge per-cluster predictions
+│   ├── portfolio/
+│   │   ├── metrics.py             # Sharpe, Sortino, Omega, Calmar, Information ratio
+│   │   └── optimizer.py           # Stage 4: Multi-profile portfolio optimization
 │   ├── evaluation/
-│   │   ├── backtest.py            # Portfolio-level backtesting with risk management
-│   │   └── promote.py             # Promote best model to MLflow registry
+│   │   ├── regime.py              # Market regime detection (bull/bear/sideways)
+│   │   ├── backtest.py            # Stage 5: Regime-aware portfolio backtesting
+│   │   └── promote.py             # Promote best per-cluster models to registry
 │   └── strategy/
-│       └── runner.py              # Load champion model, generate BUY/HOLD signals
-├── data/                          # Feature parquet files (gitignored)
+│       └── runner.py              # Load champion models, generate BUY/SELL/HOLD signals
+├── data/                          # Feature parquet files, clusters, predictions, portfolios
 ├── tests/
 │   ├── test_features.py
+│   ├── test_clustering.py
+│   ├── test_aggregation.py
+│   ├── test_portfolio_metrics.py
+│   ├── test_portfolio_optimizer.py
+│   ├── test_regime.py
 │   └── test_backtest.py
 └── notebooks/
 ```
 
+## Database tables
+
+| Table | Purpose |
+|---|---|
+| `ohlcv_daily` | Daily OHLCV price data |
+| `treasury_rates` | US Treasury rates (2Y, 10Y, 30Y) |
+| `vix_daily` | VIX volatility index data |
+| `stock_sectors` | GICS sector mapping per symbol |
+| `cluster_assignments` | Stage 1 output: stock-to-cluster mapping |
+| `predictions` | Stage 3 output: aggregated BUY/SELL/HOLD predictions |
+| `portfolio_allocations` | Stage 4 output: optimized weights per profile |
+| `backtest_results` | Stage 5 output: metrics per (profile, regime) |
+
 ## Key connections
 
-- Ingestion writes to Postgres via SQLAlchemy (OHLCV, treasury rates, VIX)
+- Ingestion writes to Postgres via SQLAlchemy (OHLCV, treasury rates, VIX, GICS sectors)
 - Features reads from Postgres, transforms with Polars, outputs `data/features.parquet`
-- Training uses PyTorch Lightning with `MLFlowLogger` pointing to `http://localhost:5000`
+- Clustering reads sectors from DB + features, assigns clusters with KMeans, outputs `data/clusters.parquet`
+- Training iterates over clusters, creates per-cluster MLflow experiments, trains LSTM models
+- Aggregation loads per-cluster models, runs inference, outputs `data/predictions.parquet`
+- Portfolio optimizer uses predictions + historical returns to construct 3 risk-profiled portfolios
+- Backtesting simulates portfolios across bull/bear/sideways regimes, computes all metrics
 - Data is normalized using training-set statistics only (Z-score), applied to val/test/inference
-- Evaluation runs a portfolio backtest with risk management (stop-loss, take-profit, drawdown circuit breaker)
-- Promote finds the best training run (highest `val_acc` with checkpoint) and registers it as `champion` in MLflow
-- Strategy loads the champion model and generates per-symbol BUY/HOLD signals
 
 ## Makefile targets
 
@@ -102,13 +172,18 @@ ai-pipeline/
 make setup       # Create venv and install dependencies with UV
 make up          # docker compose up -d (Postgres + MLflow)
 make down        # docker compose down
-make ingest      # FMP API → PostgreSQL (OHLCV + treasury + VIX)
+make ingest      # FMP API → PostgreSQL (OHLCV + treasury + VIX + sectors)
 make features    # Generate feature parquet from DB
-make train       # Train LSTM with Lightning + MPS, log to MLflow
-make evaluate    # Portfolio backtest on test set, log metrics
-make promote     # Register best model as champion in MLflow
-make signals     # Generate BUY/HOLD signals from champion model
-make pipeline    # Run: ingest → features → train → evaluate
+make cluster     # Stage 1: Cluster stocks by sector
+make train       # Stage 2: Train LSTM per cluster
+make train-cluster CLUSTER=Tech_0  # Train single cluster
+make aggregate   # Stage 3: Consolidate predictions
+make portfolio   # Stage 4: Optimize 3 portfolio profiles
+make backtest    # Stage 5: Regime-aware backtesting
+make promote     # Register best per-cluster models as champions
+make signals     # Generate BUY/SELL/HOLD signals
+make pipeline    # Run: ingest → features → cluster → train → aggregate → portfolio → backtest
+make test        # Run all tests
 ```
 
 ## Environment variables
@@ -126,23 +201,38 @@ MLFLOW_TRACKING_URI=http://localhost:5000
 ## Model details
 
 - **Architecture**: LSTM with LayerNorm, GELU activation, 2 layers, 128 hidden units
-- **Task**: Binary classification — probability of ≥3% gain in 63 trading days (~3 months)
+- **Task**: Ternary classification — BUY (≥+5%), SELL (≤-3%), HOLD (neither) in 63 trading days
+- **Thresholds**: Configurable per cluster in `configs/default.yaml` under `clustering.cluster_thresholds`
 - **Regularization**: Dropout (0.3), weight decay, gradient clipping (1.0), label smoothing (0.05)
 - **Optimizer**: AdamW with ReduceLROnPlateau scheduler
 - **Early stopping**: Monitors `val_acc`, patience 20 epochs
+- **Loss**: CrossEntropyLoss with label smoothing
 
 ## Features
 
 - **Technical indicators**: SMA, EMA, RSI, MACD, Bollinger Bands, ATR, volume SMA (at windows 5, 10, 20, 50, 200)
 - **Returns**: 1-day, 5-day, 20-day returns
 - **Macro**: US Treasury rates (2Y, 10Y, 30Y), yield spreads (10Y-2Y, 30Y-10Y), VIX (close, SMA, percentile, regime)
+- **Clustering features**: Return profile, volatility, volume, RSI, beta vs SPY
+
+## Portfolio metrics
+
+| Metric | Formula | Use |
+|---|---|---|
+| Sharpe | excess_return / total_volatility | Moderate primary |
+| Sortino | excess_return / downside_volatility | Aggressive primary |
+| Calmar | annual_return / max_drawdown | Conservative primary |
+| Omega | sum(gains) / sum(losses) | Aggressive complementary |
+| Information | excess_vs_benchmark / tracking_error | Aggressive validation |
 
 ## Risk management (backtest)
 
-- Max 20 concurrent equal-weight positions
 - Per-position stop-loss at -8%, take-profit at +50%
 - Portfolio drawdown circuit breaker at -25% with 2-day cooldown
+- Sector weight limits per profile (20-30%)
+- Max single position weight: 10%
 - Commission: 0.1%
+- Monthly rebalance (21 trading days)
 
 ## Constraints and preferences
 
@@ -162,6 +252,9 @@ docker compose up -d
 # Run full pipeline
 make pipeline
 
+# Train a specific cluster
+make train-cluster CLUSTER=Technology_0
+
 # Generate trading signals
 make signals
 
@@ -170,9 +263,16 @@ open http://localhost:5000
 
 # Run with UV directly
 uv run python -m src.ingestion.fmp_loader
-uv run python -m src.training.train
+uv run python -m src.features.clustering
+uv run python -m src.training.train --cluster Technology_0
+uv run python -m src.aggregation.consolidate
+uv run python -m src.portfolio.optimizer
+uv run python -m src.evaluation.backtest
 uv run python -m src.strategy.runner --symbols AAPL NVDA TSLA
 
 # Check Postgres
 docker exec -it trading-postgres psql -U trading -d trading
+
+# Run tests
+make test
 ```

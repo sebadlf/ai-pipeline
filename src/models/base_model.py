@@ -8,12 +8,13 @@ import torch.nn as nn
 
 
 class LSTMForecaster(L.LightningModule):
-    """LSTM-based time series forecaster with regularization for calibrated outputs.
+    """LSTM-based time series forecaster for ternary classification (BUY/SELL/HOLD).
 
     Args:
         input_size: Number of input features per timestep.
         hidden_size: LSTM hidden dimension.
         num_layers: Number of stacked LSTM layers.
+        num_classes: Number of output classes (3: HOLD=0, BUY=1, SELL=2).
         dropout: Dropout rate between LSTM layers.
         learning_rate: Optimizer learning rate.
         weight_decay: L2 regularization strength.
@@ -25,6 +26,7 @@ class LSTMForecaster(L.LightningModule):
         input_size: int,
         hidden_size: int = 128,
         num_layers: int = 2,
+        num_classes: int = 3,
         dropout: float = 0.3,
         learning_rate: float = 0.001,
         weight_decay: float = 0.0,
@@ -33,7 +35,7 @@ class LSTMForecaster(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.learning_rate = learning_rate
-        self.label_smoothing = label_smoothing
+        self.num_classes = num_classes
 
         self.input_norm = nn.LayerNorm(input_size)
 
@@ -50,15 +52,10 @@ class LSTMForecaster(L.LightningModule):
             nn.Linear(hidden_size, hidden_size // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
+            nn.Linear(hidden_size // 2, num_classes),
         )
 
-        self.loss_fn = nn.BCEWithLogitsLoss()
-
-    def _smooth_labels(self, y: torch.Tensor) -> torch.Tensor:
-        """Apply label smoothing: 0 -> eps, 1 -> 1-eps."""
-        eps = self.label_smoothing
-        return y * (1 - 2 * eps) + eps
+        self.loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -67,7 +64,7 @@ class LSTMForecaster(L.LightningModule):
             x: Input tensor of shape (batch, seq_len, features).
 
         Returns:
-            Logits of shape (batch, 1).
+            Logits of shape (batch, num_classes).
         """
         x = self.input_norm(x)
         lstm_out, _ = self.lstm(x)
@@ -75,27 +72,32 @@ class LSTMForecaster(L.LightningModule):
         return self.head(last_hidden)
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Return probability of positive class (price up >= threshold)."""
-        return torch.sigmoid(self(x)).squeeze(-1)
+        """Return class probabilities [prob_hold, prob_buy, prob_sell]."""
+        return torch.softmax(self(x), dim=-1)
 
     def _step(self, batch: tuple[torch.Tensor, torch.Tensor], stage: str) -> torch.Tensor:
         x, y = batch
-        logits = self(x).squeeze(-1)
+        y = y.long()
+        logits = self(x)
+        loss = self.loss_fn(logits, y)
 
-        if stage == "train":
-            loss = self.loss_fn(logits, self._smooth_labels(y))
-        else:
-            loss = self.loss_fn(logits, y)
-
-        probs = torch.sigmoid(logits)
-        preds = (probs >= 0.5).float()
+        preds = logits.argmax(dim=-1)
         acc = (preds == y).float().mean()
 
         self.log(f"{stage}_loss", loss, prog_bar=True)
         self.log(f"{stage}_acc", acc, prog_bar=True)
 
         if stage == "val":
-            self.log("val_mean_prob", probs.mean(), prog_bar=True)
+            probs = torch.softmax(logits, dim=-1)
+            self.log("val_mean_prob_buy", probs[:, 1].mean(), prog_bar=True)
+            self.log("val_mean_prob_sell", probs[:, 2].mean(), prog_bar=True)
+
+            # Per-class accuracy
+            for cls_idx, cls_name in enumerate(["hold", "buy", "sell"]):
+                mask = y == cls_idx
+                if mask.sum() > 0:
+                    cls_acc = (preds[mask] == y[mask]).float().mean()
+                    self.log(f"val_acc_{cls_name}", cls_acc)
 
         return loss
 

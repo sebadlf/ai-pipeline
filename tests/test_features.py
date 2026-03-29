@@ -12,6 +12,7 @@ from src.features.technical import (
     add_returns,
     add_rsi,
     add_sma,
+    add_ternary_target,
     add_volume_sma,
 )
 
@@ -90,3 +91,41 @@ def test_add_returns(sample_ohlcv: pl.DataFrame) -> None:
     assert "return_1d" in result.columns
     assert "return_5d" in result.columns
     assert "return_20d" in result.columns
+
+
+def test_add_ternary_target(sample_ohlcv: pl.DataFrame) -> None:
+    """Ternary target should produce values 0 (HOLD), 1 (BUY), 2 (SELL)."""
+    result = add_ternary_target(sample_ohlcv, horizon=5, buy_threshold=0.02, sell_threshold=0.02)
+    assert "target" in result.columns
+    valid = result.filter(pl.col("target").is_not_null())
+    unique_vals = set(valid["target"].unique().to_list())
+    assert unique_vals.issubset({0, 1, 2}), f"Unexpected target values: {unique_vals}"
+
+
+def test_ternary_target_thresholds() -> None:
+    """Verify that thresholds correctly separate BUY/SELL/HOLD."""
+    # Create data where forward return is deterministic
+    n = 20
+    close = [100.0] * n
+    # Set prices so that forward return at horizon=5 is known
+    # Row 0: close=100, row 5: close=110 -> +10% -> BUY
+    close[5] = 110.0
+    # Row 1: close=100, row 6: close=90 -> -10% -> SELL
+    close[6] = 90.0
+    # Row 2: close=100, row 7: close=101 -> +1% -> HOLD
+    close[7] = 101.0
+
+    df = pl.DataFrame({
+        "symbol": ["TEST"] * n,
+        "date": pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 1, 1) + pl.duration(days=n - 1), eager=True),
+        "close": close,
+    })
+
+    result = add_ternary_target(df, horizon=5, buy_threshold=0.05, sell_threshold=0.05)
+    targets = result["target"].to_list()
+    # Row 0: +10% > +5% -> BUY (1)
+    assert targets[0] == 1
+    # Row 1: -10% < -5% -> SELL (2)
+    assert targets[1] == 2
+    # Row 2: +1% in [-5%, +5%] -> HOLD (0)
+    assert targets[2] == 0

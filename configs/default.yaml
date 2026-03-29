@@ -1,139 +1,10 @@
 # Data ingestion
 ingestion:
-  # S&P 500 stocks available as CEDEARs in BYMA (132 symbols)
-  symbols:
-    - AAPL
-    - ABBV
-    - ABNB
-    - ABT
-    - ACN
-    - ADBE
-    - ADI
-    - ADP
-    - AIG
-    - AMAT
-    - AMD
-    - AMGN
-    - AMZN
-    - AVY
-    - AXP
-    - BAC
-    - BG
-    - BKR
-    - BRK-B
-    - C
-    - CAH
-    - CAT
-    - CCL
-    - CEG
-    - CL
-    - COIN
-    - COST
-    - CRM
-    - CSCO
-    - CVS
-    - CVX
-    - DAL
-    - DD
-    - DE
-    - DECK
-    - DHR
-    - DIS
-    - DOW
-    - EA
-    - EBAY
-    - ECL
-    - EFX
-    - F
-    - FCX
-    - FDX
-    - FSLR
-    - GE
-    - GILD
-    - GLW
-    - GM
-    - GOOGL
-    - GRMN
-    - GS
-    - HAL
-    - HD
-    - HON
-    - HPQ
-    - HSY
-    - HWM
-    - IBM
-    - IFF
-    - INTC
-    - IP
-    - ISRG
-    - JCI
-    - JNJ
-    - JPM
-    - KMB
-    - KO
-    - LLY
-    - LMT
-    - LRCX
-    - LVS
-    - MA
-    - MCD
-    - MDLZ
-    - MDT
-    - META
-    - MMM
-    - MO
-    - MOS
-    - MRK
-    - MRNA
-    - MSFT
-    - MSI
-    - MU
-    - NEM
-    - NFLX
-    - NKE
-    - NOW
-    - NUE
-    - NVDA
-    - ORCL
-    - ORLY
-    - OXY
-    - PANW
-    - PCAR
-    - PEP
-    - PFE
-    - PG
-    - PLTR
-    - PM
-    - PSX
-    - PYPL
-    - QCOM
-    - ROST
-    - RTX
-    - SBUX
-    - SCHW
-    - SLB
-    - SPGI
-    - SYY
-    - T
-    - TGT
-    - TJX
-    - TMO
-    - TMUS
-    - TRV
-    - TSLA
-    - TXN
-    - UAL
-    - UBER
-    - UNH
-    - UNP
-    - USB
-    - V
-    - VRTX
-    - VST
-    - VZ
-    - WFC
-    - WMT
-    - XOM
+  # Fetch all S&P 500 constituents dynamically from FMP API
+  source: sp500
+  # Benchmark symbols needed for beta, regime detection, and backtesting
+  benchmark_symbols:
+    - SPY
   start_years_back: 10  # dynamically computed as today - N years
   end_date: null  # null = today
 
@@ -151,10 +22,11 @@ features:
     - atr
     - volume_sma
 
-# Target
+# Target — ternary classification (BUY/SELL/HOLD)
 target:
-  horizon: 63        # trading days ahead (~3 months)
-  threshold: 0.03    # 3% minimum return for positive label
+  horizon: 63          # trading days ahead (~3 months)
+  buy_threshold: 0.05  # +5% for BUY signal
+  sell_threshold: 0.03 # -3% for SELL signal (applied as negative)
 
 # Model
 model:
@@ -162,6 +34,7 @@ model:
   input_size: null  # auto-calculated from features
   hidden_size: 128
   num_layers: 2
+  num_classes: 3    # HOLD=0, BUY=1, SELL=2
   dropout: 0.3
   sequence_length: 30
 
@@ -173,20 +46,87 @@ training:
   weight_decay: 0.01
   label_smoothing: 0.05
   early_stopping_patience: 20
+  per_cluster: true
+  cluster_experiment_prefix: "cluster"
   # Temporal splits (relative to today, with purge gaps)
   test_years: 2        # last 2 years = test
   val_years: 1         # 1 year before test = validation
   purge_days: 63       # gap between splits = target horizon (avoids label leakage)
 
-# Evaluation & Risk Management
-evaluation:
+# Clustering — Stage 1
+clustering:
+  method: kmeans
+  n_clusters_per_sector: 3
+  features_for_clustering:
+    - return_20d_mean
+    - volatility_60d
+    - volume_profile
+    - rsi_14_mean
+    - beta_60d
+  min_cluster_size: 3
+  output_parquet: data/clusters.parquet
+  # Per-cluster threshold overrides (populated after initial clustering run).
+  # Keys are cluster_id strings; missing clusters use target defaults.
+  cluster_thresholds: {}
+    # Example:
+    # Technology_0:
+    #   buy_threshold: 0.07
+    #   sell_threshold: 0.04
+
+# Aggregation — Stage 3
+aggregation:
+  output_parquet: data/predictions.parquet
+
+# Portfolio optimization — Stage 4
+portfolio:
+  profiles:
+    aggressive:
+      primary_metric: sortino
+      complementary_metric: omega
+      validation_metric: information
+      max_positions: 25
+      max_sector_weight: 0.30
+      min_confidence: 0.50
+      allow_short: true
+    moderate:
+      primary_metric: sharpe
+      complementary_metric: calmar
+      validation_metric: sortino
+      max_positions: 20
+      max_sector_weight: 0.25
+      min_confidence: 0.55
+      allow_short: false
+    conservative:
+      primary_metric: calmar
+      complementary_metric: sortino
+      validation_metric: sharpe
+      max_positions: 15
+      max_sector_weight: 0.20
+      min_confidence: 0.60
+      allow_short: false
+  constraints:
+    max_single_position: 0.10
+    min_single_position: 0.01
+    rebalance_frequency_days: 21
+  benchmark: SPY
+  output_parquet: data/portfolios.parquet
+
+# Market regime detection — Stage 5
+regime:
+  benchmark: SPY
+  lookback_days: 126         # 6 months of trading days
+  bull_threshold: 0.10       # annualized return > 10% = bull
+  bear_threshold: -0.10      # annualized return < -10% = bear
+  sma_short: 50
+  sma_long: 200
+
+# Backtesting — Stage 5
+backtest:
   initial_capital: 100000
   commission_pct: 0.001
-  confidence_threshold: 0.6
-  benchmark: SPY
-  # Risk management
-  max_positions: 20            # max concurrent positions (equal-weight)
-  position_stop_loss: 0.08     # exit position if it drops 8% from entry
-  position_take_profit: 0.50   # exit position if it gains 20% from entry
-  max_drawdown_limit: 0.25     # stop trading if portfolio drawdown hits 25%
-  cooldown_days: 2            # days to wait after circuit breaker triggers
+  risk:
+    position_stop_loss: 0.08
+    position_take_profit: 0.50
+    max_drawdown_limit: 0.25
+    cooldown_days: 2
+  output_dir: data/backtest_reports

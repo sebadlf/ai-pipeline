@@ -15,10 +15,30 @@ import httpx
 from sqlalchemy import text
 
 from src.config import load_config
-from src.db import get_engine, init_db, ohlcv_daily
+from src.db import get_engine, init_db
 from src.keys import FMP_API_KEY
 
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
+
+
+def fetch_sp500_constituents(api_key: str | None = None) -> list[str]:
+    """Fetch current S&P 500 constituent symbols from FMP API.
+
+    Returns:
+        Sorted list of ticker symbols.
+    """
+    api_key = api_key or FMP_API_KEY
+    if not api_key:
+        raise ValueError("FMP_API_KEY not set")
+
+    url = f"{FMP_BASE_URL}/sp500-constituent"
+    resp = httpx.get(url, params={"apikey": api_key}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    symbols = sorted({row["symbol"].replace(".", "-") for row in data})
+    print(f"Fetched {len(symbols)} S&P 500 constituents from FMP")
+    return symbols
 
 
 def fetch_ohlcv(
@@ -233,6 +253,74 @@ def upsert_ohlcv(engine, rows: list[dict]) -> int:
     return inserted
 
 
+def fetch_sectors(
+    symbols: list[str],
+    api_key: str | None = None,
+) -> list[dict]:
+    """Fetch GICS sector information for symbols from FMP API.
+
+    Args:
+        symbols: List of ticker symbols.
+        api_key: FMP API key. Defaults to FMP_API_KEY env var.
+    """
+    api_key = api_key or FMP_API_KEY
+    if not api_key:
+        raise ValueError("FMP_API_KEY not set")
+
+    results = []
+    for symbol in symbols:
+        url = f"{FMP_BASE_URL}/profile"
+        params = {"symbol": symbol, "apikey": api_key}
+        try:
+            resp = httpx.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if data and len(data) > 0:
+                profile = data[0]
+                results.append({
+                    "symbol": symbol,
+                    "sector": profile.get("sector", "Unknown"),
+                    "sub_industry": profile.get("industry"),
+                })
+        except httpx.HTTPStatusError:
+            results.append({
+                "symbol": symbol,
+                "sector": "Unknown",
+                "sub_industry": None,
+            })
+
+    return results
+
+
+def upsert_sectors(engine, rows: list[dict]) -> int:
+    """Insert or update stock sector rows.
+
+    Args:
+        engine: SQLAlchemy engine.
+        rows: List of sector dicts with symbol, sector, sub_industry.
+
+    Returns:
+        Number of rows inserted/updated.
+    """
+    if not rows:
+        return 0
+
+    inserted = 0
+    with engine.begin() as conn:
+        for row in rows:
+            stmt = text("""
+                INSERT INTO stock_sectors (symbol, sector, sub_industry, updated_at)
+                VALUES (:symbol, :sector, :sub_industry, NOW())
+                ON CONFLICT (symbol) DO UPDATE SET
+                    sector = EXCLUDED.sector,
+                    sub_industry = EXCLUDED.sub_industry,
+                    updated_at = NOW()
+            """)
+            result = conn.execute(stmt, row)
+            inserted += result.rowcount
+    return inserted
+
+
 def main() -> None:
     """Run data ingestion for configured symbols and treasury rates."""
     config = load_config()
@@ -242,8 +330,20 @@ def main() -> None:
     today = dt.date.today()
     default_start = today.replace(year=today.year - start_years_back).isoformat()
 
+    # Resolve symbol list: dynamic from API or static from config
+    source = ingestion_cfg.get("source", "static")
+    if source == "sp500":
+        all_symbols = fetch_sp500_constituents()
+    else:
+        all_symbols = list(ingestion_cfg["symbols"])
+
+    # Append benchmark symbols (SPY, etc.) if not already present
+    for bm in ingestion_cfg.get("benchmark_symbols", []):
+        if bm not in all_symbols:
+            all_symbols.append(bm)
+
     parser = argparse.ArgumentParser(description="Ingest FMP OHLCV data")
-    parser.add_argument("--symbols", nargs="+", default=ingestion_cfg["symbols"])
+    parser.add_argument("--symbols", nargs="+", default=all_symbols)
     parser.add_argument("--start", default=default_start)
     parser.add_argument("--end", default=ingestion_cfg.get("end_date"))
     parser.add_argument(
@@ -251,6 +351,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--skip-vix", action="store_true", help="Skip VIX ingestion"
+    )
+    parser.add_argument(
+        "--skip-sectors", action="store_true", help="Skip GICS sector ingestion"
     )
     args = parser.parse_args()
 
@@ -294,6 +397,13 @@ def main() -> None:
             f"  VIX: {n_vix} rows inserted/updated"
             f" ({len(vix_rows)} fetched)"
         )
+
+    # --- GICS sector ingestion ---
+    if not args.skip_sectors:
+        print("\nFetching GICS sectors...")
+        sector_rows = fetch_sectors(args.symbols)
+        n_sectors = upsert_sectors(engine, sector_rows)
+        print(f"  Sectors: {n_sectors} rows inserted/updated ({len(sector_rows)} symbols)")
 
 
 if __name__ == "__main__":

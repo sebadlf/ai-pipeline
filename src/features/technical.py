@@ -157,19 +157,29 @@ def add_returns(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def add_target(
-    df: pl.DataFrame, horizon: int = 63, threshold: float = 0.03
+def add_ternary_target(
+    df: pl.DataFrame,
+    horizon: int = 63,
+    buy_threshold: float = 0.05,
+    sell_threshold: float = 0.03,
 ) -> pl.DataFrame:
-    """Add binary classification target: 1 if price rises >= threshold in horizon days.
+    """Add ternary classification target: HOLD=0, BUY=1, SELL=2.
 
     Args:
         df: DataFrame with close prices.
-        horizon: Number of trading days ahead (63 ≈ 3 months).
-        threshold: Minimum return to label as positive (0.03 = 3%).
+        horizon: Number of trading days ahead (63 ~ 3 months).
+        buy_threshold: Minimum positive return for BUY (e.g. 0.05 = +5%).
+        sell_threshold: Minimum negative return for SELL (e.g. 0.03 = -3%, applied as negative).
     """
     forward_return = pl.col("close").pct_change(horizon).shift(-horizon).over("symbol")
     return df.with_columns(
-        (forward_return >= threshold).cast(pl.Float32).alias("target"),
+        pl.when(forward_return >= buy_threshold)
+        .then(pl.lit(1))
+        .when(forward_return <= -sell_threshold)
+        .then(pl.lit(2))
+        .otherwise(pl.lit(0))
+        .cast(pl.Int64)
+        .alias("target"),
     )
 
 
@@ -227,12 +237,13 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
     ])
     df = df.with_columns(ratio_exprs)
 
-    # Target: binary classification (needs close column)
+    # Target: ternary classification BUY/SELL/HOLD (needs close column)
     target_cfg = config.get("target", {})
-    df = add_target(
+    df = add_ternary_target(
         df,
         horizon=target_cfg.get("horizon", 63),
-        threshold=target_cfg.get("threshold", 0.03),
+        buy_threshold=target_cfg.get("buy_threshold", 0.05),
+        sell_threshold=target_cfg.get("sell_threshold", 0.03),
     )
 
     # Drop absolute price columns (keep only scale-invariant features)
