@@ -21,3 +21,6 @@ POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "changeme")
 
 # MLflow
 MLFLOW_TRACKING_URI: str = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+
+# Pipeline environment: "dev" (default) or "prod"
+PIPELINE_ENV: str = os.getenv("PIPELINE_ENV", "dev")

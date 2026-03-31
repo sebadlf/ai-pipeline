@@ -12,8 +12,8 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 
 ### Stage 2: Per-Cluster Model Training
 - Trains one LSTM model per cluster for ternary classification: BUY/SELL/HOLD
-  - **BUY**: stock rises ≥ buy_threshold (default +5%) in 63 trading days
-  - **SELL**: stock drops ≥ sell_threshold (default -3%) in 63 trading days
+  - **BUY**: stock rises ≥ buy_threshold (default +2.5%) in 21 trading days
+  - **SELL**: stock drops ≥ sell_threshold (default -1.5%) in 21 trading days
   - **HOLD**: neither condition met
 - Thresholds are configurable per cluster as hyperparameters
 - Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`)
@@ -55,8 +55,9 @@ Output: portfolio allocations with optimized weights (`data/portfolios.parquet`)
 - All services share a Docker network called `ml-network`
 
 **Native macOS** (compute, leverages MPS):
-- Data ingestion scripts: FMP API → PostgreSQL (OHLCV, treasury rates, VIX, GICS sectors)
-- Feature engineering with Polars (technical indicators + macro features)
+- Data ingestion scripts: FMP API → PostgreSQL (OHLCV, adj close, treasury 12 tenors, VIX, key metrics, financial ratios, sector performance, GICS sectors)
+- Feature engineering with Polars (technical indicators + macro + fundamentals + sector features)
+- Feature selection (null filter, variance filter, correlation filter)
 - Stock clustering with scikit-learn (KMeans per sector)
 - Model training with PyTorch Lightning (`accelerator="mps"`)
 - Portfolio optimization with scipy (SLSQP)
@@ -68,10 +69,10 @@ Docker on Apple Silicon runs Linux VMs — PyTorch inside Docker has NO access t
 
 ### Temporal split design
 
-All date boundaries are computed relative to `date.today()` to support daily retraining. Purge gaps of 63 trading days (~3 months, matching the target horizon) between splits prevent label leakage.
+All date boundaries are computed relative to `date.today()` to support daily retraining. Purge gaps of 21 trading days (~1 month, matching the target horizon) between splits prevent label leakage.
 
 ```
-train (7yr) | PURGE 63d | val (1yr) | PURGE 63d | test (2yr) | today
+train (17yr) | PURGE 21d | val (1yr) | PURGE 21d | test (2yr) | today
 ```
 
 Configured via relative durations in `configs/default.yaml`, computed by `compute_split_dates()` in `src/config.py`.
@@ -80,7 +81,7 @@ Configured via relative durations in `configs/default.yaml`, computed by `comput
 
 | Layer | Tool | Purpose |
 |---|---|---|
-| Data source | financialmodelingprep.com API | OHLCV, treasury rates, VIX, GICS sectors |
+| Data source | financialmodelingprep.com API | OHLCV, adj close, treasury (12 tenors), VIX, key metrics, ratios, sector perf, GICS sectors |
 | Database | PostgreSQL + TimescaleDB | Time-series storage, hypertables |
 | Feature engineering | Polars | Rolling windows, technical indicators, macro features |
 | Clustering | scikit-learn | KMeans per sector, silhouette score validation |
@@ -110,9 +111,10 @@ ai-pipeline/
 │   ├── db.py                      # SQLAlchemy schema (9 tables)
 │   ├── keys.py                    # Environment variable loading
 │   ├── ingestion/
-│   │   └── fmp_loader.py          # FMP API → PostgreSQL (OHLCV, treasury, VIX, sectors)
+│   │   └── fmp_loader.py          # FMP API → PostgreSQL (OHLCV, adj close, treasury 12 tenors, VIX, key metrics, ratios, sector perf, sectors)
 │   ├── features/
-│   │   ├── technical.py           # Polars feature engineering (indicators + macro)
+│   │   ├── technical.py           # Polars feature engineering (indicators + macro + fundamentals + sector)
+│   │   ├── selection.py           # Feature selection (null/variance/correlation filters)
 │   │   └── clustering.py          # Stage 1: KMeans clustering by sector
 │   ├── models/
 │   │   ├── base_model.py          # LSTMForecaster (3-class Lightning module)
@@ -146,9 +148,12 @@ ai-pipeline/
 
 | Table | Purpose |
 |---|---|
-| `ohlcv_daily` | Daily OHLCV price data |
-| `treasury_rates` | US Treasury rates (2Y, 10Y, 30Y) |
+| `ohlcv_daily` | Daily OHLCV + adj_close price data |
+| `treasury_rates` | US Treasury rates (12 tenors: 1M to 30Y) |
 | `vix_daily` | VIX volatility index data |
+| `key_metrics_quarterly` | Quarterly key metrics per symbol (JSONB) |
+| `financial_ratios_quarterly` | Quarterly financial ratios per symbol (JSONB) |
+| `sector_performance_daily` | Historical sector performance (avg daily change) |
 | `stock_sectors` | GICS sector mapping per symbol |
 | `cluster_assignments` | Stage 1 output: stock-to-cluster mapping |
 | `predictions` | Stage 3 output: aggregated BUY/SELL/HOLD predictions |
@@ -157,14 +162,17 @@ ai-pipeline/
 
 ## Key connections
 
-- Ingestion writes to Postgres via SQLAlchemy (OHLCV, treasury rates, VIX, GICS sectors)
-- Features reads from Postgres, transforms with Polars, outputs `data/features.parquet`
+- Ingestion writes to Postgres via SQLAlchemy (OHLCV + adj close, treasury 12 tenors, VIX, key metrics, financial ratios, sector performance, GICS sectors)
+- Features reads from Postgres, transforms with Polars, outputs `data/features.parquet`. Uses adj_close for all price-derived indicators when available
+- Feature selection filters by null rate, variance, and correlation, outputs `data/features_selected.parquet` and `data/selected_features.json` manifest
+- Training and aggregation read from `features_selected.parquet` when feature selection is enabled; runner filters to selected features at inference time
 - Clustering reads sectors from DB + features, assigns clusters with KMeans, outputs `data/clusters.parquet`
 - Training iterates over clusters, creates per-cluster MLflow experiments, trains LSTM models
 - Aggregation loads per-cluster models, runs inference, outputs `data/predictions.parquet`
 - Portfolio optimizer uses predictions + historical returns to construct 3 risk-profiled portfolios
 - Backtesting simulates portfolios across bull/bear/sideways regimes, computes all metrics
 - Data is normalized using training-set statistics only (Z-score), applied to val/test/inference
+- TimeSeriesDataset uses symbol-boundary-aware indexing — windows never cross from one stock's data into another's
 
 ## Makefile targets
 
@@ -172,8 +180,9 @@ ai-pipeline/
 make setup       # Create venv and install dependencies with UV
 make up          # docker compose up -d (Postgres + MLflow)
 make down        # docker compose down
-make ingest      # FMP API → PostgreSQL (OHLCV + treasury + VIX + sectors)
+make ingest      # FMP API → PostgreSQL (OHLCV, adj close, treasury, VIX, fundamentals, sector perf, sectors)
 make features    # Generate feature parquet from DB
+make select-features  # Feature selection (null/variance/correlation filters)
 make cluster     # Stage 1: Cluster stocks by sector
 make train       # Stage 2: Train LSTM per cluster
 make train-cluster CLUSTER=Tech_0  # Train single cluster
@@ -182,7 +191,7 @@ make portfolio   # Stage 4: Optimize 3 portfolio profiles
 make backtest    # Stage 5: Regime-aware backtesting
 make promote     # Register best per-cluster models as champions
 make signals     # Generate BUY/SELL/HOLD signals
-make pipeline    # Run: ingest → features → cluster → train → aggregate → portfolio → backtest
+make pipeline    # Run: ingest → features → select-features → cluster → train → aggregate → portfolio → backtest
 make test        # Run all tests
 ```
 
@@ -196,12 +205,13 @@ POSTGRES_DB=trading
 POSTGRES_USER=trading
 POSTGRES_PASSWORD=     # Set in .env, never commit
 MLFLOW_TRACKING_URI=http://localhost:5000
+PIPELINE_ENV=dev       # dev (5yr data) or prod (20yr data), default: dev
 ```
 
 ## Model details
 
 - **Architecture**: LSTM with LayerNorm, GELU activation, 2 layers, 128 hidden units
-- **Task**: Ternary classification — BUY (≥+5%), SELL (≤-3%), HOLD (neither) in 63 trading days
+- **Task**: Ternary classification — BUY (≥+2.5%), SELL (≤-1.5%), HOLD (neither) in 21 trading days
 - **Thresholds**: Configurable per cluster in `configs/default.yaml` under `clustering.cluster_thresholds`
 - **Regularization**: Dropout (0.3), weight decay, gradient clipping (1.0), label smoothing (0.05)
 - **Optimizer**: AdamW with ReduceLROnPlateau scheduler
@@ -210,10 +220,21 @@ MLFLOW_TRACKING_URI=http://localhost:5000
 
 ## Features
 
-- **Technical indicators**: SMA, EMA, RSI, MACD, Bollinger Bands, ATR, volume SMA (at windows 5, 10, 20, 50, 200)
-- **Returns**: 1-day, 5-day, 20-day returns
-- **Macro**: US Treasury rates (2Y, 10Y, 30Y), yield spreads (10Y-2Y, 30Y-10Y), VIX (close, SMA, percentile, regime)
-- **Clustering features**: Return profile, volatility, volume, RSI, beta vs SPY
+All price-derived indicators (SMAs, EMAs, RSI, MACD, Bollinger, ATR, etc.) use `adj_close` when available, ensuring consistency between indicators and target labels.
+
+- **Technical indicators**: SMA, EMA, RSI, MACD, Bollinger Bands, ATR, Stochastic Oscillator (%K, %D), volume SMA (at windows 5, 10, 20, 50, 200)
+- **Returns**: 1-day, 5-day, 20-day returns (from dividend-adjusted close)
+- **Volatility**: Multi-window realized volatility (5d, 20d, 60d rolling std of returns), ATR ratio, mean-reversion z-score
+- **Volume**: Relative volume, OBV rate-of-change (20d)
+- **Macro**: US Treasury rates (12 tenors: 1M to 30Y), 8 yield spreads + curve slope, daily changes per tenor, lagged spreads (5d, 20d)
+- **VIX**: Close, SMA(5/20), SMA20 ratio, intraday range, VIX percentile rank (252d rolling min/max), lagged VIX (5d, 20d)
+- **Cross-sectional**: Relative strength vs SPY (20d return minus SPY 20d return)
+- **Fundamentals**: ~20 key metrics + ~20 financial ratios, quarterly data forward-filled to daily, with true quarter-over-quarter changes (computed on quarterly data before asof join)
+- **Sector performance**: Daily sector avg change, 5d/20d sector momentum, relative-to-sector performance
+- **Time encoding**: Cyclical sin/cos encoding of day-of-week and month-of-year
+- **Clustering features**: Behavioral, fundamental, macro-sensitivity, and sector-relative features with PCA and auto-K selection
+- **Feature selection**: Post-engineering filter removing >90% null features, near-zero variance, and highly correlated pairs (>0.95). Output (`features_selected.parquet`) is consumed by training, aggregation, and inference when enabled
+- **Null handling**: Fundamentals are forward-filled per symbol, remaining nulls are median-filled per symbol, only rows with null returns/target are dropped
 
 ## Portfolio metrics
 

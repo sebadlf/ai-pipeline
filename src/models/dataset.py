@@ -17,12 +17,17 @@ EXCLUDE_COLS = {"id", "symbol", "date", "target", "adj_close"}
 
 
 class TimeSeriesDataset(Dataset):
-    """Sliding window dataset over feature matrix.
+    """Sliding window dataset with symbol-boundary-aware indexing.
+
+    Only yields windows that fall entirely within a single symbol's
+    time series, preventing cross-symbol contamination.
 
     Args:
-        features: Feature array of shape (timesteps, n_features).
-        targets: Target array of shape (timesteps,).
+        features: Flat feature array of shape (total_timesteps, n_features).
+        targets: Flat target array of shape (total_timesteps,).
         seq_len: Number of timesteps per sample.
+        valid_indices: Pre-computed starting indices for windows that
+            do not cross symbol boundaries.
         target_dtype: Torch dtype for targets (int64 for classification).
     """
 
@@ -31,18 +36,30 @@ class TimeSeriesDataset(Dataset):
         features: np.ndarray,
         targets: np.ndarray,
         seq_len: int,
+        valid_indices: np.ndarray,
         target_dtype: torch.dtype = torch.int64,
+        is_train: bool = False,
+        noise_std: float = 0.01,
     ) -> None:
         self.features = torch.tensor(features, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=target_dtype)
         self.seq_len = seq_len
+        self.valid_indices = valid_indices
+        self.is_train = is_train
+        self.noise_std = noise_std
 
     def __len__(self) -> int:
-        return len(self.features) - self.seq_len
+        return len(self.valid_indices)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.features[idx : idx + self.seq_len]
-        y = self.targets[idx + self.seq_len]
+        start = int(self.valid_indices[idx])
+        x = self.features[start : start + self.seq_len]
+        y = self.targets[start + self.seq_len]
+
+        # Gaussian noise augmentation during training only
+        if self.is_train and self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
+
         return x, y
 
 
@@ -94,6 +111,7 @@ class TradingDataModule(L.LightningDataModule):
         self.clusters_parquet = clusters_parquet
 
         self.feature_cols: list[str] = []
+        self.class_weights: list[float] | None = None
         self.train_ds: TimeSeriesDataset | None = None
         self.val_ds: TimeSeriesDataset | None = None
         self.test_ds: TimeSeriesDataset | None = None
@@ -121,6 +139,8 @@ class TradingDataModule(L.LightningDataModule):
         all_train_x, all_train_y = [], []
         all_val_x, all_val_y = [], []
         all_test_x, all_test_y = [], []
+        train_valid, val_valid, test_valid = [], [], []
+        train_offset, val_offset, test_offset = 0, 0, 0
 
         for symbol in df["symbol"].unique().sort().to_list():
             sym_df = df.filter(pl.col("symbol") == symbol)
@@ -131,14 +151,21 @@ class TradingDataModule(L.LightningDataModule):
             )
             test_df = sym_df.filter(pl.col("date") >= sd.test_start)
 
-            for split_df, x_list, y_list in [
-                (train_df, all_train_x, all_train_y),
-                (val_df, all_val_x, all_val_y),
-                (test_df, all_test_x, all_test_y),
+            for split_df, x_list, y_list, valid_list, offset in [
+                (train_df, all_train_x, all_train_y, train_valid, train_offset),
+                (val_df, all_val_x, all_val_y, val_valid, val_offset),
+                (test_df, all_test_x, all_test_y, test_valid, test_offset),
             ]:
-                if len(split_df) > 0:
+                n = len(split_df)
+                if n > 0:
                     x_list.append(split_df.select(self.feature_cols).to_numpy())
                     y_list.append(split_df["target"].to_numpy().astype(np.int64))
+                    if n > self.seq_len:
+                        valid_list.extend(range(offset, offset + n - self.seq_len))
+
+            train_offset += len(train_df)
+            val_offset += len(val_df)
+            test_offset += len(test_df)
 
         train_x = np.concatenate(all_train_x)
         train_y = np.concatenate(all_train_y)
@@ -146,6 +173,10 @@ class TradingDataModule(L.LightningDataModule):
         val_y = np.concatenate(all_val_y)
         test_x = np.concatenate(all_test_x)
         test_y = np.concatenate(all_test_y)
+
+        train_vi = np.array(train_valid, dtype=np.int64)
+        val_vi = np.array(val_valid, dtype=np.int64)
+        test_vi = np.array(test_valid, dtype=np.int64)
 
         print(
             f"  Split sizes — train: {len(train_y):,} | "
@@ -164,6 +195,19 @@ class TradingDataModule(L.LightningDataModule):
             )
             print(f"  {name} class balance — {parts}")
 
+        # Compute inverse-frequency class weights from training set
+        unique, counts = np.unique(train_y, return_counts=True)
+        total = counts.sum()
+        weight_map = {int(cls): total / (len(unique) * cnt) for cls, cnt in zip(unique, counts)}
+        self.class_weights = [weight_map.get(i, 1.0) for i in range(max(int(unique.max()) + 1, 3))]
+        print(f"  class weights — " + " | ".join(
+            f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
+        ))
+
+        # Replace Inf/NaN with 0 before normalization
+        for arr in (train_x, val_x, test_x):
+            np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Normalize using training set statistics only
         self._mean = train_x.mean(axis=0)
         self._std = train_x.std(axis=0)
@@ -172,9 +216,9 @@ class TradingDataModule(L.LightningDataModule):
         val_x = (val_x - self._mean) / self._std
         test_x = (test_x - self._mean) / self._std
 
-        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, target_dtype=torch.int64)
-        self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, target_dtype=torch.int64)
-        self.test_ds = TimeSeriesDataset(test_x, test_y, self.seq_len, target_dtype=torch.int64)
+        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True)
+        self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64)
+        self.test_ds = TimeSeriesDataset(test_x, test_y, self.seq_len, test_vi, target_dtype=torch.int64)
 
     @property
     def input_size(self) -> int:

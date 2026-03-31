@@ -30,6 +30,28 @@ def load_config(path: str | None = None) -> dict:
         return yaml.safe_load(f)
 
 
+def resolve_start_years_back(config: dict) -> int:
+    """Resolve start_years_back based on PIPELINE_ENV.
+
+    Supports both int (legacy) and dict with dev/prod keys.
+    """
+    from src.keys import PIPELINE_ENV
+
+    value = config["ingestion"]["start_years_back"]
+    if isinstance(value, int):
+        return value
+    return value.get(PIPELINE_ENV, value.get("dev", 5))
+
+
+def resolve_dev_sectors(config: dict) -> list[str] | None:
+    """Return the sector filter list for dev mode, or None for prod (all sectors)."""
+    from src.keys import PIPELINE_ENV
+
+    if PIPELINE_ENV != "dev":
+        return None
+    return config.get("ingestion", {}).get("dev_sectors")
+
+
 @dataclass
 class SplitDates:
     """Date boundaries for temporal train/val/test splits with purge gaps.
@@ -66,7 +88,7 @@ def compute_split_dates(config: dict, reference_date: dt.date | None = None) -> 
     """
     today = reference_date or dt.date.today()
 
-    start_years_back = config["ingestion"]["start_years_back"]
+    start_years_back = resolve_start_years_back(config)
     train_cfg = config["training"]
     test_years = train_cfg["test_years"]
     val_years = train_cfg["val_years"]
@@ -96,14 +118,17 @@ class ClusterConfig:
     """Configuration for stock clustering (Stage 1)."""
 
     method: str = "kmeans"
-    n_clusters_per_sector: int = 3
+    max_clusters_per_sector: int = 6
+    pca_variance_ratio: float = 0.95
     features_for_clustering: list[str] = field(
         default_factory=lambda: [
-            "return_20d_mean",
-            "volatility_60d",
-            "volume_profile",
-            "rsi_14_mean",
-            "beta_60d",
+            "return_20d_mean", "volatility_60d", "volume_profile",
+            "rsi_14_mean", "beta_60d", "momentum_60d", "drawdown_max",
+            "relative_to_sector_avg", "vix_beta", "yield_sensitivity",
+            "km_returnonequity", "km_earningsyield", "km_freecashflowyield",
+            "km_evtoebitda", "fr_grossprofitmargin", "fr_netprofitmargin",
+            "fr_debttoequityratio", "fr_pricetoearningsratio",
+            "fr_pricetobookratio", "fr_dividendyield",
         ]
     )
     min_cluster_size: int = 3
@@ -115,7 +140,8 @@ class ClusterConfig:
         """Create from config dict section."""
         return cls(
             method=d.get("method", "kmeans"),
-            n_clusters_per_sector=d.get("n_clusters_per_sector", 3),
+            max_clusters_per_sector=d.get("max_clusters_per_sector", 6),
+            pca_variance_ratio=d.get("pca_variance_ratio", 0.95),
             features_for_clustering=d.get(
                 "features_for_clustering",
                 cls.__dataclass_fields__["features_for_clustering"].default_factory(),
@@ -174,6 +200,39 @@ class RegimeConfig:
             sma_short=d.get("sma_short", 50),
             sma_long=d.get("sma_long", 200),
         )
+
+
+def get_features_parquet_path(config: dict) -> str:
+    """Resolve the features parquet path based on feature selection config.
+
+    Returns features_selected.parquet when feature selection is enabled,
+    otherwise falls back to features.parquet.
+    """
+    sel_cfg = config.get("feature_selection", {})
+    if sel_cfg.get("enabled", False):
+        selected_path = "data/features_selected.parquet"
+        if Path(selected_path).exists():
+            return selected_path
+    return "data/features.parquet"
+
+
+def get_selected_feature_names(config: dict) -> list[str] | None:
+    """Load the selected feature names from the manifest when available.
+
+    Returns None if feature selection is disabled or manifest not found.
+    """
+    import json
+
+    sel_cfg = config.get("feature_selection", {})
+    if not sel_cfg.get("enabled", False):
+        return None
+
+    manifest_path = Path("data/selected_features.json")
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            data = json.load(f)
+        return data.get("features")
+    return None
 
 
 def get_cluster_thresholds(

@@ -19,7 +19,7 @@ import polars as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
 
-from src.config import ClusterConfig, compute_split_dates, get_cluster_thresholds, load_config
+from src.config import ClusterConfig, compute_split_dates, get_cluster_thresholds, get_features_parquet_path, load_config
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
@@ -49,8 +49,10 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
 
     # Data
+    features_path = get_features_parquet_path(config)
+    print(f"  Features source: {features_path}")
     dm = TradingDataModule(
-        parquet_path="data/features.parquet",
+        parquet_path=features_path,
         seq_len=model_cfg["sequence_length"],
         batch_size=train_cfg["batch_size"],
         split_dates=split_dates,
@@ -60,11 +62,10 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     dm.setup()
 
     # Skip clusters with insufficient data for sequence creation
-    seq_len = model_cfg["sequence_length"]
-    train_samples = dm.train_ds.features.shape[0] - seq_len
-    val_samples = dm.val_ds.features.shape[0] - seq_len
+    train_samples = len(dm.train_ds)
+    val_samples = len(dm.val_ds)
     if train_samples <= 0 or val_samples <= 0:
-        print(f"  SKIPPING {cluster_id}: insufficient data for training (need >{seq_len} samples per split, got train={dm.train_ds.features.shape[0]}, val={dm.val_ds.features.shape[0]})")
+        print(f"  SKIPPING {cluster_id}: insufficient valid sequences (train={train_samples}, val={val_samples})")
         return
 
     # Model
@@ -78,6 +79,9 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
         learning_rate=train_cfg["learning_rate"],
         weight_decay=train_cfg.get("weight_decay", 0.0),
         label_smoothing=train_cfg.get("label_smoothing", 0.05),
+        class_weights=dm.class_weights,
+        num_attention_heads=model_cfg.get("num_attention_heads", 4),
+        focal_gamma=train_cfg.get("focal_gamma", 2.0),
     )
 
     # MLflow logger — separate experiment per cluster
@@ -97,6 +101,7 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
         mode="max",
     )
     checkpoint = ModelCheckpoint(
+        dirpath="checkpoints",
         monitor="val_acc",
         mode="max",
         save_top_k=1,

@@ -18,7 +18,8 @@ Local ML pipeline for evaluating stock trading strategies on S&P 500 stocks avai
 │  │  │ PostgreSQL 16       │  │ MLflow Tracking Server │ │   │
 │  │  │ + TimescaleDB       │  │ :5000                  │ │   │
 │  │  │ OHLCV, treasury,    │  │ Experiments, registry  │ │   │
-│  │  │ VIX data            │  │ Model promotion        │ │   │
+    │  │  │ VIX, fundamentals,  │  │ Model promotion        │ │   │
+    │  │  │ sector performance  │  │                        │ │   │
 │  │  └─────────────────────┘  └────────────────────────┘ │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
@@ -52,9 +53,10 @@ Local ML pipeline for evaluating stock trading strategies on S&P 500 stocks avai
 │   ├── db.py                      # Database schema and connection
 │   ├── keys.py                    # Environment variable loading
 │   ├── ingestion/
-│   │   └── fmp_loader.py          # FMP API → PostgreSQL (OHLCV, treasury, VIX)
+│   │   └── fmp_loader.py          # FMP API → PostgreSQL (OHLCV, adj close, treasury 12 tenors, VIX, fundamentals, sector perf, sectors)
 │   ├── features/
-│   │   └── technical.py           # Technical indicators + macro features (Polars)
+│   │   ├── technical.py           # Technical + macro + fundamental + sector features (Polars)
+│   │   └── selection.py           # Feature selection (null/variance/correlation filters)
 │   ├── models/
 │   │   ├── base_model.py          # LSTMForecaster (Lightning module)
 │   │   └── dataset.py             # TradingDataModule with temporal splits + purge gaps
@@ -101,18 +103,22 @@ make up
 ### Run the Full Pipeline
 
 ```bash
-make pipeline    # ingest → features → train → evaluate
+make pipeline    # ingest → features → select-features → cluster → train → aggregate → portfolio → backtest
 ```
 
 Or run each step individually:
 
 ```bash
-make ingest      # Fetch OHLCV, treasury rates, VIX from FMP API into PostgreSQL
-make features    # Generate technical indicators + macro features → data/features.parquet
-make train       # Train LSTM model with MPS acceleration, log to MLflow
-make evaluate    # Portfolio backtest on test set, log metrics to MLflow
-make promote     # Register best training model as champion in MLflow
-make signals     # Generate BUY/HOLD signals from champion model
+make ingest           # Fetch all data from FMP API into PostgreSQL
+make features         # Generate features → data/features.parquet
+make select-features  # Feature selection → data/features_selected.parquet
+make cluster          # Cluster stocks by sector
+make train            # Train LSTM per cluster with MPS, log to MLflow
+make aggregate        # Consolidate per-cluster predictions
+make portfolio        # Optimize 3 portfolio profiles
+make backtest         # Regime-aware backtesting
+make promote          # Register best models as champions in MLflow
+make signals          # Generate BUY/HOLD signals from champion models
 ```
 
 ### Generate Trading Signals
@@ -133,43 +139,55 @@ open http://localhost:5000    # MLflow UI
 
 ### Data Ingestion
 
-Fetches data from the FMP API for 132 S&P 500 stocks available as CEDEARs in BYMA. The start date is computed dynamically as `today - 10 years`. Three data sources:
+Fetches data from the FMP API for S&P 500 stocks. The start date is computed dynamically as `today - 20 years`. Seven data sources:
 
 - **OHLCV**: Daily price data per symbol
-- **Treasury Rates**: US 2Y, 10Y, 30Y yields
+- **Adjusted Close**: Dividend-adjusted close prices via dedicated FMP endpoint
+- **Treasury Rates**: All 12 US tenors (1M, 2M, 3M, 6M, 1Y, 2Y, 3Y, 5Y, 7Y, 10Y, 20Y, 30Y)
 - **VIX**: Volatility index data
+- **Key Metrics**: Quarterly fundamental metrics per symbol (~47 fields, stored as JSONB)
+- **Financial Ratios**: Quarterly financial ratios per symbol (~66 fields, stored as JSONB)
+- **Sector Performance**: Daily historical average change per GICS sector
 
-Symbols that return HTTP errors (e.g., 402 Payment Required) are skipped gracefully.
+Use `--skip-adjclose`, `--skip-treasury`, `--skip-vix`, `--skip-fundamentals`, `--skip-sector-perf`, `--skip-sectors` flags to skip individual sources. Symbols that return HTTP errors are skipped gracefully.
 
 ### Feature Engineering
 
-Computes features using Polars and saves to `data/features.parquet`:
+Computes features using Polars and saves to `data/features.parquet`. When `adj_close` is available, all price-derived indicators (SMAs, EMAs, RSI, MACD, Bollinger, ATR) are computed on dividend-adjusted prices for consistency with the target labels.
 
-- **Moving Averages**: SMA and EMA at windows [5, 10, 20, 50, 200]
-- **Momentum**: RSI(14), MACD(12, 26, 9)
-- **Volatility**: Bollinger Bands(20), ATR(14)
-- **Volume**: Volume SMA(20), relative volume
-- **Returns**: 1-day, 5-day, 20-day returns
-- **Macro**: Treasury yields (2Y, 10Y, 30Y), yield spreads (10Y-2Y, 30Y-10Y)
-- **VIX**: Close, SMA(20), percentile rank(252d), regime (low/mid/high/extreme)
-- **Target**: Binary label — 1 if 63-day forward return ≥ 3%, else 0
+- **Moving Averages**: SMA and EMA at windows [5, 10, 20, 50, 200], expressed as price-relative ratios
+- **Momentum**: RSI(14), MACD(12, 26, 9), Stochastic Oscillator (%K, %D)
+- **Volatility**: Bollinger Bands(20), ATR(14), realized volatility at 5d/20d/60d horizons, mean-reversion z-score
+- **Volume**: Volume SMA(20), relative volume, OBV rate-of-change (20d)
+- **Returns**: 1-day, 5-day, 20-day returns (from dividend-adjusted close)
+- **Macro**: All 12 treasury tenors, 8 yield spreads + curve slope, daily changes per tenor, lagged spreads (5d, 20d)
+- **VIX**: Close, SMA(5/20), SMA20 ratio, intraday range, daily change/return, percentile rank (252d), lagged VIX (5d, 20d)
+- **Cross-Sectional**: Relative strength vs SPY (stock 20d return minus SPY 20d return)
+- **Fundamentals**: ~20 key metrics + ~20 financial ratios, quarterly data forward-filled to daily, with true QoQ changes (computed on quarterly data before forward-fill)
+- **Sector**: Daily sector avg change, 5d/20d sector momentum, relative-to-sector performance
+- **Time Encoding**: Cyclical sin/cos encoding of day-of-week and month-of-year
+- **Target**: Ternary label — BUY (≥+5%), SELL (≤-3%), HOLD (neither) in 63 trading days
+
+**Null handling**: Fundamentals are forward-filled per symbol (quarterly gaps are expected), remaining nulls are median-filled per symbol, and only rows with null returns or target are dropped — preserving significantly more data than a naive drop-all approach.
+
+**Feature selection** (`make select-features`): Filters features by null rate (>90%), near-zero variance (bottom 1%), and high correlation (>0.95), saving the result to `data/features_selected.parquet` and a manifest of selected feature names to `data/selected_features.json`. When enabled, training, aggregation, and inference automatically use the selected features.
 
 ### Temporal Splits
 
 All split boundaries are relative to today for daily retraining. A 63-day purge gap between each split prevents label leakage (matches the 63-day target horizon):
 
 ```
-train (7yr) │ PURGE (63d) │ val (1yr) │ PURGE (63d) │ test (2yr) │ today
+train (17yr) │ PURGE (63d) │ val (1yr) │ PURGE (63d) │ test (2yr) │ today
 ```
 
-Data in purge gaps is discarded. Features are Z-score normalized using training-set statistics only.
+Data in purge gaps is discarded. Features are Z-score normalized using training-set statistics only. The sliding-window dataset uses symbol-boundary-aware indexing to ensure no sequence ever mixes data from different stocks.
 
 ### Model
 
-LSTM-based binary classifier built with PyTorch Lightning:
+LSTM-based ternary classifier built with PyTorch Lightning:
 
 - **Architecture**: 2-layer LSTM (128 hidden), LayerNorm, GELU, dropout (0.3)
-- **Task**: Predict probability of ≥3% gain in 63 trading days (~3 months)
+- **Task**: Classify BUY (≥+5%), SELL (≤-3%), or HOLD in 63 trading days (~3 months)
 - **Regularization**: Weight decay (0.01), gradient clipping (1.0), label smoothing (0.05)
 - **Optimizer**: AdamW with ReduceLROnPlateau scheduler
 - **Early stopping**: Monitor `val_acc`, patience 20 epochs
@@ -198,8 +216,8 @@ All parameters are in `configs/default.yaml`:
 
 ```yaml
 ingestion:
-  symbols: [AAPL, MSFT, GOOGL, ...]  # 132 S&P 500 CEDEAR symbols
-  start_years_back: 10                # dynamically computed
+  source: sp500                       # dynamic from FMP API
+  start_years_back: 20                # 20 years of data
 
 model:
   type: lstm
@@ -208,20 +226,29 @@ model:
   dropout: 0.3
   sequence_length: 30
 
+features:
+  fundamentals: true       # key metrics + financial ratios
+  sector_performance: true # sector daily performance
+
+feature_selection:
+  enabled: true
+  max_null_pct: 0.90
+  max_correlation: 0.95
+  min_variance_pct: 0.01
+
 training:
   batch_size: 64
   max_epochs: 200
   learning_rate: 0.001
-  test_years: 2         # relative to today
+  test_years: 2           # relative to today
   val_years: 1
-  purge_days: 63         # gap between splits
+  purge_days: 63           # gap between splits
 
-evaluation:
-  confidence_threshold: 0.6
-  max_positions: 20
-  position_stop_loss: 0.08
-  position_take_profit: 0.50
-  max_drawdown_limit: 0.25
+backtest:
+  risk:
+    position_stop_loss: 0.08
+    position_take_profit: 0.50
+    max_drawdown_limit: 0.25
 ```
 
 ## Environment Variables
@@ -244,14 +271,18 @@ make up                  # Start Postgres + MLflow
 make down                # Stop all containers
 
 # Full pipeline
-make pipeline            # ingest → features → train → evaluate
+make pipeline            # ingest → features → select-features → cluster → train → aggregate → portfolio → backtest
 
 # Individual steps
-make ingest              # Fetch data from FMP API
+make ingest              # Fetch all data from FMP API
 make features            # Generate features parquet
-make train               # Train model
-make evaluate            # Backtest
-make promote             # Register best model
+make select-features     # Feature selection
+make cluster             # Cluster stocks by sector
+make train               # Train per-cluster models
+make aggregate           # Consolidate predictions
+make portfolio           # Optimize portfolios
+make backtest            # Regime-aware backtesting
+make promote             # Register best models
 make signals             # Generate trading signals
 
 # Database access

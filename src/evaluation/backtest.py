@@ -77,6 +77,8 @@ def run_portfolio_backtest(
     risk_cfg = config.get("risk", {})
     initial_capital = config.get("initial_capital", 100000)
     commission_pct = config.get("commission_pct", 0.001)
+    slippage_bps = config.get("slippage_bps", 5)
+    slippage_pct = slippage_bps / 10_000
     stop_loss = risk_cfg.get("position_stop_loss", 0.08)
     take_profit = risk_cfg.get("position_take_profit", 0.50)
     max_dd_limit = risk_cfg.get("max_drawdown_limit", 0.25)
@@ -121,10 +123,11 @@ def run_portfolio_backtest(
                     continue
 
                 capital_for_pos = initial_capital * weight
-                shares = (capital_for_pos * (1 - commission_pct)) / price
+                entry_price = price * (1 + slippage_pct)  # slippage on entry
+                shares = (capital_for_pos * (1 - commission_pct)) / entry_price
                 positions[symbol] = Position(
                     symbol=symbol,
-                    entry_price=price,
+                    entry_price=entry_price,
                     entry_date=day,
                     shares=shares,
                     cost_basis=capital_for_pos,
@@ -150,7 +153,7 @@ def run_portfolio_backtest(
 
             # Stop-loss
             if pnl_pct <= -stop_loss:
-                proceeds = _close_position(pos, current_price, commission_pct)
+                proceeds = _close_position(pos, current_price, commission_pct, slippage_pct)
                 trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                 cash += proceeds
                 closed_symbols.append(sym)
@@ -158,7 +161,7 @@ def run_portfolio_backtest(
 
             # Take-profit
             if pnl_pct >= take_profit:
-                proceeds = _close_position(pos, current_price, commission_pct)
+                proceeds = _close_position(pos, current_price, commission_pct, slippage_pct)
                 trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                 cash += proceeds
                 closed_symbols.append(sym)
@@ -198,7 +201,7 @@ def run_portfolio_backtest(
                     (pl.col("date") == day) & (pl.col("symbol") == sym)
                 )
                 if not price_row.is_empty():
-                    proceeds = _close_position(pos, price_row["close"][0], commission_pct)
+                    proceeds = _close_position(pos, price_row["close"][0], commission_pct, slippage_pct)
                     trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                     cash += proceeds
             positions.clear()
@@ -218,7 +221,7 @@ def run_portfolio_backtest(
             (pl.col("date") == last_date) & (pl.col("symbol") == sym)
         )
         if not price_row.is_empty():
-            proceeds = _close_position(pos, price_row["close"][0], commission_pct)
+            proceeds = _close_position(pos, price_row["close"][0], commission_pct, slippage_pct)
             trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
             cash += proceeds
     positions.clear()
@@ -257,22 +260,23 @@ def run_portfolio_backtest(
     )
 
 
-def _close_position(pos: Position, current_price: float, commission_pct: float) -> float:
+def _close_position(pos: Position, current_price: float, commission_pct: float, slippage_pct: float = 0.0) -> float:
     """Calculate proceeds from closing a position.
 
     Args:
         pos: The position to close.
         current_price: Current market price.
         commission_pct: Commission rate.
+        slippage_pct: Slippage as a fraction (e.g., 0.0005 for 5 bps).
 
     Returns:
         Net proceeds.
     """
+    exit_price = current_price * (1 - slippage_pct)  # slippage on exit
     if pos.direction == 1:  # long
-        return pos.shares * current_price * (1 - commission_pct)
+        return pos.shares * exit_price * (1 - commission_pct)
     else:  # short
-        # Short profit = entry_price - current_price per share
-        gross = pos.cost_basis + pos.shares * (pos.entry_price - current_price)
+        gross = pos.cost_basis + pos.shares * (pos.entry_price - exit_price)
         return gross * (1 - commission_pct)
 
 

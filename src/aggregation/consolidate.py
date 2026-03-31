@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import glob
 import os
+import re
 from pathlib import Path
 
 import mlflow
@@ -21,7 +22,7 @@ import polars as pl
 import torch
 from sqlalchemy import text
 
-from src.config import ClusterConfig, compute_split_dates, load_config
+from src.config import ClusterConfig, compute_split_dates, get_features_parquet_path, get_selected_feature_names, load_config
 from src.db import get_engine
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
@@ -42,17 +43,18 @@ def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
     Returns:
         Path to the best checkpoint, or None if not found.
     """
-    # Search for checkpoints in mlflow/ directory (primary) and fallback to mlruns/
+    # Search across all possible checkpoint locations, return the most recent
+    all_checkpoints = []
     for search_dir in ["checkpoints", "mlruns", "."]:
         pattern = f"{search_dir}/**/{cluster_id}-best-*.ckpt"
-        checkpoints = sorted(
-            glob.glob(pattern, recursive=True),
-            key=lambda p: os.path.getmtime(p),
-        )
-        if checkpoints:
-            return checkpoints[-1]
+        all_checkpoints.extend(glob.glob(pattern, recursive=True))
 
-    return None
+    if not all_checkpoints:
+        return None
+
+    # Deduplicate (`.` may overlap with other dirs) and return most recent
+    unique = list({os.path.abspath(p): p for p in all_checkpoints}.values())
+    return max(unique, key=lambda p: os.path.getmtime(p))
 
 
 def run_inference_for_cluster(
@@ -82,7 +84,20 @@ def run_inference_for_cluster(
     cluster_symbols = (
         clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
     )
-    feature_cols = [c for c in features_df.columns if c not in EXCLUDE_COLS]
+    # Use selected features if available, else fall back to all non-meta columns
+    selected = get_selected_feature_names(config)
+    if selected:
+        feature_cols = [c for c in selected if c in features_df.columns]
+    else:
+        feature_cols = [c for c in features_df.columns if c not in EXCLUDE_COLS]
+
+    # Validate feature count matches model input_size
+    expected = model.hparams.get("input_size", len(feature_cols))
+    if len(feature_cols) != expected:
+        raise ValueError(
+            f"Feature mismatch for {cluster_id}: model expects {expected} features "
+            f"but got {len(feature_cols)}. Re-run feature selection or retrain."
+        )
 
     # Compute normalization from training period
     train_df = features_df.filter(
@@ -94,6 +109,7 @@ def run_inference_for_cluster(
         return []
 
     train_matrix = train_df.select(feature_cols).to_numpy()
+    np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     train_mean = train_matrix.mean(axis=0)
     train_std = train_matrix.std(axis=0)
     train_std[train_std == 0] = 1.0
@@ -109,6 +125,7 @@ def run_inference_for_cluster(
         # Use the most recent seq_len rows for prediction
         recent = sym_df.tail(seq_len)
         features = recent.select(feature_cols).to_numpy()
+        np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         norm_features = (features - train_mean) / train_std
 
         x = torch.tensor(norm_features, dtype=torch.float32).unsqueeze(0)
@@ -145,7 +162,9 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
 
-    features_df = pl.read_parquet("data/features.parquet").sort(["symbol", "date"])
+    features_path = get_features_parquet_path(config)
+    print(f"  Features source: {features_path}")
+    features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
 
     # Drop all-null columns
     all_null_cols = [c for c in features_df.columns if features_df[c].null_count() == len(features_df)]
@@ -161,14 +180,21 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
             continue
 
         print(f"  Loading model for {cluster_id} from {ckpt_path}")
-        model = LSTMForecaster.load_from_checkpoint(ckpt_path, map_location="cpu")
+        model = LSTMForecaster.load_from_checkpoint(ckpt_path, map_location="cpu", weights_only=False)
         model.eval()
+
+        # Extract val_acc from checkpoint filename for confidence weighting
+        val_acc_match = re.search(r"val_acc=([0-9]+\.[0-9]+)", ckpt_path)
+        val_acc = float(val_acc_match.group(1)) if val_acc_match else 1.0
 
         preds = run_inference_for_cluster(
             cluster_id, model, features_df, clusters_df, config, split_dates
         )
         for p in preds:
-            p["model_run_id"] = None  # Could be populated from MLflow
+            p["model_run_id"] = None
+            p["model_val_acc"] = val_acc
+            # Scale confidence by model quality (val_acc as weight)
+            p["weighted_confidence"] = p["confidence"] * val_acc
         all_predictions.extend(preds)
 
     result_df = pl.DataFrame(all_predictions)

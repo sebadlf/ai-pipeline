@@ -5,7 +5,15 @@ ingestion:
   # Benchmark symbols needed for beta, regime detection, and backtesting
   benchmark_symbols:
     - SPY
-  start_years_back: 10  # dynamically computed as today - N years
+  start_years_back:
+    dev: 5             # dev: 5 years (~2yr training after splits)
+    prod: 20           # prod: 20 years (full history)
+  # In dev mode, limit to these sectors for faster iteration (null = all sectors)
+  dev_sectors:
+    - Technology
+    - Consumer Defensive
+    - Energy
+  # Resolved at runtime via PIPELINE_ENV (default: dev)
   end_date: null  # null = today
 
 # Feature engineering
@@ -13,6 +21,8 @@ features:
   windows: [5, 10, 20, 50, 200]
   treasury_rates: true
   vix: true
+  fundamentals: true        # key metrics + financial ratios (quarterly, forward-filled)
+  sector_performance: true  # historical sector average change
   indicators:
     - sma
     - ema
@@ -21,12 +31,27 @@ features:
     - bollinger_bands
     - atr
     - volume_sma
+    - stochastic
+    - obv
+    - mean_reversion_zscore
+    - realized_volatility
+    - cyclical_time
+    - vix_percentile
+    - relative_strength_spy
+    - lagged_macros
+
+# Feature selection (post-feature-engineering dimensionality reduction)
+feature_selection:
+  enabled: true
+  max_null_pct: 0.90      # drop features with >90% nulls
+  max_correlation: 0.95   # drop one of each pair with |corr| > 0.95
+  min_variance_pct: 0.01  # drop bottom 1% by variance
 
 # Target — ternary classification (BUY/SELL/HOLD)
 target:
-  horizon: 63          # trading days ahead (~3 months)
-  buy_threshold: 0.05  # +5% for BUY signal
-  sell_threshold: 0.03 # -3% for SELL signal (applied as negative)
+  horizon: 21          # trading days ahead (~1 month)
+  buy_threshold: 0.025 # +2.5% for BUY signal
+  sell_threshold: 0.015 # -1.5% for SELL signal (applied as negative)
 
 # Model
 model:
@@ -36,6 +61,7 @@ model:
   num_layers: 2
   num_classes: 3    # HOLD=0, BUY=1, SELL=2
   dropout: 0.3
+  num_attention_heads: 4  # multi-head self-attention post-LSTM (0 to disable)
   sequence_length: 30
 
 # Training
@@ -45,24 +71,46 @@ training:
   learning_rate: 0.001
   weight_decay: 0.01
   label_smoothing: 0.05
+  focal_gamma: 2.0          # focal loss gamma (0 = standard CrossEntropy)
   early_stopping_patience: 20
   per_cluster: true
   cluster_experiment_prefix: "cluster"
   # Temporal splits (relative to today, with purge gaps)
   test_years: 2        # last 2 years = test
   val_years: 1         # 1 year before test = validation
-  purge_days: 63       # gap between splits = target horizon (avoids label leakage)
+  purge_days: 21       # gap between splits = target horizon (avoids label leakage)
 
 # Clustering — Stage 1
 clustering:
   method: kmeans
-  n_clusters_per_sector: 3
+  max_clusters_per_sector: 6   # auto-selects optimal K in [2..6] via silhouette
+  pca_variance_ratio: 0.95     # PCA retains 95% of variance before clustering
   features_for_clustering:
+    # Behavioral
     - return_20d_mean
     - volatility_60d
     - volume_profile
     - rsi_14_mean
     - beta_60d
+    - momentum_60d
+    - drawdown_max
+    # Macro sensitivity
+    - vix_beta
+    - yield_sensitivity
+    # Sector-relative
+    - relative_to_sector_avg
+    # Fundamentals (key metrics)
+    - km_returnonequity
+    - km_earningsyield
+    - km_freecashflowyield
+    - km_evtoebitda
+    # Fundamentals (financial ratios)
+    - fr_grossprofitmargin
+    - fr_netprofitmargin
+    - fr_debttoequityratio
+    - fr_pricetoearningsratio
+    - fr_pricetobookratio
+    - fr_dividendyield
   min_cluster_size: 3
   output_parquet: data/clusters.parquet
   # Per-cluster threshold overrides (populated after initial clustering run).
@@ -124,6 +172,7 @@ regime:
 backtest:
   initial_capital: 100000
   commission_pct: 0.001
+  slippage_bps: 5           # 5 basis points slippage on entry/exit
   risk:
     position_stop_loss: 0.08
     position_take_profit: 0.50

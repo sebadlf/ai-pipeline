@@ -15,6 +15,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 
 from src.config import get_db_url
@@ -42,9 +43,53 @@ treasury_rates = Table(
     metadata,
     Column("id", BigInteger, primary_key=True, autoincrement=True),
     Column("date", Date, nullable=False, unique=True),
+    Column("month1", Float),
+    Column("month2", Float),
+    Column("month3", Float),
+    Column("month6", Float),
+    Column("year1", Float),
     Column("year2", Float),
+    Column("year3", Float),
+    Column("year5", Float),
+    Column("year7", Float),
     Column("year10", Float),
+    Column("year20", Float),
     Column("year30", Float),
+)
+
+key_metrics_quarterly = Table(
+    "key_metrics_quarterly",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("symbol", String(10), nullable=False),
+    Column("date", Date, nullable=False),
+    Column("fiscal_year", String(4)),
+    Column("period", String(4)),
+    Column("data", JSONB),
+    UniqueConstraint("symbol", "date", "period", name="uq_km_symbol_date_period"),
+)
+
+financial_ratios_quarterly = Table(
+    "financial_ratios_quarterly",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("symbol", String(10), nullable=False),
+    Column("date", Date, nullable=False),
+    Column("fiscal_year", String(4)),
+    Column("period", String(4)),
+    Column("data", JSONB),
+    UniqueConstraint("symbol", "date", "period", name="uq_fr_symbol_date_period"),
+)
+
+sector_performance_daily = Table(
+    "sector_performance_daily",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("date", Date, nullable=False),
+    Column("sector", String(100), nullable=False),
+    Column("exchange", String(20), nullable=False),
+    Column("average_change", Float),
+    UniqueConstraint("date", "sector", "exchange", name="uq_sp_date_sector_exchange"),
 )
 
 vix_daily = Table(
@@ -138,8 +183,23 @@ def get_engine() -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create tables and enable TimescaleDB extension."""
+    """Create tables, enable TimescaleDB, and migrate schemas."""
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
         conn.commit()
     metadata.create_all(engine)
+
+    _migrate_treasury_columns(engine)
+
+
+def _migrate_treasury_columns(engine: Engine) -> None:
+    """Add new treasury tenor columns to existing table if missing."""
+    new_cols = [
+        "month1", "month2", "month3", "month6",
+        "year1", "year3", "year5", "year7", "year20",
+    ]
+    with engine.begin() as conn:
+        for col in new_cols:
+            conn.execute(text(
+                f"ALTER TABLE treasury_rates ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION"
+            ))

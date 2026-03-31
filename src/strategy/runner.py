@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from src.config import ClusterConfig, compute_split_dates, load_config
+from src.config import ClusterConfig, compute_split_dates, get_selected_feature_names, load_config
 from src.features.technical import build_features, load_ohlcv
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
@@ -53,7 +53,7 @@ def load_cluster_model(cluster_id: str) -> LSTMForecaster | None:
     if not checkpoints:
         return None
 
-    model = LSTMForecaster.load_from_checkpoint(checkpoints[-1], map_location="cpu")
+    model = LSTMForecaster.load_from_checkpoint(checkpoints[-1], map_location="cpu", weights_only=False)
     model.eval()
     return model
 
@@ -91,6 +91,12 @@ def generate_signals(
         df = df.drop(all_null_cols)
 
     feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
+
+    selected_names = get_selected_feature_names(config)
+    if selected_names:
+        feature_cols = [c for c in selected_names if c in feature_cols]
+        print(f"  Using {len(feature_cols)} selected features (from manifest)")
+
     df = df.drop_nulls(subset=feature_cols)
 
     # Compute normalization from training period

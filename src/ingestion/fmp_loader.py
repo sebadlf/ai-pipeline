@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
+from pathlib import Path
 
 import httpx
 from sqlalchemy import text
@@ -21,8 +23,15 @@ from src.keys import FMP_API_KEY
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 
 
-def fetch_sp500_constituents(api_key: str | None = None) -> list[str]:
+def fetch_sp500_constituents(
+    api_key: str | None = None,
+    sectors: list[str] | None = None,
+) -> list[str]:
     """Fetch current S&P 500 constituent symbols from FMP API.
+
+    Args:
+        api_key: FMP API key.
+        sectors: If provided, only return symbols from these GICS sectors.
 
     Returns:
         Sorted list of ticker symbols.
@@ -35,6 +44,11 @@ def fetch_sp500_constituents(api_key: str | None = None) -> list[str]:
     resp = httpx.get(url, params={"apikey": api_key}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
+
+    if sectors:
+        sector_set = set(sectors)
+        data = [row for row in data if row.get("sector") in sector_set]
+        print(f"Filtered to {len(data)} symbols in sectors: {', '.join(sectors)}")
 
     symbols = sorted({row["symbol"].replace(".", "-") for row in data})
     print(f"Fetched {len(symbols)} S&P 500 constituents from FMP")
@@ -87,12 +101,18 @@ def fetch_ohlcv(
     ]
 
 
+_TREASURY_TENORS = [
+    "month1", "month2", "month3", "month6",
+    "year1", "year2", "year3", "year5", "year7", "year10", "year20", "year30",
+]
+
+
 def fetch_treasury_rates(
     start_date: str,
     end_date: str | None = None,
     api_key: str | None = None,
 ) -> list[dict]:
-    """Fetch daily US Treasury rates from FMP API.
+    """Fetch daily US Treasury rates (all 12 tenors) from FMP API.
 
     Args:
         start_date: Start date in YYYY-MM-DD format.
@@ -116,39 +136,27 @@ def fetch_treasury_rates(
         return []
 
     return [
-        {
-            "date": row["date"],
-            "year2": row.get("year2"),
-            "year10": row.get("year10"),
-            "year30": row.get("year30"),
-        }
+        {"date": row["date"], **{t: row.get(t) for t in _TREASURY_TENORS}}
         for row in data
     ]
 
 
 def upsert_treasury_rates(engine, rows: list[dict]) -> int:
-    """Insert or update treasury rate rows.
-
-    Args:
-        engine: SQLAlchemy engine.
-        rows: List of treasury rate dicts.
-
-    Returns:
-        Number of rows inserted/updated.
-    """
+    """Insert or update treasury rate rows (all 12 tenors)."""
     if not rows:
         return 0
+
+    cols = ", ".join(_TREASURY_TENORS)
+    params = ", ".join(f":{t}" for t in _TREASURY_TENORS)
+    updates = ", ".join(f"{t} = EXCLUDED.{t}" for t in _TREASURY_TENORS)
 
     inserted = 0
     with engine.begin() as conn:
         for row in rows:
-            stmt = text("""
-                INSERT INTO treasury_rates (date, year2, year10, year30)
-                VALUES (:date, :year2, :year10, :year30)
-                ON CONFLICT (date) DO UPDATE SET
-                    year2 = EXCLUDED.year2,
-                    year10 = EXCLUDED.year10,
-                    year30 = EXCLUDED.year30
+            stmt = text(f"""
+                INSERT INTO treasury_rates (date, {cols})
+                VALUES (:date, {params})
+                ON CONFLICT (date) DO UPDATE SET {updates}
             """)
             result = conn.execute(stmt, row)
             inserted += result.rowcount
@@ -321,19 +329,327 @@ def upsert_sectors(engine, rows: list[dict]) -> int:
     return inserted
 
 
+def fetch_adj_close(
+    symbol: str,
+    start_date: str,
+    end_date: str | None = None,
+    api_key: str | None = None,
+) -> list[dict]:
+    """Fetch dividend-adjusted close prices from FMP API.
+
+    Args:
+        symbol: Ticker symbol.
+        start_date: Start date in YYYY-MM-DD format.
+        end_date: End date. Defaults to today.
+        api_key: FMP API key.
+    """
+    api_key = api_key or FMP_API_KEY
+    if not api_key:
+        raise ValueError("FMP_API_KEY not set")
+
+    end_date = end_date or dt.date.today().isoformat()
+    url = f"{FMP_BASE_URL}/historical-price-eod/dividend-adjusted"
+    params = {"symbol": symbol, "from": start_date, "to": end_date, "apikey": api_key}
+
+    resp = httpx.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data:
+        return []
+
+    return [
+        {"symbol": symbol, "date": row["date"], "adj_close": row.get("adjClose")}
+        for row in data
+    ]
+
+
+def update_adj_close(engine, rows: list[dict]) -> int:
+    """Update adj_close column in ohlcv_daily for existing rows."""
+    if not rows:
+        return 0
+
+    updated = 0
+    with engine.begin() as conn:
+        for row in rows:
+            stmt = text("""
+                UPDATE ohlcv_daily SET adj_close = :adj_close
+                WHERE symbol = :symbol AND date = :date
+            """)
+            result = conn.execute(stmt, row)
+            updated += result.rowcount
+    return updated
+
+
+_PROBE_OFFSETS_DAYS = [30, 180, 730]
+_ADJCLOSE_TOLERANCE = 0.001
+
+
+def check_adjclose_changed(
+    engine,
+    symbol: str,
+    api_key: str | None = None,
+) -> bool:
+    """Probe a few historical dates to detect if adjClose has been recalculated.
+
+    Fetches adjClose for 3 reference dates (1mo, 6mo, 2yr ago) from FMP and
+    compares against the stored values. Returns True if any value differs or
+    if the symbol has no adjClose data yet.
+
+    Args:
+        engine: SQLAlchemy engine.
+        symbol: Ticker symbol.
+        api_key: FMP API key.
+    """
+    today = dt.date.today()
+
+    probe_dates = [(today - dt.timedelta(days=d)).isoformat() for d in _PROBE_OFFSETS_DAYS]
+
+    with engine.connect() as conn:
+        placeholders = ", ".join(f"'{d}'" for d in probe_dates)
+        result = conn.execute(text(f"""
+            SELECT date, adj_close FROM ohlcv_daily
+            WHERE symbol = :symbol AND date IN ({placeholders})
+            ORDER BY date
+        """), {"symbol": symbol})
+        db_rows = {str(row[0]): row[1] for row in result}
+
+    if not db_rows or any(v is None for v in db_rows.values()):
+        return True
+
+    api_key = api_key or FMP_API_KEY
+    for probe_date in probe_dates:
+        if probe_date not in db_rows:
+            continue
+        try:
+            rows = fetch_adj_close(symbol, probe_date, probe_date, api_key)
+            if not rows:
+                continue
+            api_val = rows[0].get("adj_close")
+            if api_val is None:
+                continue
+            db_val = db_rows[probe_date]
+            if abs(api_val - db_val) > _ADJCLOSE_TOLERANCE:
+                return True
+        except httpx.HTTPStatusError:
+            continue
+
+    return False
+
+
+def fetch_key_metrics(
+    symbol: str,
+    period: str = "quarter",
+    api_key: str | None = None,
+    start_date: str | None = None,
+) -> list[dict]:
+    """Fetch key metrics for a symbol from FMP API.
+
+    Args:
+        symbol: Ticker symbol.
+        period: Reporting period ('quarter' or 'annual').
+        api_key: FMP API key.
+        start_date: If provided, discard rows with date before this (YYYY-MM-DD).
+    """
+    api_key = api_key or FMP_API_KEY
+    if not api_key:
+        raise ValueError("FMP_API_KEY not set")
+
+    url = f"{FMP_BASE_URL}/key-metrics"
+    params = {"symbol": symbol, "period": period, "apikey": api_key}
+
+    resp = httpx.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data:
+        return []
+
+    results = []
+    for row in data:
+        if start_date and row["date"] < start_date:
+            continue
+        meta = {
+            "symbol": row.get("symbol", symbol),
+            "date": row["date"],
+            "fiscal_year": row.get("fiscalYear"),
+            "period": row.get("period"),
+        }
+        metrics = {k: v for k, v in row.items()
+                   if k not in ("symbol", "date", "fiscalYear", "period", "reportedCurrency")}
+        meta["data"] = json.dumps(metrics)
+        results.append(meta)
+    return results
+
+
+def upsert_key_metrics(engine, rows: list[dict]) -> int:
+    """Insert or update key metrics quarterly rows."""
+    if not rows:
+        return 0
+
+    inserted = 0
+    with engine.begin() as conn:
+        for row in rows:
+            stmt = text("""
+                INSERT INTO key_metrics_quarterly (symbol, date, fiscal_year, period, data)
+                VALUES (:symbol, :date, :fiscal_year, :period, CAST(:data AS jsonb))
+                ON CONFLICT (symbol, date, period) DO UPDATE SET
+                    fiscal_year = EXCLUDED.fiscal_year,
+                    data = EXCLUDED.data
+            """)
+            result = conn.execute(stmt, row)
+            inserted += result.rowcount
+    return inserted
+
+
+def fetch_financial_ratios(
+    symbol: str,
+    period: str = "quarter",
+    api_key: str | None = None,
+    start_date: str | None = None,
+) -> list[dict]:
+    """Fetch financial ratios for a symbol from FMP API.
+
+    Args:
+        symbol: Ticker symbol.
+        period: Reporting period ('quarter' or 'annual').
+        api_key: FMP API key.
+        start_date: If provided, discard rows with date before this (YYYY-MM-DD).
+    """
+    api_key = api_key or FMP_API_KEY
+    if not api_key:
+        raise ValueError("FMP_API_KEY not set")
+
+    url = f"{FMP_BASE_URL}/ratios"
+    params = {"symbol": symbol, "period": period, "apikey": api_key}
+
+    resp = httpx.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data:
+        return []
+
+    results = []
+    for row in data:
+        if start_date and row["date"] < start_date:
+            continue
+        meta = {
+            "symbol": row.get("symbol", symbol),
+            "date": row["date"],
+            "fiscal_year": row.get("fiscalYear"),
+            "period": row.get("period"),
+        }
+        ratios = {k: v for k, v in row.items()
+                  if k not in ("symbol", "date", "fiscalYear", "period", "reportedCurrency")}
+        meta["data"] = json.dumps(ratios)
+        results.append(meta)
+    return results
+
+
+def upsert_financial_ratios(engine, rows: list[dict]) -> int:
+    """Insert or update financial ratios quarterly rows."""
+    if not rows:
+        return 0
+
+    inserted = 0
+    with engine.begin() as conn:
+        for row in rows:
+            stmt = text("""
+                INSERT INTO financial_ratios_quarterly (symbol, date, fiscal_year, period, data)
+                VALUES (:symbol, :date, :fiscal_year, :period, CAST(:data AS jsonb))
+                ON CONFLICT (symbol, date, period) DO UPDATE SET
+                    fiscal_year = EXCLUDED.fiscal_year,
+                    data = EXCLUDED.data
+            """)
+            result = conn.execute(stmt, row)
+            inserted += result.rowcount
+    return inserted
+
+
+GICS_SECTORS = [
+    "Technology", "Healthcare", "Financial Services", "Consumer Cyclical",
+    "Communication Services", "Industrials", "Consumer Defensive",
+    "Energy", "Real Estate", "Utilities", "Basic Materials",
+]
+
+
+def fetch_sector_performance(
+    sector: str,
+    start_date: str,
+    end_date: str | None = None,
+    api_key: str | None = None,
+) -> list[dict]:
+    """Fetch historical sector performance from FMP API.
+
+    Args:
+        sector: GICS sector name (e.g. 'Technology').
+        start_date: Start date in YYYY-MM-DD format.
+        end_date: End date. Defaults to today.
+        api_key: FMP API key.
+    """
+    api_key = api_key or FMP_API_KEY
+    if not api_key:
+        raise ValueError("FMP_API_KEY not set")
+
+    end_date = end_date or dt.date.today().isoformat()
+    url = f"{FMP_BASE_URL}/historical-sector-performance"
+    params = {"sector": sector, "from": start_date, "to": end_date, "apikey": api_key}
+
+    resp = httpx.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data:
+        return []
+
+    return [
+        {
+            "date": row["date"],
+            "sector": row["sector"],
+            "exchange": row.get("exchange", ""),
+            "average_change": row.get("averageChange"),
+        }
+        for row in data
+    ]
+
+
+def upsert_sector_performance(engine, rows: list[dict]) -> int:
+    """Insert or update sector performance daily rows."""
+    if not rows:
+        return 0
+
+    inserted = 0
+    with engine.begin() as conn:
+        for row in rows:
+            stmt = text("""
+                INSERT INTO sector_performance_daily (date, sector, exchange, average_change)
+                VALUES (:date, :sector, :exchange, :average_change)
+                ON CONFLICT (date, sector, exchange) DO UPDATE SET
+                    average_change = EXCLUDED.average_change
+            """)
+            result = conn.execute(stmt, row)
+            inserted += result.rowcount
+    return inserted
+
+
 def main() -> None:
     """Run data ingestion for configured symbols and treasury rates."""
     config = load_config()
     ingestion_cfg = config["ingestion"]
 
-    start_years_back = ingestion_cfg["start_years_back"]
+    from src.config import resolve_start_years_back
+    from src.keys import PIPELINE_ENV
+    start_years_back = resolve_start_years_back(config)
+    print(f"Pipeline environment: {PIPELINE_ENV} ({start_years_back} years of data)")
     today = dt.date.today()
     default_start = today.replace(year=today.year - start_years_back).isoformat()
 
     # Resolve symbol list: dynamic from API or static from config
     source = ingestion_cfg.get("source", "static")
+    dev_sectors = ingestion_cfg.get("dev_sectors") if PIPELINE_ENV == "dev" else None
     if source == "sp500":
-        all_symbols = fetch_sp500_constituents()
+        all_symbols = fetch_sp500_constituents(sectors=dev_sectors)
     else:
         all_symbols = list(ingestion_cfg["symbols"])
 
@@ -342,20 +658,27 @@ def main() -> None:
         if bm not in all_symbols:
             all_symbols.append(bm)
 
-    parser = argparse.ArgumentParser(description="Ingest FMP OHLCV data")
+    parser = argparse.ArgumentParser(description="Ingest FMP data")
     parser.add_argument("--symbols", nargs="+", default=all_symbols)
     parser.add_argument("--start", default=default_start)
     parser.add_argument("--end", default=ingestion_cfg.get("end_date"))
-    parser.add_argument(
-        "--skip-treasury", action="store_true", help="Skip treasury rate ingestion"
-    )
-    parser.add_argument(
-        "--skip-vix", action="store_true", help="Skip VIX ingestion"
-    )
-    parser.add_argument(
-        "--skip-sectors", action="store_true", help="Skip GICS sector ingestion"
-    )
+    parser.add_argument("--skip-treasury", action="store_true", help="Skip treasury rate ingestion")
+    parser.add_argument("--skip-vix", action="store_true", help="Skip VIX ingestion")
+    parser.add_argument("--skip-sectors", action="store_true", help="Skip GICS sector ingestion")
+    parser.add_argument("--skip-adjclose", action="store_true", help="Skip adjusted close ingestion")
+    parser.add_argument("--force-adjclose", action="store_true", help="Force full adjClose re-download without probe check")
+    parser.add_argument("--skip-fundamentals", action="store_true", help="Skip key metrics + ratios ingestion")
+    parser.add_argument("--skip-sector-perf", action="store_true", help="Skip historical sector performance")
+    parser.add_argument("--force", action="store_true", help="Force ingestion even if already completed today")
     args = parser.parse_args()
+
+    # Skip if already completed today (unless --force)
+    marker_path = Path("data/.last_ingest")
+    if not args.force and marker_path.exists():
+        last_run = marker_path.read_text().strip()
+        if last_run == today.isoformat():
+            print(f"Ingestion already completed today ({today}). Use --force to re-run.")
+            return
 
     engine = get_engine()
     init_db(engine)
@@ -378,9 +701,38 @@ def main() -> None:
     if failed:
         print(f"  Failed symbols ({len(failed)}): {', '.join(failed)}")
 
+    # --- Adjusted close ingestion (smart probe-and-refresh) ---
+    if not args.skip_adjclose:
+        force = args.force_adjclose
+        mode = "FORCE" if force else "smart probe"
+        print(f"\nFetching adjusted close prices ({mode})...")
+        adj_total = 0
+        adj_refreshed = 0
+        adj_skipped = 0
+        adj_failed: list[str] = []
+        for i, symbol in enumerate(args.symbols, 1):
+            try:
+                needs_refresh = force or check_adjclose_changed(engine, symbol)
+                if needs_refresh:
+                    adj_rows = fetch_adj_close(symbol, args.start, args.end)
+                    n = update_adj_close(engine, adj_rows)
+                    adj_total += n
+                    adj_refreshed += 1
+                else:
+                    adj_skipped += 1
+                if i % 50 == 0 or i == len(args.symbols):
+                    print(f"  [{i}/{len(args.symbols)}] refreshed: {adj_refreshed}, "
+                          f"skipped: {adj_skipped}, rows updated: {adj_total}")
+            except httpx.HTTPStatusError:
+                adj_failed.append(symbol)
+        print(f"  Adjusted close done. {adj_refreshed} refreshed, "
+              f"{adj_skipped} unchanged, {adj_total} rows updated.")
+        if adj_failed:
+            print(f"  Failed ({len(adj_failed)}): {', '.join(adj_failed[:10])}...")
+
     # --- Treasury rates ingestion ---
     if not args.skip_treasury:
-        print("\nFetching treasury rates...")
+        print("\nFetching treasury rates (12 tenors)...")
         treasury_rows = fetch_treasury_rates(args.start, args.end)
         n_treasury = upsert_treasury_rates(engine, treasury_rows)
         print(
@@ -404,6 +756,45 @@ def main() -> None:
         sector_rows = fetch_sectors(args.symbols)
         n_sectors = upsert_sectors(engine, sector_rows)
         print(f"  Sectors: {n_sectors} rows inserted/updated ({len(sector_rows)} symbols)")
+
+    # --- Fundamentals: key metrics + financial ratios ---
+    if not args.skip_fundamentals:
+        print("\nFetching key metrics and financial ratios (quarterly)...")
+        km_total = 0
+        fr_total = 0
+        fund_failed: list[str] = []
+        for i, symbol in enumerate(args.symbols, 1):
+            try:
+                km_rows = fetch_key_metrics(symbol, start_date=args.start)
+                km_total += upsert_key_metrics(engine, km_rows)
+                fr_rows = fetch_financial_ratios(symbol, start_date=args.start)
+                fr_total += upsert_financial_ratios(engine, fr_rows)
+            except httpx.HTTPStatusError as e:
+                fund_failed.append(symbol)
+            if i % 50 == 0 or i == len(args.symbols):
+                print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, ratios: {fr_total}")
+        print(f"  Fundamentals done. KM: {km_total}, Ratios: {fr_total}")
+        if fund_failed:
+            print(f"  Failed ({len(fund_failed)}): {', '.join(fund_failed[:10])}...")
+
+    # --- Historical sector performance ---
+    if not args.skip_sector_perf:
+        print("\nFetching historical sector performance...")
+        sp_total = 0
+        for sector in GICS_SECTORS:
+            try:
+                sp_rows = fetch_sector_performance(sector, args.start, args.end)
+                n = upsert_sector_performance(engine, sp_rows)
+                sp_total += n
+                print(f"  {sector}: {n} rows ({len(sp_rows)} fetched)")
+            except httpx.HTTPStatusError as e:
+                print(f"  {sector}: SKIPPED (HTTP {e.response.status_code})")
+        print(f"  Sector performance done. {sp_total} total rows.")
+
+    # Mark today's ingestion as complete
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(today.isoformat())
+    print(f"\nIngestion complete. Marker written to {marker_path}")
 
 
 if __name__ == "__main__":
