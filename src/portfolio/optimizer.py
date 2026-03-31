@@ -147,6 +147,8 @@ def optimize_portfolio(
     constraints: dict,
     benchmark_returns: np.ndarray | None = None,
     sectors_df: pl.DataFrame | None = None,
+    commission_pct: float = 0.001,
+    rebalance_frequency_days: int = 21,
 ) -> pl.DataFrame:
     """Optimize portfolio weights for a single profile.
 
@@ -207,6 +209,11 @@ def optimize_portfolio(
         # Optimization objective: maximize primary metric
         def _objective(w: np.ndarray) -> float:
             portfolio_returns = adjusted_matrix @ w
+            # Deduct transaction costs at each rebalance period
+            if commission_pct > 0 and rebalance_frequency_days > 0:
+                for day in range(0, len(portfolio_returns), rebalance_frequency_days):
+                    turnover = 2.0 * np.sum(np.abs(w))  # round-trip estimate
+                    portfolio_returns[day] -= commission_pct * turnover
             equity = np.cumprod(1 + portfolio_returns) * 100000
             primary_fn = METRIC_FUNCTIONS[profile_config.primary_metric]
             comp_fn = METRIC_FUNCTIONS[profile_config.complementary_metric]
@@ -322,6 +329,7 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
         print(f"\nOptimizing {profile_name} portfolio...")
         profile_config = PortfolioProfileConfig.from_dict(profile_dict)
 
+        bt_cfg = config.get("backtest", {})
         allocation = optimize_portfolio(
             predictions=predictions,
             returns_df=returns_df,
@@ -329,6 +337,8 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
             constraints=constraints,
             benchmark_returns=benchmark_returns,
             sectors_df=sectors_df,
+            commission_pct=bt_cfg.get("commission_pct", 0.001),
+            rebalance_frequency_days=constraints.get("rebalance_frequency_days", 21),
         )
 
         if not allocation.is_empty():

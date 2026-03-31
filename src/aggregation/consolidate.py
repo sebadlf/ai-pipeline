@@ -146,6 +146,95 @@ def run_inference_for_cluster(
     return predictions
 
 
+def run_inference_for_period(
+    cluster_id: str,
+    model: LSTMForecaster,
+    features_df: pl.DataFrame,
+    clusters_df: pl.DataFrame,
+    config: dict,
+    split_dates,
+    period_start,
+    period_end,
+) -> list[dict]:
+    """Run inference for a specific date period using the last window before period_end.
+
+    Same logic as run_inference_for_cluster but filters data to a specific
+    period, using the last seq_len rows before period_end for each symbol.
+    Always normalizes with training-period statistics.
+
+    Args:
+        cluster_id: Cluster identifier.
+        model: Loaded model.
+        features_df: Full features DataFrame.
+        clusters_df: Cluster assignments.
+        config: Full config dict.
+        split_dates: SplitDates instance (used for normalization).
+        period_start: Start date of the evaluation period.
+        period_end: End date of the evaluation period.
+
+    Returns:
+        List of prediction dicts.
+    """
+    model_cfg = config["model"]
+    seq_len = model_cfg["sequence_length"]
+
+    cluster_symbols = (
+        clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
+    )
+    selected = get_selected_feature_names(config)
+    if selected:
+        feature_cols = [c for c in selected if c in features_df.columns]
+    else:
+        feature_cols = [c for c in features_df.columns if c not in EXCLUDE_COLS]
+
+    # Normalize with training-period statistics (always)
+    train_df = features_df.filter(
+        (pl.col("date") < split_dates.train_end)
+        & pl.col("symbol").is_in(cluster_symbols)
+    ).drop_nulls(subset=feature_cols)
+
+    if train_df.is_empty():
+        return []
+
+    train_matrix = train_df.select(feature_cols).to_numpy()
+    np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    train_mean = train_matrix.mean(axis=0)
+    train_std = train_matrix.std(axis=0)
+    train_std[train_std == 0] = 1.0
+
+    predictions = []
+    for symbol in cluster_symbols:
+        sym_df = features_df.filter(pl.col("symbol") == symbol).sort("date")
+        # Use data up to period_end for building the window
+        sym_df = sym_df.filter(pl.col("date") <= period_end)
+        sym_df = sym_df.drop_nulls(subset=feature_cols)
+
+        if len(sym_df) < seq_len:
+            continue
+
+        recent = sym_df.tail(seq_len)
+        features = recent.select(feature_cols).to_numpy()
+        np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        norm_features = (features - train_mean) / train_std
+
+        x = torch.tensor(norm_features, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            probs = model.predict_proba(x).squeeze(0).numpy()
+
+        pred_class = int(np.argmax(probs))
+        predictions.append({
+            "symbol": symbol,
+            "cluster_id": cluster_id,
+            "prediction": CLASS_MAP[pred_class],
+            "confidence": float(probs.max()),
+            "prob_hold": float(probs[0]),
+            "prob_buy": float(probs[1]),
+            "prob_sell": float(probs[2]),
+        })
+
+    return predictions
+
+
 def aggregate_predictions(config: dict) -> pl.DataFrame:
     """Run inference on all clusters and consolidate predictions.
 

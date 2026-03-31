@@ -142,12 +142,12 @@ Ternary classification based on forward returns:
 ```
 forward_return = pct_change(adj_close, horizon).shift(-horizon)
 
-target = 1 (BUY)  if forward_return >= buy_threshold  (default +5%)
-target = 2 (SELL) if forward_return <= -sell_threshold (default -3%)
+target = 1 (BUY)  if forward_return >= buy_threshold  (default +2.5%)
+target = 2 (SELL) if forward_return <= -sell_threshold (default -1.5%)
 target = 0 (HOLD) otherwise
 ```
 
-Default horizon: 63 trading days (~3 months). Thresholds are configurable per cluster.
+Default horizon: 21 trading days (~1 month). Thresholds are configurable per cluster.
 
 ## Columns Dropped Before Output
 

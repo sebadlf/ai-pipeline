@@ -12,17 +12,161 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import tempfile
 
 import lightning as L
 import mlflow
+import numpy as np
 import polars as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
 
-from src.config import ClusterConfig, compute_split_dates, get_cluster_thresholds, get_features_parquet_path, load_config
+from src.config import ClusterConfig, SplitDates, compute_split_dates, get_cluster_thresholds, get_features_parquet_path, load_config
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
+
+
+def _run_split_eval(
+    prefix: str,
+    preds: list[dict],
+    period_start,
+    period_end,
+    client,
+    run_id: str,
+    config: dict,
+) -> None:
+    """Evaluate and log trade metrics for a single split period.
+
+    Args:
+        prefix: Metric prefix (e.g. "train", "val", "test").
+        preds: List of prediction dicts from run_inference_for_period().
+        period_start: Start date of the evaluation period.
+        period_end: End date of the evaluation period.
+        client: MLflow client instance.
+        run_id: MLflow run ID.
+        config: Full config dict.
+    """
+    from src.evaluation.backtest import load_test_prices, run_portfolio_backtest
+
+    if not preds:
+        print(f"    {prefix}: no predictions")
+        return
+
+    # Count signals
+    n_buy = sum(1 for p in preds if p["prediction"] == "BUY")
+    n_sell = sum(1 for p in preds if p["prediction"] == "SELL")
+    n_hold = sum(1 for p in preds if p["prediction"] == "HOLD")
+    print(f"    {prefix}: {n_buy} BUY, {n_sell} SELL, {n_hold} HOLD")
+
+    # Log signal counts
+    for key, value in {
+        f"{prefix}_trade_n_buy": n_buy,
+        f"{prefix}_trade_n_sell": n_sell,
+        f"{prefix}_trade_n_hold": n_hold,
+    }.items():
+        client.log_metric(run_id, key, value)
+
+    # Save CSV artifact
+    trades_df = pl.DataFrame(preds)
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+        trades_df.write_csv(f.name)
+        client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_trades")
+
+    # Filter actionable signals (BUY/SELL only) for backtest
+    actionable = [p for p in preds if p["prediction"] != "HOLD"]
+    if not actionable:
+        print(f"    {prefix}: no actionable signals, skipping backtest")
+        for key in ["total_return", "sharpe", "sortino", "calmar",
+                     "max_drawdown", "win_rate", "num_trades", "avg_return"]:
+            client.log_metric(run_id, f"{prefix}_trade_{key}", 0.0)
+        return
+
+    # Equal-weight allocation across actionable signals
+    weight = 1.0 / len(actionable)
+    allocations_df = pl.DataFrame([
+        {"symbol": p["symbol"], "weight": weight, "signal": p["prediction"]}
+        for p in actionable
+    ])
+
+    # Load prices for the period
+    symbols = [p["symbol"] for p in actionable]
+    prices_df = load_test_prices(symbols, period_start, period_end)
+
+    if prices_df.is_empty():
+        print(f"    {prefix}: no price data for period")
+        return
+
+    # Run backtest
+    bt_config = config.get("backtest", {})
+    result = run_portfolio_backtest(allocations_df, prices_df, bt_config)
+
+    # Log all backtest metrics with prefix
+    metrics = {
+        f"{prefix}_trade_total_return": result.total_return,
+        f"{prefix}_trade_sharpe": result.sharpe_ratio,
+        f"{prefix}_trade_sortino": result.sortino_ratio,
+        f"{prefix}_trade_calmar": result.calmar_ratio,
+        f"{prefix}_trade_max_drawdown": result.max_drawdown,
+        f"{prefix}_trade_win_rate": result.win_rate,
+        f"{prefix}_trade_num_trades": result.num_trades,
+        f"{prefix}_trade_avg_return": result.avg_trade_return,
+        f"{prefix}_trade_final_value": result.final_value,
+    }
+    for key, value in metrics.items():
+        val = float(value) if value is not None and np.isfinite(value) else 0.0
+        client.log_metric(run_id, key, val)
+
+    print(f"    {prefix}: return={result.total_return:+.2%}, "
+          f"sharpe={result.sharpe_ratio:.3f}, trades={result.num_trades}, "
+          f"win_rate={result.win_rate:.1%}")
+
+
+def _evaluate_cluster_trades(
+    model: LSTMForecaster,
+    config: dict,
+    cluster_id: str,
+    split_dates: SplitDates,
+    run_id: str,
+    clusters_parquet: str,
+) -> None:
+    """Run mini-backtests for a cluster across train/val/test splits.
+
+    Generates predictions for each temporal split, simulates trades with
+    equal-weight allocation, and logs all metrics + trade details as
+    MLflow artifacts with split-specific prefixes.
+    """
+    from src.aggregation.consolidate import run_inference_for_period
+
+    features_path = get_features_parquet_path(config)
+    features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
+
+    # Drop all-null columns (same as aggregation)
+    all_null_cols = [c for c in features_df.columns if features_df[c].null_count() == len(features_df)]
+    if all_null_cols:
+        features_df = features_df.drop(all_null_cols)
+
+    clusters_df = pl.read_parquet(clusters_parquet)
+    client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+
+    model.eval()
+    print(f"  Trade eval across splits:")
+
+    splits = [
+        ("train", split_dates.start_date, split_dates.train_end),
+        ("val", split_dates.val_start, split_dates.val_end),
+        ("test", split_dates.test_start, split_dates.today),
+    ]
+
+    for prefix, period_start, period_end in splits:
+        preds = run_inference_for_period(
+            cluster_id, model, features_df, clusters_df, config,
+            split_dates, period_start, period_end,
+        )
+        _run_split_eval(
+            prefix, preds, period_start, period_end,
+            client, run_id, config,
+        )
 
 
 def train_single_cluster(config: dict, cluster_id: str) -> None:
@@ -142,6 +286,15 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
         "num_classes": num_classes,
     }.items():
         client.log_param(run_id, key, value)
+
+    # Evaluate trading performance on test set
+    try:
+        _evaluate_cluster_trades(
+            model, config, cluster_id, split_dates,
+            run_id, cluster_cfg.output_parquet,
+        )
+    except Exception as e:
+        print(f"  Trade evaluation failed: {e}")
 
 
 def train_all_clusters(config: dict) -> None:

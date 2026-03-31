@@ -25,8 +25,9 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-trading}
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/mlflow
       MLFLOW_DEFAULT_ARTIFACT_ROOT: mlflow-artifacts:/mlruns
+      MLFLOW_ALLOW_ORIGINS: "*"
     ports:
       - "5000:5000"
     volumes:
@@ -36,7 +37,7 @@ services:
       mlflow server
       --host 0.0.0.0
       --port 5000
-      --backend-store-uri postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-trading}
+      --backend-store-uri postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/mlflow
       --default-artifact-root mlflow-artifacts:/mlruns
       --artifacts-destination /mlruns
       --serve-artifacts"

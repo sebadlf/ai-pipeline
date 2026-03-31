@@ -118,19 +118,19 @@ Split dates are computed by `compute_split_dates(config, reference_date)` in `sr
 
 ```
                     ┌──── train_end ────┐    ┌── val_end ──┐
-|------- 17yr ------|----- purge 63d ---|-- 1yr --|- purge -|-- 2yr --|
+|------- 17yr ------|----- purge 21d ---|-- 1yr --|- purge -|-- 2yr --|
 start            train_end           val_start  val_end   test_start  today
 ```
 
 | Segment | Duration | Purpose |
 |---|---|---|
 | Training | ~17 years | Learn price patterns |
-| Purge gap | 63 days | Prevent target label leakage |
+| Purge gap | 21 days | Prevent target label leakage |
 | Validation | 1 year | Hyperparameter tuning, early stopping |
-| Purge gap | 63 days | Same |
+| Purge gap | 21 days | Same |
 | Test | 2 years | Held-out evaluation |
 
-The 63-day purge gap matches the target horizon (63 trading days). Without this gap, validation samples near the train/val boundary would have target labels computed from prices that the training set also sees, causing overly optimistic validation metrics.
+The 21-day purge gap matches the target horizon (21 trading days). Without this gap, validation samples near the train/val boundary would have target labels computed from prices that the training set also sees, causing overly optimistic validation metrics.
 
 ## Per-Cluster Training
 

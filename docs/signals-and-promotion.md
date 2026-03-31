@@ -114,7 +114,7 @@ The `main()` function prints signals grouped by type, sorted by confidence:
 === HOLD (477 stocks) ===
   ...
 
-Target: +5% BUY / -3% SELL in 63 trading days (~3 months)
+Target: +2.5% BUY / -1.5% SELL in 21 trading days (~1 month)
 ```
 
 ### DataFrame Schema (returned by `generate_signals`)

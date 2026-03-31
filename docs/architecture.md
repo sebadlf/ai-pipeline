@@ -161,10 +161,10 @@ All parameters are centralized in `configs/default.yaml` and loaded by `src/conf
 
 ## Temporal Split Design
 
-All date boundaries are computed relative to today for daily retraining support. A 63-day purge gap between splits prevents label leakage (matching the 63-day forward-return target horizon):
+All date boundaries are computed relative to today for daily retraining support. A 21-day purge gap between splits prevents label leakage (matching the 21-day forward-return target horizon):
 
 ```
-start ──────── train_end │ PURGE 63d │ val_start ─── val_end │ PURGE 63d │ test_start ─── today
+start ──────── train_end │ PURGE 21d │ val_start ─── val_end │ PURGE 21d │ test_start ─── today
   (17yr)                                  (1yr)                               (2yr)
 ```
 
