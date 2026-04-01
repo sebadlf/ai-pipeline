@@ -129,7 +129,8 @@ ai-pipeline/
 │   ├── evaluation/
 │   │   ├── regime.py              # Market regime detection (bull/bear/sideways)
 │   │   ├── backtest.py            # Stage 5: Regime-aware portfolio backtesting
-│   │   └── promote.py             # Promote best per-cluster models to registry
+│   │   ├── promote.py             # Promote per-cluster models by trading metrics (val_trade_sortino)
+│   │   └── champion.py            # Shared champion checkpoint loader from MLflow registry
 │   └── strategy/
 │       └── runner.py              # Load champion models, generate BUY/SELL/HOLD signals
 ├── data/                          # Feature parquet files, clusters, predictions, portfolios
@@ -139,6 +140,7 @@ ai-pipeline/
 │   ├── test_aggregation.py
 │   ├── test_portfolio_metrics.py
 │   ├── test_portfolio_optimizer.py
+│   ├── test_promotion.py
 │   ├── test_regime.py
 │   └── test_backtest.py
 └── notebooks/
@@ -191,7 +193,7 @@ make portfolio   # Stage 4: Optimize 3 portfolio profiles
 make backtest    # Stage 5: Regime-aware backtesting
 make promote     # Register best per-cluster models as champions
 make signals     # Generate BUY/SELL/HOLD signals
-make pipeline    # Run: ingest → features → select-features → cluster → train → aggregate → portfolio → backtest
+make pipeline    # Run: ingest → features → select-features → cluster → train → promote → aggregate → portfolio → backtest
 make test        # Run all tests
 ```
 

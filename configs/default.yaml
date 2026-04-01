@@ -179,3 +179,16 @@ backtest:
     max_drawdown_limit: 0.25
     cooldown_days: 2
   output_dir: data/backtest_reports
+
+# Model promotion — champion selection criteria
+promotion:
+  primary_metric: val_trade_sortino       # main metric for candidate vs champion comparison
+  higher_is_better: true
+  tiebreak_metrics:                       # ordered list; used when primary is tied
+    - val_trade_sharpe
+    - val_trade_calmar
+  # Guards — candidate must pass ALL to be eligible
+  min_val_trade_num_trades: 1             # reject if backtest had fewer trades (0 = disabled)
+  max_val_trade_max_drawdown: -0.80       # reject if drawdown worse than this (more negative = worse)
+  # Legacy fallback: if val_trade_* metrics are missing (old runs), use val_acc instead
+  legacy_fallback_to_val_acc: true

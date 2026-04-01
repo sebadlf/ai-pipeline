@@ -11,14 +11,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
-import os
 
 import numpy as np
 import polars as pl
 import torch
 
 from src.config import ClusterConfig, compute_split_dates, get_selected_feature_names, load_config
+from src.evaluation.champion import download_champion_checkpoint
 from src.features.technical import build_features, load_ohlcv
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
@@ -27,35 +26,24 @@ CLASS_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
 
 
 def load_cluster_model(cluster_id: str) -> LSTMForecaster | None:
-    """Load the best checkpoint for a cluster.
+    """Load the champion checkpoint for a cluster from MLflow registry.
 
     Args:
         cluster_id: Cluster identifier.
 
     Returns:
-        Loaded model or None if no checkpoint found.
+        Loaded model or None if no champion found.
     """
-    pattern = f"**/{cluster_id}-best-*.ckpt"
-    checkpoints = sorted(
-        glob.glob(pattern, recursive=True),
-        key=lambda p: os.path.getmtime(p),
-    )
-    checkpoints = [c for c in checkpoints if not c.startswith("mlruns/")]
-
-    if not checkpoints:
-        # Try mlruns
-        mlruns_pattern = f"mlruns/**/{cluster_id}-best-*.ckpt"
-        checkpoints = sorted(
-            glob.glob(mlruns_pattern, recursive=True),
-            key=lambda p: os.path.getmtime(p),
+    try:
+        ckpt_path, run_id = download_champion_checkpoint(cluster_id)
+        print(f"    champion run {run_id[:12]}")
+        model = LSTMForecaster.load_from_checkpoint(
+            str(ckpt_path), map_location="cpu", weights_only=False,
         )
-
-    if not checkpoints:
+        model.eval()
+        return model
+    except FileNotFoundError:
         return None
-
-    model = LSTMForecaster.load_from_checkpoint(checkpoints[-1], map_location="cpu", weights_only=False)
-    model.eval()
-    return model
 
 
 def generate_signals(

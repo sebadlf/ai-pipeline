@@ -51,7 +51,7 @@ signals:
 	uv run python -m src.strategy.runner
 
 # --- Full pipeline ---
-pipeline: ingest features select-features cluster train aggregate portfolio backtest
+pipeline: ingest features select-features cluster train promote aggregate portfolio backtest
 
 # --- Tests ---
 test:

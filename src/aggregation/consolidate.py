@@ -24,6 +24,7 @@ from sqlalchemy import text
 
 from src.config import ClusterConfig, compute_split_dates, get_features_parquet_path, get_selected_feature_names, load_config
 from src.db import get_engine
+from src.evaluation.champion import download_champion_checkpoint
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
@@ -263,27 +264,28 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
     all_predictions = []
 
     for cluster_id in cluster_ids:
-        ckpt_path = find_best_checkpoint(cluster_id, config)
-        if ckpt_path is None:
-            print(f"  WARNING: No checkpoint found for {cluster_id}, skipping")
-            continue
+        # Load champion model from MLflow registry; fall back to local checkpoint
+        ckpt_path: str | None = None
+        model_run_id: str | None = None
+        try:
+            champion_path, model_run_id = download_champion_checkpoint(cluster_id)
+            ckpt_path = str(champion_path)
+            print(f"  Loading champion for {cluster_id} (run {model_run_id[:12]})")
+        except FileNotFoundError:
+            ckpt_path = find_best_checkpoint(cluster_id, config)
+            if ckpt_path is None:
+                print(f"  WARNING: No checkpoint found for {cluster_id}, skipping")
+                continue
+            print(f"  Loading local fallback for {cluster_id} from {ckpt_path}")
 
-        print(f"  Loading model for {cluster_id} from {ckpt_path}")
         model = LSTMForecaster.load_from_checkpoint(ckpt_path, map_location="cpu", weights_only=False)
         model.eval()
-
-        # Extract val_acc from checkpoint filename for confidence weighting
-        val_acc_match = re.search(r"val_acc=([0-9]+\.[0-9]+)", ckpt_path)
-        val_acc = float(val_acc_match.group(1)) if val_acc_match else 1.0
 
         preds = run_inference_for_cluster(
             cluster_id, model, features_df, clusters_df, config, split_dates
         )
         for p in preds:
-            p["model_run_id"] = None
-            p["model_val_acc"] = val_acc
-            # Scale confidence by model quality (val_acc as weight)
-            p["weighted_confidence"] = p["confidence"] * val_acc
+            p["model_run_id"] = model_run_id
         all_predictions.extend(preds)
 
     result_df = pl.DataFrame(all_predictions)
