@@ -42,7 +42,7 @@ class FocalLoss(nn.Module):
 
 
 class LSTMForecaster(L.LightningModule):
-    """LSTM with self-attention for ternary classification (BUY/SELL/HOLD).
+    """LSTM with self-attention for binary classification (UP/NOT_UP).
 
     Architecture: LayerNorm → LSTM → MultiHeadAttention → Residual → MLP Head.
 
@@ -50,7 +50,7 @@ class LSTMForecaster(L.LightningModule):
         input_size: Number of input features per timestep.
         hidden_size: LSTM hidden dimension.
         num_layers: Number of stacked LSTM layers.
-        num_classes: Number of output classes (3: HOLD=0, BUY=1, SELL=2).
+        num_classes: Number of output classes (2: NOT_UP=0, UP=1).
         dropout: Dropout rate between LSTM layers.
         learning_rate: Optimizer learning rate.
         weight_decay: L2 regularization strength.
@@ -65,7 +65,7 @@ class LSTMForecaster(L.LightningModule):
         input_size: int,
         hidden_size: int = 128,
         num_layers: int = 2,
-        num_classes: int = 3,
+        num_classes: int = 2,
         dropout: float = 0.3,
         learning_rate: float = 0.001,
         weight_decay: float = 0.0,
@@ -149,7 +149,7 @@ class LSTMForecaster(L.LightningModule):
         return self.head(last_hidden)
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Return class probabilities [prob_hold, prob_buy, prob_sell]."""
+        """Return class probabilities."""
         return torch.softmax(self(x), dim=-1)
 
     def _step(self, batch: tuple[torch.Tensor, torch.Tensor], stage: str) -> torch.Tensor:
@@ -166,11 +166,10 @@ class LSTMForecaster(L.LightningModule):
 
         if stage == "val":
             probs = torch.softmax(logits, dim=-1)
-            self.log("val_mean_prob_buy", probs[:, 1].mean(), prog_bar=True)
-            self.log("val_mean_prob_sell", probs[:, 2].mean(), prog_bar=True)
+            self.log("val_mean_prob_up", probs[:, 1].mean(), prog_bar=True)
 
             # Per-class accuracy
-            for cls_idx, cls_name in enumerate(["hold", "buy", "sell"]):
+            for cls_idx, cls_name in enumerate(["not_up", "up"]):
                 mask = y == cls_idx
                 if mask.sum() > 0:
                     cls_acc = (preds[mask] == y[mask]).float().mean()

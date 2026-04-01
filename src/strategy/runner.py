@@ -1,7 +1,7 @@
-"""Strategy runner — load per-cluster champion models and generate ternary signals.
+"""Strategy runner — load per-cluster champion models and generate trading signals.
 
-Generates BUY/SELL/HOLD recommendations for each symbol using its
-cluster's trained model.
+Generates BUY/SELL/HOLD trading signals for each symbol using its
+cluster's binary classification model (UP/NOT_UP → signal mapping).
 
 Usage:
     uv run python -m src.strategy.runner
@@ -16,13 +16,13 @@ import numpy as np
 import polars as pl
 import torch
 
+from src.aggregation.consolidate import map_binary_to_signal
 from src.config import ClusterConfig, compute_split_dates, get_selected_feature_names, load_config
 from src.evaluation.champion import download_champion_checkpoint
 from src.features.technical import build_features, load_ohlcv
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
 
-CLASS_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
 
 
 def load_cluster_model(cluster_id: str) -> LSTMForecaster | None:
@@ -50,7 +50,7 @@ def generate_signals(
     symbols: list[str],
     config: dict,
 ) -> pl.DataFrame:
-    """Generate ternary signals for all symbols using per-cluster models.
+    """Generate trading signals for all symbols using per-cluster binary models.
 
     Args:
         symbols: List of ticker symbols.
@@ -138,17 +138,17 @@ def generate_signals(
         with torch.no_grad():
             probs = model.predict_proba(x).squeeze(0).numpy()
 
-        pred_class = int(np.argmax(probs))
         last_date = sym_df["date"].tail(1).item()
+        signal, confidence, prob_buy, prob_sell, prob_hold = map_binary_to_signal(probs, config)
 
         results.append({
             "symbol": symbol,
             "date": last_date,
-            "signal": CLASS_MAP[pred_class],
-            "confidence": round(float(probs.max()), 4),
-            "prob_buy": round(float(probs[1]), 4),
-            "prob_sell": round(float(probs[2]), 4),
-            "prob_hold": round(float(probs[0]), 4),
+            "signal": signal,
+            "confidence": round(confidence, 4),
+            "prob_buy": round(prob_buy, 4),
+            "prob_sell": round(prob_sell, 4),
+            "prob_hold": round(prob_hold, 4),
             "cluster_id": cluster_id,
         })
 
@@ -190,9 +190,8 @@ def main() -> None:
                 )
 
     target_cfg = config.get("target", {})
-    print(f"\nTarget: +{target_cfg.get('buy_threshold', 0.05):.0%} BUY / "
-          f"-{target_cfg.get('sell_threshold', 0.03):.0%} SELL "
-          f"in {target_cfg.get('horizon', 63)} trading days (~3 months)")
+    print(f"\nTarget: UP ≥ +{target_cfg.get('buy_threshold', 0.025):.1%} "
+          f"in {target_cfg.get('horizon', 21)} trading days (~1 month)")
 
 
 if __name__ == "__main__":

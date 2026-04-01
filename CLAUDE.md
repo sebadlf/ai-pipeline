@@ -11,11 +11,12 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 - Output: cluster assignments (`data/clusters.parquet`, `cluster_assignments` table)
 
 ### Stage 2: Per-Cluster Model Training
-- Trains one LSTM model per cluster for ternary classification: BUY/SELL/HOLD
-  - **BUY**: stock rises ≥ buy_threshold (default +2.5%) in 21 trading days
-  - **SELL**: stock drops ≥ sell_threshold (default -1.5%) in 21 trading days
-  - **HOLD**: neither condition met
-- Thresholds are configurable per cluster as hyperparameters
+- Trains one LSTM model per cluster for binary classification: UP/NOT_UP
+  - **UP (1)**: stock rises ≥ buy_threshold (default +2.5%) in 21 trading days
+  - **NOT_UP (0)**: everything else
+- At inference, binary probabilities map to trading signals for the portfolio optimizer:
+  - prob_up ≥ 0.5 → BUY, prob_up ≤ 0.20 → SELL (short proxy), otherwise → HOLD
+- buy_threshold is configurable per cluster
 - Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`)
 
 ### Stage 3: Result Aggregation
@@ -62,7 +63,7 @@ Output: portfolio allocations with optimized weights (`data/portfolios.parquet`)
 - Model training with PyTorch Lightning (`accelerator="mps"`)
 - Portfolio optimization with scipy (SLSQP)
 - Regime-aware backtesting with comprehensive risk metrics
-- Strategy execution: load champion models and generate BUY/SELL/HOLD signals
+- Strategy execution: load champion models and generate trading signals
 
 ### Why this split
 Docker on Apple Silicon runs Linux VMs — PyTorch inside Docker has NO access to MPS. Training natively gives us GPU acceleration. Infrastructure (Postgres, MLflow) runs perfectly in Docker and benefits from containerization (reproducibility, isolation, easy teardown).
@@ -85,7 +86,7 @@ Configured via relative durations in `configs/default.yaml`, computed by `comput
 | Database | PostgreSQL + TimescaleDB | Time-series storage, hypertables |
 | Feature engineering | Polars | Rolling windows, technical indicators, macro features |
 | Clustering | scikit-learn | KMeans per sector, silhouette score validation |
-| ML framework | PyTorch | LSTM-based ternary classifier (BUY/SELL/HOLD) |
+| ML framework | PyTorch | LSTM-based binary classifier (UP/NOT_UP) |
 | Training wrapper | PyTorch Lightning | Training loop, MPS support, MLflow auto-logging |
 | Portfolio optimization | scipy | SLSQP optimizer for multi-objective portfolio design |
 | Experiment tracking | MLflow | Tracking, comparison, artifact storage, model registry |
@@ -132,7 +133,7 @@ ai-pipeline/
 │   │   ├── promote.py             # Promote per-cluster models by trading metrics (val_trade_sortino)
 │   │   └── champion.py            # Shared champion checkpoint loader from MLflow registry
 │   └── strategy/
-│       └── runner.py              # Load champion models, generate BUY/SELL/HOLD signals
+│       └── runner.py              # Load champion models, generate trading signals
 ├── data/                          # Feature parquet files, clusters, predictions, portfolios
 ├── tests/
 │   ├── test_features.py
@@ -158,7 +159,7 @@ ai-pipeline/
 | `sector_performance_daily` | Historical sector performance (avg daily change) |
 | `stock_sectors` | GICS sector mapping per symbol |
 | `cluster_assignments` | Stage 1 output: stock-to-cluster mapping |
-| `predictions` | Stage 3 output: aggregated BUY/SELL/HOLD predictions |
+| `predictions` | Stage 3 output: aggregated predictions with trading signals |
 | `portfolio_allocations` | Stage 4 output: optimized weights per profile |
 | `backtest_results` | Stage 5 output: metrics per (profile, regime) |
 
@@ -192,7 +193,7 @@ make aggregate   # Stage 3: Consolidate predictions
 make portfolio   # Stage 4: Optimize 3 portfolio profiles
 make backtest    # Stage 5: Regime-aware backtesting
 make promote     # Register best per-cluster models as champions
-make signals     # Generate BUY/SELL/HOLD signals
+make signals     # Generate trading signals
 make pipeline    # Run: ingest → features → select-features → cluster → train → promote → aggregate → portfolio → backtest
 make test        # Run all tests
 ```
@@ -213,8 +214,8 @@ PIPELINE_ENV=dev       # dev (5yr data) or prod (20yr data), default: dev
 ## Model details
 
 - **Architecture**: LSTM with LayerNorm, GELU activation, 2 layers, 128 hidden units
-- **Task**: Ternary classification — BUY (≥+2.5%), SELL (≤-1.5%), HOLD (neither) in 21 trading days
-- **Thresholds**: Configurable per cluster in `configs/default.yaml` under `clustering.cluster_thresholds`
+- **Task**: Binary classification — UP (≥+2.5%) vs NOT_UP in 21 trading days
+- **Threshold**: buy_threshold configurable per cluster in `configs/default.yaml` under `clustering.cluster_thresholds`
 - **Regularization**: Dropout (0.3), weight decay, gradient clipping (1.0), label smoothing (0.05)
 - **Optimizer**: AdamW with ReduceLROnPlateau scheduler
 - **Early stopping**: Monitors `val_acc`, patience 20 epochs

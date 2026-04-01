@@ -6,7 +6,7 @@ ingestion:
   benchmark_symbols:
     - SPY
   start_years_back:
-    dev: 5             # dev: 5 years (~2yr training after splits)
+    dev: 8             # dev: 8 years (~6yr training after splits)
     prod: 20           # prod: 20 years (full history)
   # In dev mode, limit to these sectors for faster iteration (null = all sectors)
   dev_sectors:
@@ -47,11 +47,14 @@ feature_selection:
   max_correlation: 0.95   # drop one of each pair with |corr| > 0.95
   min_variance_pct: 0.01  # drop bottom 1% by variance
 
-# Target — ternary classification (BUY/SELL/HOLD)
+# Target — binary classification: will the stock rise >= threshold in horizon days?
 target:
   horizon: 21          # trading days ahead (~1 month)
-  buy_threshold: 0.025 # +2.5% for BUY signal
-  sell_threshold: 0.015 # -1.5% for SELL signal (applied as negative)
+  buy_threshold: 0.025 # +2.5% → UP (1), otherwise NOT_UP (0)
+
+# Inference signal mapping — binary prob_up → trading signals for portfolio optimizer
+inference:
+  sell_proxy_max_prob_up: 0.20  # prob_up <= this → SELL signal (short proxy for aggressive profile)
 
 # Model
 model:
@@ -59,7 +62,7 @@ model:
   input_size: null  # auto-calculated from features
   hidden_size: 128
   num_layers: 2
-  num_classes: 3    # HOLD=0, BUY=1, SELL=2
+  num_classes: 2    # NOT_UP=0, UP=1
   dropout: 0.3
   num_attention_heads: 4  # multi-head self-attention post-LSTM (0 to disable)
   sequence_length: 30
@@ -76,7 +79,7 @@ training:
   per_cluster: true
   cluster_experiment_prefix: "cluster"
   # Temporal splits (relative to today, with purge gaps)
-  test_years: 2        # last 2 years = test
+  test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation
   purge_days: 21       # gap between splits = target horizon (avoids label leakage)
 
@@ -113,13 +116,12 @@ clustering:
     - fr_dividendyield
   min_cluster_size: 3
   output_parquet: data/clusters.parquet
-  # Per-cluster threshold overrides (populated after initial clustering run).
-  # Keys are cluster_id strings; missing clusters use target defaults.
+  # Per-cluster buy_threshold overrides (populated after initial clustering run).
+  # Keys are cluster_id strings; missing clusters use target.buy_threshold default.
   cluster_thresholds: {}
     # Example:
     # Technology_0:
     #   buy_threshold: 0.07
-    #   sell_threshold: 0.04
 
 # Aggregation — Stage 3
 aggregation:
@@ -182,13 +184,7 @@ backtest:
 
 # Model promotion — champion selection criteria
 promotion:
-  primary_metric: val_trade_sortino       # main metric for candidate vs champion comparison
+  primary_metric: val_acc                 # classification accuracy on validation set
   higher_is_better: true
   tiebreak_metrics:                       # ordered list; used when primary is tied
-    - val_trade_sharpe
-    - val_trade_calmar
-  # Guards — candidate must pass ALL to be eligible
-  min_val_trade_num_trades: 1             # reject if backtest had fewer trades (0 = disabled)
-  max_val_trade_max_drawdown: -0.80       # reject if drawdown worse than this (more negative = worse)
-  # Legacy fallback: if val_trade_* metrics are missing (old runs), use val_acc instead
-  legacy_fallback_to_val_acc: true
+    - val_acc_up                          # recall of UP class as tiebreaker

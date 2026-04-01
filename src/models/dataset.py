@@ -184,8 +184,11 @@ class TradingDataModule(L.LightningDataModule):
         )
         print(sd.summary())
 
-        # Class balance report for ternary targets
-        class_names = {0: "HOLD", 1: "BUY", 2: "SELL"}
+        # Binary classification: NOT_UP=0, UP=1
+        num_classes = 2
+        class_names = {0: "NOT_UP", 1: "UP"}
+
+        # Class balance report
         for name, y in [("train", train_y), ("val", val_y), ("test", test_y)]:
             counts = {cls_name: int((y == cls_idx).sum()) for cls_idx, cls_name in class_names.items()}
             total = len(y)
@@ -199,7 +202,7 @@ class TradingDataModule(L.LightningDataModule):
         unique, counts = np.unique(train_y, return_counts=True)
         total = counts.sum()
         weight_map = {int(cls): total / (len(unique) * cnt) for cls, cnt in zip(unique, counts)}
-        self.class_weights = [weight_map.get(i, 1.0) for i in range(max(int(unique.max()) + 1, 3))]
+        self.class_weights = [weight_map.get(i, 1.0) for i in range(num_classes)]
         print(f"  class weights — " + " | ".join(
             f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
         ))

@@ -21,7 +21,7 @@ import polars as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
 
-from src.config import ClusterConfig, SplitDates, compute_split_dates, get_cluster_thresholds, get_features_parquet_path, load_config
+from src.config import ClusterConfig, SplitDates, compute_split_dates, get_cluster_buy_threshold, get_features_parquet_path, load_config
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
@@ -122,6 +122,69 @@ def _run_split_eval(
           f"win_rate={result.win_rate:.1%}")
 
 
+def _log_confusion_matrix(
+    model: LSTMForecaster,
+    dm: TradingDataModule,
+    client,
+    run_id: str,
+) -> None:
+    """Compute and log confusion matrix + classification metrics to MLflow.
+
+    Evaluates the model on both validation and test sets, logs precision/recall/f1
+    for the UP class, and saves confusion matrix images as artifacts.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, precision_recall_fscore_support
+
+    import torch
+
+    model.eval()
+    class_names = ["NOT_UP", "UP"]
+
+    for split_name, dataloader in [("val", dm.val_dataloader()), ("test", dm.test_dataloader())]:
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in dataloader:
+                x, y = batch
+                logits = model(x)
+                preds = logits.argmax(dim=-1)
+                all_preds.append(preds.cpu())
+                all_targets.append(y.cpu())
+
+        all_preds = torch.cat(all_preds).numpy()
+        all_targets = torch.cat(all_targets).numpy()
+
+        # Confusion matrix
+        cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
+
+        # Precision, recall, F1 for UP class (index 1)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, labels=[0, 1], zero_division=0.0,
+        )
+        client.log_metric(run_id, f"{split_name}_precision_up", float(precision[1]))
+        client.log_metric(run_id, f"{split_name}_recall_up", float(recall[1]))
+        client.log_metric(run_id, f"{split_name}_f1_up", float(f1[1]))
+
+        print(f"  {split_name} — precision_up={precision[1]:.3f}, "
+              f"recall_up={recall[1]:.3f}, f1_up={f1[1]:.3f}")
+
+        # Save confusion matrix image
+        fig, ax = plt.subplots(figsize=(5, 4))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+        disp.plot(ax=ax, cmap="Blues", values_format="d")
+        ax.set_title(f"Confusion Matrix — {split_name}")
+        fig.tight_layout()
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            fig.savefig(f.name, dpi=100)
+            client.log_artifact(run_id, f.name, artifact_path="confusion_matrix")
+        plt.close(fig)
+
+
 def _evaluate_cluster_trades(
     model: LSTMForecaster,
     config: dict,
@@ -186,9 +249,9 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     print("Temporal splits:")
     print(split_dates.summary())
 
-    # Resolve per-cluster thresholds
-    buy_thresh, sell_thresh = get_cluster_thresholds(config, cluster_id)
-    print(f"  Thresholds — BUY: +{buy_thresh:.1%}, SELL: -{sell_thresh:.1%}")
+    # Resolve per-cluster threshold
+    buy_thresh = get_cluster_buy_threshold(config, cluster_id)
+    print(f"  Threshold — UP: +{buy_thresh:.1%}")
 
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
 
@@ -282,10 +345,15 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     for key, value in {
         "cluster_id": cluster_id,
         "buy_threshold": buy_thresh,
-        "sell_threshold": sell_thresh,
         "num_classes": num_classes,
     }.items():
         client.log_param(run_id, key, value)
+
+    # Confusion matrix + precision/recall/f1
+    try:
+        _log_confusion_matrix(model, dm, client, run_id)
+    except Exception as e:
+        print(f"  Confusion matrix logging failed: {e}")
 
     # Evaluate trading performance on test set
     try:

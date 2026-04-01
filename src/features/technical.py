@@ -410,27 +410,23 @@ def add_returns(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def add_ternary_target(
+def add_binary_target(
     df: pl.DataFrame,
-    horizon: int = 63,
-    buy_threshold: float = 0.05,
-    sell_threshold: float = 0.03,
+    horizon: int = 21,
+    buy_threshold: float = 0.025,
 ) -> pl.DataFrame:
-    """Add ternary classification target using adj_close when available.
+    """Add binary classification target: UP (1) if forward return >= threshold, else NOT_UP (0).
 
     Args:
         df: DataFrame with close/adj_close prices.
-        horizon: Number of trading days ahead (63 ~ 3 months).
-        buy_threshold: Minimum positive return for BUY (e.g. 0.05 = +5%).
-        sell_threshold: Minimum negative return for SELL (e.g. 0.03 = -3%, applied as negative).
+        horizon: Number of trading days ahead.
+        buy_threshold: Minimum positive return for UP class.
     """
     price_col = "adj_close" if "adj_close" in df.columns and df["adj_close"].null_count() < len(df) else "close"
     forward_return = pl.col(price_col).pct_change(horizon).shift(-horizon).over("symbol")
     return df.with_columns(
         pl.when(forward_return >= buy_threshold)
         .then(pl.lit(1))
-        .when(forward_return <= -sell_threshold)
-        .then(pl.lit(2))
         .otherwise(pl.lit(0))
         .cast(pl.Int64)
         .alias("target"),
@@ -538,13 +534,12 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
     ])
     df = df.with_columns(ratio_exprs)
 
-    # Target: ternary classification BUY/SELL/HOLD (needs close or adj_close)
+    # Target: binary classification UP/NOT_UP (needs close or adj_close)
     target_cfg = config.get("target", {})
-    df = add_ternary_target(
+    df = add_binary_target(
         df,
-        horizon=target_cfg.get("horizon", 63),
-        buy_threshold=target_cfg.get("buy_threshold", 0.05),
-        sell_threshold=target_cfg.get("sell_threshold", 0.03),
+        horizon=target_cfg.get("horizon", 21),
+        buy_threshold=target_cfg.get("buy_threshold", 0.025),
     )
 
     # Restore original column name if we swapped adj_close -> close

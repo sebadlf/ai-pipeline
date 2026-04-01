@@ -235,26 +235,22 @@ def get_selected_feature_names(config: dict) -> list[str] | None:
     return None
 
 
-def get_cluster_thresholds(
-    config: dict, cluster_id: str
-) -> tuple[float, float]:
-    """Resolve buy/sell thresholds for a cluster, falling back to defaults.
+def get_cluster_buy_threshold(config: dict, cluster_id: str) -> float:
+    """Resolve buy_threshold for a cluster, falling back to default.
 
     Args:
         config: Full config dict.
         cluster_id: Cluster identifier (e.g. "Technology_0").
 
     Returns:
-        Tuple of (buy_threshold, sell_threshold).
+        The buy_threshold for this cluster.
     """
     target_cfg = config.get("target", {})
-    default_buy = target_cfg.get("buy_threshold", 0.05)
-    default_sell = target_cfg.get("sell_threshold", 0.03)
+    default_buy = target_cfg.get("buy_threshold", 0.025)
 
     cluster_cfg = config.get("clustering", {})
     overrides = cluster_cfg.get("cluster_thresholds", {})
     if cluster_id in overrides:
-        ct = overrides[cluster_id]
-        return ct.get("buy_threshold", default_buy), ct.get("sell_threshold", default_sell)
+        return overrides[cluster_id].get("buy_threshold", default_buy)
 
-    return default_buy, default_sell
+    return default_buy

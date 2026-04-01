@@ -29,7 +29,29 @@ from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
 
-CLASS_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
+def map_binary_to_signal(
+    probs: np.ndarray,
+    config: dict,
+) -> tuple[str, float, float, float, float]:
+    """Map binary model probabilities to BUY/HOLD/SELL signal for downstream compatibility.
+
+    Args:
+        probs: Array of shape (2,) — [prob_not_up, prob_up].
+        config: Full config dict.
+
+    Returns:
+        (prediction, confidence, prob_buy, prob_sell, prob_hold)
+    """
+    prob_up = float(probs[1])
+    sell_max = config.get("inference", {}).get("sell_proxy_max_prob_up", 0.20)
+
+    if prob_up >= 0.5:
+        return "BUY", prob_up, prob_up, 0.0, 1.0 - prob_up
+    elif prob_up <= sell_max:
+        return "SELL", 1.0 - prob_up, prob_up, 1.0 - prob_up, 0.0
+    else:
+        confidence = max(prob_up, 1.0 - prob_up)
+        return "HOLD", confidence, prob_up, 0.0, 1.0 - prob_up
 
 
 def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
@@ -133,15 +155,15 @@ def run_inference_for_cluster(
         with torch.no_grad():
             probs = model.predict_proba(x).squeeze(0).numpy()
 
-        pred_class = int(np.argmax(probs))
+        prediction, confidence, prob_buy, prob_sell, prob_hold = map_binary_to_signal(probs, config)
         predictions.append({
             "symbol": symbol,
             "cluster_id": cluster_id,
-            "prediction": CLASS_MAP[pred_class],
-            "confidence": float(probs.max()),
-            "prob_hold": float(probs[0]),
-            "prob_buy": float(probs[1]),
-            "prob_sell": float(probs[2]),
+            "prediction": prediction,
+            "confidence": confidence,
+            "prob_hold": prob_hold,
+            "prob_buy": prob_buy,
+            "prob_sell": prob_sell,
         })
 
     return predictions
@@ -222,15 +244,15 @@ def run_inference_for_period(
         with torch.no_grad():
             probs = model.predict_proba(x).squeeze(0).numpy()
 
-        pred_class = int(np.argmax(probs))
+        prediction, confidence, prob_buy, prob_sell, prob_hold = map_binary_to_signal(probs, config)
         predictions.append({
             "symbol": symbol,
             "cluster_id": cluster_id,
-            "prediction": CLASS_MAP[pred_class],
-            "confidence": float(probs.max()),
-            "prob_hold": float(probs[0]),
-            "prob_buy": float(probs[1]),
-            "prob_sell": float(probs[2]),
+            "prediction": prediction,
+            "confidence": confidence,
+            "prob_hold": prob_hold,
+            "prob_buy": prob_buy,
+            "prob_sell": prob_sell,
         })
 
     return predictions

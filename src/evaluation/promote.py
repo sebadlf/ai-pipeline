@@ -35,35 +35,15 @@ def build_score_tuple(
 ) -> tuple[float, ...] | None:
     """Build a comparable score tuple from run metrics and promotion config.
 
-    Returns None when the primary metric is missing and legacy fallback
-    is disabled, or when guard conditions are not met.
+    Returns None when the primary metric is missing.
     """
-    primary = promotion_cfg.get("primary_metric", "val_trade_sortino")
+    primary = promotion_cfg.get("primary_metric", "val_acc")
     higher_is_better = promotion_cfg.get("higher_is_better", True)
     tiebreaks = promotion_cfg.get("tiebreak_metrics", [])
-    legacy_fallback = promotion_cfg.get("legacy_fallback_to_val_acc", True)
 
     primary_val = metrics.get(primary)
-
-    # Legacy fallback: primary metric missing → use val_acc as sole score
     if primary_val is None:
-        if legacy_fallback and "val_acc" in metrics:
-            return (metrics["val_acc"],)
         return None
-
-    # Guard: minimum number of trades
-    min_trades = promotion_cfg.get("min_val_trade_num_trades", 0)
-    if min_trades > 0:
-        num_trades = metrics.get("val_trade_num_trades", 0)
-        if num_trades < min_trades:
-            return None
-
-    # Guard: max drawdown (more negative = worse)
-    max_dd = promotion_cfg.get("max_val_trade_max_drawdown")
-    if max_dd is not None:
-        dd = metrics.get("val_trade_max_drawdown", 0.0)
-        if dd < max_dd:  # e.g. -0.85 < -0.80 → fails
-            return None
 
     # Build score tuple — higher is always better after sign flip
     sign = 1.0 if higher_is_better else -1.0
