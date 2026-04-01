@@ -137,17 +137,16 @@ Day-of-week and month-of-year effects are encoded as cyclical features using sin
 
 ### 12. Target Label
 
-Ternary classification based on forward returns:
+Binary classification based on forward returns:
 
 ```
 forward_return = pct_change(adj_close, horizon).shift(-horizon)
 
-target = 1 (BUY)  if forward_return >= buy_threshold  (default +2.5%)
-target = 2 (SELL) if forward_return <= -sell_threshold (default -1.5%)
-target = 0 (HOLD) otherwise
+target = 1 (UP)     if forward_return >= buy_threshold  (default +2.5%)
+target = 0 (NOT_UP) otherwise
 ```
 
-Default horizon: 21 trading days (~1 month). Thresholds are configurable per cluster.
+Default horizon: 21 trading days (~1 month). The `buy_threshold` is configurable per cluster.
 
 ## Columns Dropped Before Output
 

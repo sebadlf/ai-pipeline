@@ -32,10 +32,10 @@ def sample_prices() -> pl.DataFrame:
 
 @pytest.fixture
 def sample_allocations() -> pl.DataFrame:
-    """Portfolio with 60% AAPL (long) and 40% MSFT (long)."""
+    """Portfolio with 60% AAPL and 40% MSFT (long-only)."""
     return pl.DataFrame([
-        {"symbol": "AAPL", "weight": 0.6, "signal": "BUY", "cluster_id": "Tech_0"},
-        {"symbol": "MSFT", "weight": 0.4, "signal": "BUY", "cluster_id": "Tech_0"},
+        {"symbol": "AAPL", "weight": 0.6, "cluster_id": "Tech_0", "prob_up": 0.85},
+        {"symbol": "MSFT", "weight": 0.4, "cluster_id": "Tech_0", "prob_up": 0.72},
     ])
 
 
@@ -75,36 +75,10 @@ def test_backtest_long_portfolio_positive_return(
     assert result.total_return > 0, f"Expected positive return, got {result.total_return}"
 
 
-def test_backtest_short_position() -> None:
-    """Test that short positions profit when price drops."""
-    dates = pl.date_range(pl.date(2024, 1, 1), pl.date(2024, 1, 10), eager=True).to_list()
-    prices_data = [{"date": d, "symbol": "BAD", "close": float(p)}
-                   for d, p in zip(dates, np.linspace(100, 80, len(dates)))]
-    prices = pl.DataFrame(prices_data)
-
-    allocations = pl.DataFrame([
-        {"symbol": "BAD", "weight": 1.0, "signal": "SELL", "cluster_id": "Test_0"},
-    ])
-
-    config = {
-        "initial_capital": 100000,
-        "commission_pct": 0.001,
-        "risk": {
-            "position_stop_loss": 0.30,
-            "position_take_profit": 0.50,
-            "max_drawdown_limit": 0.50,
-            "cooldown_days": 2,
-        },
-    }
-
-    result = run_portfolio_backtest(allocations, prices, config)
-    assert result.total_return > 0, f"Short should profit on falling stock, got {result.total_return}"
-
-
 def test_backtest_empty_allocations(sample_prices: pl.DataFrame, backtest_config: dict) -> None:
     empty_alloc = pl.DataFrame(schema={
         "symbol": pl.Utf8, "weight": pl.Float64,
-        "signal": pl.Utf8, "cluster_id": pl.Utf8,
+        "cluster_id": pl.Utf8, "prob_up": pl.Float64,
     })
     result = run_portfolio_backtest(empty_alloc, sample_prices, backtest_config)
     assert result.final_value == 100000

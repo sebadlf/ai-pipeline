@@ -116,21 +116,20 @@ clustering:
     - volume_profile
     # ... (19 features listed in default.yaml)
   output_parquet: data/clusters.parquet
-  cluster_thresholds: {}   # per-cluster BUY/SELL threshold overrides
+  cluster_thresholds: {}   # per-cluster buy_threshold overrides
 ```
 
 ### Per-Cluster Threshold Overrides
 
-The `cluster_thresholds` map allows setting different BUY/SELL thresholds per cluster:
+The `cluster_thresholds` map allows setting a different `buy_threshold` per cluster:
 
 ```yaml
 cluster_thresholds:
   Technology_0:
     buy_threshold: 0.07
-    sell_threshold: 0.04
 ```
 
-Clusters not listed use the global defaults from `target.buy_threshold` and `target.sell_threshold`.
+Clusters not listed use the global default from `target.buy_threshold`.
 
 ## Output
 

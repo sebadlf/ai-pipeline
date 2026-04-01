@@ -14,7 +14,7 @@ Load the best trained checkpoint for each cluster, run inference on the most rec
 For each cluster_id in clusters.parquet:
     │
     ▼
-Find best checkpoint (.ckpt file)
+Find champion checkpoint from MLflow registry (fallback: local .ckpt)
     │
     ▼
 Load LSTMForecaster from checkpoint
@@ -29,10 +29,10 @@ For each symbol in cluster:
   Extract last seq_len rows for the symbol
     │
     ▼
-  Forward pass → softmax probabilities
+  Z-score normalize using training-period statistics
     │
     ▼
-  Classify: argmax → BUY(1) / HOLD(0) / SELL(2)
+  Forward pass → softmax → prob_up = P(UP)
     │
     ▼
 Merge all predictions into single DataFrame
@@ -43,34 +43,25 @@ Save to predictions.parquet + DB + MLflow
 
 ## Checkpoint Discovery
 
-`find_best_checkpoint(cluster_id, config)` searches for `.ckpt` files using a multi-path glob strategy:
+`find_best_checkpoint(cluster_id, config)` searches for `.ckpt` files using a multi-path glob strategy across `checkpoints/`, `mlruns/`, and the workspace root. If multiple checkpoints exist, the most recently modified file is selected.
 
-1. First pass: search `checkpoints/`, `lightning_logs/` under the workspace root, excluding `mlruns/`
-2. Second pass (fallback): search inside `mlruns/` directories
-
-The search pattern matches files containing the `cluster_id` in the path. If multiple checkpoints exist, the file with the highest `val_acc` in its filename is selected (filenames follow Lightning's pattern: `best-epoch=X-val_acc=Y.Z.ckpt`).
+The aggregation step first tries to download the **champion** checkpoint from MLflow Model Registry (via `download_champion_checkpoint()`). If no champion is registered for a cluster, it falls back to local checkpoint discovery.
 
 ## Inference Logic
 
-`run_inference_for_cluster(cluster_id, symbols, config)`:
+`run_inference_for_cluster(cluster_id, model, features_df, clusters_df, config, split_dates)`:
 
-1. Load checkpoint → reconstruct `LSTMForecaster` with matching `input_size`
-2. Load features parquet (respecting `get_features_parquet_path(config)`)
-3. Filter to `symbol in symbols`
-4. Exclude non-feature columns (`id`, `symbol`, `date`, `target`, `adj_close`)
+1. Filter features to symbols in the cluster
+2. Determine feature columns (from `get_selected_feature_names()` if enabled, else all non-meta columns)
+3. Validate feature count matches model's `input_size`
+4. Compute normalization statistics from training period only (Z-score)
 5. For each symbol:
    - Extract the last `seq_len` rows (most recent data)
    - If insufficient data, skip
-   - Convert to tensor, unsqueeze batch dimension
-   - Forward pass → `predict_proba()` returns `[prob_hold, prob_buy, prob_sell]`
-   - Classification: `argmax(probabilities)`
-6. Return list of dicts with `symbol`, `prediction`, `confidence`, `prob_hold`, `prob_buy`, `prob_sell`, `cluster_id`
-
-### Class Mapping
-
-```python
-CLASS_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
-```
+   - Normalize features using training-period mean/std
+   - Convert to tensor, forward pass → `predict_proba()` returns `[P(NOT_UP), P(UP)]`
+   - Extract `prob_up = float(probs[1])`
+6. Return list of dicts with `symbol`, `cluster_id`, `prob_up`
 
 ## Output
 
@@ -78,23 +69,19 @@ CLASS_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
 
 | Column | Type | Description |
 |---|---|---|
-| run_date | date | When predictions were generated |
 | symbol | str | Stock ticker |
 | cluster_id | str | Which cluster model produced this |
-| prediction | str | "BUY", "HOLD", or "SELL" |
-| confidence | float | Max probability across the 3 classes |
-| prob_hold | float | P(HOLD) |
-| prob_buy | float | P(BUY) |
-| prob_sell | float | P(SELL) |
+| prob_up | float | Probability of rising ≥ buy_threshold in 21 days |
+| model_run_id | str | MLflow run ID of the model used (null for local fallback) |
 
 ### `predictions` table (PostgreSQL)
 
-Same schema, upserted on `(run_date, symbol)` conflict.
+Same columns plus `run_date`, upserted on `(run_date, symbol)` conflict.
 
 ## MLflow Logging
 
 - **Experiment**: `aggregation`
-- **Metrics**: `total_predictions`, `buy_count`, `sell_count`, `hold_count`, `avg_confidence`
+- **Metrics**: `total_predictions`, `n_actionable` (prob_up ≥ 70%), `mean_prob_up`
 - **Artifact**: `data/predictions.parquet`
 
 ## Feature Selection Integration
@@ -109,3 +96,4 @@ When `feature_selection.enabled` is true in config:
 - **Missing checkpoint**: If no `.ckpt` file is found for a cluster, the cluster is skipped with a warning
 - **Insufficient data**: Symbols with fewer than `seq_len` recent rows are skipped
 - **Empty clusters**: If a cluster has no successful predictions, it is skipped
+- **Feature mismatch**: If the number of features doesn't match the model's `input_size`, a `ValueError` is raised

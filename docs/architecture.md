@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This project is a local ML pipeline for evaluating stock trading strategies on the full S&P 500 universe (~503 stocks, fetched dynamically). It runs on a Mac Mini M4 Pro (24GB RAM) using a hybrid Docker/native architecture. The pipeline produces daily BUY/SELL/HOLD recommendations with confidence scores for each stock, backed by backtested portfolio strategies with risk management.
+This project is a local ML pipeline for evaluating stock trading strategies on the full S&P 500 universe (~503 stocks, fetched dynamically). It runs on a Mac Mini M4 Pro (24GB RAM) using a hybrid Docker/native architecture. The pipeline produces prob_up predictions (probability of rising >= threshold) for each stock, used to construct risk-profiled long-only portfolios backed by regime-aware backtesting.
 
 ## System Context
 
@@ -49,7 +49,7 @@ Stage 3:  Aggregation   models + features ──▶ data/predictions.parquet
 Stage 4:  Portfolio      predictions + returns ──▶ data/portfolios.parquet
 Stage 5:  Backtest      portfolios + regime ──▶ backtest reports + DB
           Promotion     best checkpoints ──▶ MLflow Model Registry
-          Signals       champion models + live data ──▶ BUY/SELL/HOLD
+          Signals       champion models + live data ──▶ prob_up predictions
 ```
 
 ### Orchestration
@@ -121,7 +121,7 @@ Individual steps can be run independently. The pipeline is designed for daily ex
 | Feature engineering | Polars | latest | Rolling windows, joins, transforms |
 | Feature selection | numpy + Polars | latest | Null/variance/correlation filters |
 | Clustering | scikit-learn | latest | KMeans, PCA, silhouette scoring |
-| ML framework | PyTorch + Lightning | latest | LSTM ternary classifier |
+| ML framework | PyTorch + Lightning | latest | LSTM binary classifier (UP/NOT_UP) |
 | Portfolio optimization | scipy | latest | SLSQP multi-objective optimization |
 | Experiment tracking | MLflow | 3.10.1 | Tracking, registry, artifact store |
 | Dependency management | UV | latest | Fast Python package manager |
@@ -140,8 +140,8 @@ Individual steps can be run independently. The pipeline is designed for daily ex
 | `sector_performance_daily` | Sector returns | date, sector, average_change |
 | `stock_sectors` | GICS mapping | symbol, sector |
 | `cluster_assignments` | Cluster output | symbol, cluster_id, sector |
-| `predictions` | Model predictions | run_date, symbol, prediction, confidence, prob_* |
-| `portfolio_allocations` | Portfolio weights | run_date, profile, symbol, weight, signal |
+| `predictions` | Model predictions | run_date, symbol, cluster_id, prob_up |
+| `portfolio_allocations` | Portfolio weights | run_date, profile, symbol, weight, prob_up |
 | `backtest_results` | Backtest metrics | run_date, profile, regime, sharpe, sortino, ... |
 
 ## Configuration
@@ -151,7 +151,7 @@ All parameters are centralized in `configs/default.yaml` and loaded by `src/conf
 - **ingestion**: data source, lookback period, benchmark symbols
 - **features**: indicator windows, toggle flags for fundamentals/VIX/sector
 - **feature_selection**: null/variance/correlation thresholds
-- **target**: classification horizon, BUY/SELL thresholds
+- **target**: classification horizon (21 days), buy_threshold (+2.5%)
 - **model**: LSTM architecture (hidden_size, num_layers, dropout, seq_len)
 - **training**: optimizer params, temporal split durations, purge gap
 - **clustering**: KMeans config, PCA variance ratio, feature list, per-cluster threshold overrides

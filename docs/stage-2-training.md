@@ -8,7 +8,7 @@
 
 ## Purpose
 
-Train a separate LSTM ternary classifier (BUY/SELL/HOLD) for each stock cluster. Each model specializes in predicting forward 63-day returns for behaviorally similar stocks. Training uses PyTorch Lightning with MPS acceleration and logs everything to MLflow.
+Train a separate LSTM binary classifier (UP/NOT_UP) for each stock cluster. Each model specializes in predicting whether a stock will rise ≥ buy_threshold (default +2.5%) in 21 trading days. Training uses PyTorch Lightning with MPS acceleration and logs everything to MLflow.
 
 ## Model Architecture: LSTMForecaster
 
@@ -28,7 +28,7 @@ GELU activation
 Dropout
     │
     ▼
-Linear(hidden_size → num_classes=3)
+Linear(hidden_size → num_classes=2)
     │
     ▼
 Softmax (during inference only)
@@ -42,7 +42,7 @@ Softmax (during inference only)
 | `num_layers` | 2 | Deep enough for temporal patterns without vanishing gradients |
 | `dropout` | 0.3 | Regularization for financial data with low signal-to-noise |
 | `label_smoothing` | 0.05 | Prevents overconfident predictions on noisy labels |
-| `num_classes` | 3 | Ternary: 0=HOLD, 1=BUY, 2=SELL |
+| `num_classes` | 2 | Binary: 0=NOT_UP, 1=UP |
 
 ### Training Configuration
 

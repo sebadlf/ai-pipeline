@@ -14,28 +14,29 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 - Trains one LSTM model per cluster for binary classification: UP/NOT_UP
   - **UP (1)**: stock rises ≥ buy_threshold (default +2.5%) in 21 trading days
   - **NOT_UP (0)**: everything else
-- At inference, binary probabilities map to trading signals for the portfolio optimizer:
-  - prob_up ≥ 0.5 → BUY, prob_up ≤ 0.20 → SELL (short proxy), otherwise → HOLD
+- Model output is `prob_up` — the probability of UP. This is the sole signal used downstream
 - buy_threshold is configurable per cluster
 - Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`)
 
 ### Stage 3: Result Aggregation
-- Consolidates predictions from all per-cluster models into unified results
-- Output: predictions table with confidence scores and class probabilities (`data/predictions.parquet`)
+- Consolidates `prob_up` predictions from all per-cluster models into unified results
+- Output: predictions table with `prob_up` per symbol (`data/predictions.parquet`)
 
-### Stage 4: Portfolio Design (3 profiles)
+### Stage 4: Portfolio Design (3 profiles, long-only)
+
+Stocks with `prob_up >= min_prob_up` (per profile) are candidates for portfolio inclusion.
 
 **Aggressive Portfolio** (maximize return):
 - Primary: Sortino | Complementary: Omega | Validation: Information ratio
-- Allows short positions from SELL signals
+- min_prob_up: 0.70 | max_positions: 25
 
 **Moderate Portfolio** (risk/return balance):
 - Primary: Sharpe | Complementary: Calmar | Validation: Sortino
-- Long-only
+- min_prob_up: 0.75 | max_positions: 20
 
 **Conservative Portfolio** (capital preservation):
 - Primary: Calmar | Complementary: Sortino | Validation: Sharpe
-- Long-only, higher confidence threshold
+- min_prob_up: 0.80 | max_positions: 15
 
 Output: portfolio allocations with optimized weights (`data/portfolios.parquet`)
 
@@ -118,7 +119,7 @@ ai-pipeline/
 │   │   ├── selection.py           # Feature selection (null/variance/correlation filters)
 │   │   └── clustering.py          # Stage 1: KMeans clustering by sector
 │   ├── models/
-│   │   ├── base_model.py          # LSTMForecaster (3-class Lightning module)
+│   │   ├── base_model.py          # LSTMForecaster (binary UP/NOT_UP Lightning module)
 │   │   └── dataset.py             # TradingDataModule with per-cluster filtering
 │   ├── training/
 │   │   └── train.py               # Stage 2: Per-cluster training with MLflow
@@ -159,7 +160,7 @@ ai-pipeline/
 | `sector_performance_daily` | Historical sector performance (avg daily change) |
 | `stock_sectors` | GICS sector mapping per symbol |
 | `cluster_assignments` | Stage 1 output: stock-to-cluster mapping |
-| `predictions` | Stage 3 output: aggregated predictions with trading signals |
+| `predictions` | Stage 3 output: aggregated prob_up predictions per symbol |
 | `portfolio_allocations` | Stage 4 output: optimized weights per profile |
 | `backtest_results` | Stage 5 output: metrics per (profile, regime) |
 

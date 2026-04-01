@@ -90,18 +90,19 @@ def candidate_beats_champion(
 def _find_run_checkpoint(client: MlflowClient, run_id: str) -> str | None:
     """Return the artifact path to a .ckpt file in the run, or None."""
     artifacts = client.list_artifacts(run_id)
-    ckpt_dirs = [a for a in artifacts if a.path.startswith("checkpoints")]
-
-    if ckpt_dirs:
-        inner = client.list_artifacts(run_id, ckpt_dirs[0].path)
-        ckpts = [a.path for a in inner if a.path.endswith(".ckpt")]
-        if ckpts:
-            return ckpts[0]
 
     # Direct checkpoint files at root level
     ckpts = [a for a in artifacts if a.path.endswith(".ckpt")]
     if ckpts:
         return ckpts[0].path
+
+    # Search inside all artifact directories for .ckpt files
+    for artifact in artifacts:
+        if artifact.is_dir:
+            inner = client.list_artifacts(run_id, artifact.path)
+            ckpts = [a.path for a in inner if a.path.endswith(".ckpt")]
+            if ckpts:
+                return ckpts[0]
 
     return None
 

@@ -1,7 +1,7 @@
-"""Strategy runner — load per-cluster champion models and generate trading signals.
+"""Strategy runner — load per-cluster champion models and generate prob_up predictions.
 
-Generates BUY/SELL/HOLD trading signals for each symbol using its
-cluster's binary classification model (UP/NOT_UP → signal mapping).
+Generates prob_up (probability of rising >= buy_threshold) for each symbol
+using its cluster's binary classification model.
 
 Usage:
     uv run python -m src.strategy.runner
@@ -16,10 +16,9 @@ import numpy as np
 import polars as pl
 import torch
 
-from src.aggregation.consolidate import map_binary_to_signal
 from src.config import ClusterConfig, compute_split_dates, get_selected_feature_names, load_config
 from src.evaluation.champion import download_champion_checkpoint
-from src.features.technical import build_features, load_ohlcv
+from src.features.technical import build_features, fill_nulls, load_ohlcv
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
 
@@ -50,15 +49,14 @@ def generate_signals(
     symbols: list[str],
     config: dict,
 ) -> pl.DataFrame:
-    """Generate trading signals for all symbols using per-cluster binary models.
+    """Generate prob_up predictions for all symbols using per-cluster binary models.
 
     Args:
         symbols: List of ticker symbols.
         config: Full config dict.
 
     Returns:
-        DataFrame with columns [symbol, date, signal, confidence,
-        prob_buy, prob_sell, prob_hold, cluster_id].
+        DataFrame with columns [symbol, date, prob_up, cluster_id].
     """
     seq_len = config["model"]["sequence_length"]
     split_dates = compute_split_dates(config)
@@ -73,6 +71,9 @@ def generate_signals(
     df = load_ohlcv(symbols)
     df = build_features(df, config)
 
+    # Fill nulls (forward-fill fundamentals, median-fill rest)
+    df = fill_nulls(df)
+
     # Drop all-null columns
     all_null_cols = [c for c in df.columns if df[c].null_count() == len(df)]
     if all_null_cols:
@@ -85,8 +86,6 @@ def generate_signals(
         feature_cols = [c for c in selected_names if c in feature_cols]
         print(f"  Using {len(feature_cols)} selected features (from manifest)")
 
-    df = df.drop_nulls(subset=feature_cols)
-
     # Compute normalization from training period
     train_df = df.filter(pl.col("date") < train_end)
     if train_df.is_empty():
@@ -94,6 +93,7 @@ def generate_signals(
         return pl.DataFrame()
 
     train_matrix = train_df.select(feature_cols).to_numpy()
+    np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     train_mean = train_matrix.mean(axis=0)
     train_std = train_matrix.std(axis=0)
     train_std[train_std == 0] = 1.0
@@ -109,7 +109,7 @@ def generate_signals(
         else:
             print(f"  WARNING: No model found for {cid}")
 
-    # Generate signals per symbol
+    # Generate predictions per symbol
     results = []
     for symbol in symbols:
         # Find cluster for this symbol
@@ -132,6 +132,7 @@ def generate_signals(
 
         recent = sym_df.tail(seq_len)
         features = recent.select(feature_cols).to_numpy()
+        np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         features = (features - train_mean) / train_std
 
         x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
@@ -139,16 +140,12 @@ def generate_signals(
             probs = model.predict_proba(x).squeeze(0).numpy()
 
         last_date = sym_df["date"].tail(1).item()
-        signal, confidence, prob_buy, prob_sell, prob_hold = map_binary_to_signal(probs, config)
+        prob_up = float(probs[1])
 
         results.append({
             "symbol": symbol,
             "date": last_date,
-            "signal": signal,
-            "confidence": round(confidence, 4),
-            "prob_buy": round(prob_buy, 4),
-            "prob_sell": round(prob_sell, 4),
-            "prob_hold": round(prob_hold, 4),
+            "prob_up": round(prob_up, 4),
             "cluster_id": cluster_id,
         })
 
@@ -170,28 +167,36 @@ def main() -> None:
     parser.add_argument("--symbols", nargs="+", default=default_symbols)
     args = parser.parse_args()
 
-    print(f"Generating signals for {len(args.symbols)} symbols...\n")
+    print(f"Generating predictions for {len(args.symbols)} symbols...\n")
     signals = generate_signals(args.symbols, config)
 
     if signals.is_empty():
-        print("No signals generated.")
+        print("No predictions generated.")
         return
 
-    # Display results by signal type
-    for signal_type in ["BUY", "SELL", "HOLD"]:
-        subset = signals.filter(pl.col("signal") == signal_type)
-        if len(subset) > 0:
-            print(f"\n=== {signal_type} ({len(subset)} stocks) ===")
-            for row in subset.sort("confidence", descending=True).iter_rows(named=True):
-                print(
-                    f"  {row['symbol']:6s}  conf={row['confidence']:.1%}  "
-                    f"buy={row['prob_buy']:.1%}  sell={row['prob_sell']:.1%}  "
-                    f"hold={row['prob_hold']:.1%}  [{row['cluster_id']}]"
-                )
-
     target_cfg = config.get("target", {})
-    print(f"\nTarget: UP ≥ +{target_cfg.get('buy_threshold', 0.025):.1%} "
-          f"in {target_cfg.get('horizon', 21)} trading days (~1 month)")
+    buy_threshold = target_cfg.get("buy_threshold", 0.025)
+    min_prob_up = config.get("portfolio", {}).get("profiles", {}).get(
+        "aggressive", {}
+    ).get("min_prob_up", 0.70)
+
+    # Display actionable stocks (above min threshold)
+    actionable = signals.filter(pl.col("prob_up") >= min_prob_up).sort("prob_up", descending=True)
+    below = signals.filter(pl.col("prob_up") < min_prob_up).sort("prob_up", descending=True)
+
+    if len(actionable) > 0:
+        print(f"\n=== ACTIONABLE — prob_up >= {min_prob_up:.0%} ({len(actionable)} stocks) ===")
+        for row in actionable.iter_rows(named=True):
+            print(f"  {row['symbol']:6s}  prob_up={row['prob_up']:.1%}  [{row['cluster_id']}]")
+
+    if len(below) > 0:
+        print(f"\n=== BELOW THRESHOLD ({len(below)} stocks) ===")
+        for row in below.head(20).iter_rows(named=True):
+            print(f"  {row['symbol']:6s}  prob_up={row['prob_up']:.1%}  [{row['cluster_id']}]")
+        if len(below) > 20:
+            print(f"  ... and {len(below) - 20} more")
+
+    print(f"\nTarget: UP >= +{buy_threshold:.1%} in {target_cfg.get('horizon', 21)} trading days (~1 month)")
 
 
 if __name__ == "__main__":

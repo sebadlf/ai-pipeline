@@ -1,7 +1,7 @@
 """Portfolio-level backtesting with risk management and regime analysis (Stage 5).
 
-Simulates portfolio performance day by day for each (profile, regime) combination.
-Supports long and short positions, computes all risk metrics.
+Simulates long-only portfolio performance day by day for each (profile, regime)
+combination, computes all risk metrics.
 
 Usage:
     uv run python -m src.evaluation.backtest
@@ -28,14 +28,13 @@ from src.portfolio.metrics import compute_all_metrics
 
 @dataclass
 class Position:
-    """An open position in a single stock."""
+    """An open long position in a single stock."""
 
     symbol: str
     entry_price: float
     entry_date: dt.date
     shares: float
     cost_basis: float
-    direction: int = 1  # 1 = long, -1 = short
 
 
 @dataclass
@@ -66,10 +65,10 @@ def run_portfolio_backtest(
     config: dict,
     benchmark_returns: np.ndarray | None = None,
 ) -> BacktestResult:
-    """Run a portfolio-level backtest with risk management.
+    """Run a long-only portfolio backtest with risk management.
 
     Args:
-        allocations: DataFrame with columns [symbol, weight, signal].
+        allocations: DataFrame with columns [symbol, weight].
         prices: DataFrame with columns [date, symbol, close].
         config: Backtest config section.
         benchmark_returns: Optional benchmark daily returns.
@@ -88,10 +87,9 @@ def run_portfolio_backtest(
         return BacktestResult(final_value=initial_capital)
 
     # Build allocation map
-    alloc_map: dict[str, tuple[float, int]] = {}
+    alloc_map: dict[str, float] = {}
     for row in allocations.iter_rows(named=True):
-        direction = -1 if row["signal"] == "SELL" else 1
-        alloc_map[row["symbol"]] = (row["weight"], direction)
+        alloc_map[row["symbol"]] = row["weight"]
 
     dates = sorted(prices["date"].unique().to_list())
     symbols_in_portfolio = list(alloc_map.keys())
@@ -111,7 +109,7 @@ def run_portfolio_backtest(
     for day in dates:
         # Open initial positions on first day
         if day == first_day and not circuit_breaker:
-            for symbol, (weight, direction) in alloc_map.items():
+            for symbol, weight in alloc_map.items():
                 price_row = prices.filter(
                     (pl.col("date") == day) & (pl.col("symbol") == symbol)
                 )
@@ -131,7 +129,6 @@ def run_portfolio_backtest(
                     entry_date=day,
                     shares=shares,
                     cost_basis=capital_for_pos,
-                    direction=direction,
                 )
                 cash -= capital_for_pos
 
@@ -145,11 +142,7 @@ def run_portfolio_backtest(
                 continue
             current_price = price_row["close"][0]
 
-            # PnL depends on direction
-            if pos.direction == 1:  # long
-                pnl_pct = (current_price - pos.entry_price) / pos.entry_price
-            else:  # short
-                pnl_pct = (pos.entry_price - current_price) / pos.entry_price
+            pnl_pct = (current_price - pos.entry_price) / pos.entry_price
 
             # Stop-loss
             if pnl_pct <= -stop_loss:
@@ -177,11 +170,7 @@ def run_portfolio_backtest(
             )
             if not price_row.is_empty():
                 current_price = price_row["close"][0]
-                if pos.direction == 1:
-                    portfolio_value += pos.shares * current_price
-                else:
-                    # Short: value = 2 * cost_basis - shares * current_price
-                    portfolio_value += 2 * pos.cost_basis - pos.shares * current_price
+                portfolio_value += pos.shares * current_price
 
         equity_curve.append(portfolio_value)
 
@@ -273,11 +262,7 @@ def _close_position(pos: Position, current_price: float, commission_pct: float, 
         Net proceeds.
     """
     exit_price = current_price * (1 - slippage_pct)  # slippage on exit
-    if pos.direction == 1:  # long
-        return pos.shares * exit_price * (1 - commission_pct)
-    else:  # short
-        gross = pos.cost_basis + pos.shares * (pos.entry_price - exit_price)
-        return gross * (1 - commission_pct)
+    return pos.shares * exit_price * (1 - commission_pct)
 
 
 def load_test_prices(symbols: list[str], start_date: dt.date, end_date: dt.date) -> pl.DataFrame:

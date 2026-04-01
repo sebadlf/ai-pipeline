@@ -67,17 +67,17 @@ This reveals whether a portfolio that works well in bull markets collapses in be
 
 ```
 Day 1:
-  Open positions according to portfolio weights
+  Open long positions according to portfolio weights
   cash -= allocation × initial_capital per position
   shares = (capital_for_position × (1 - commission)) / price
 
 Each subsequent day:
   For each open position:
-    Compute PnL (long: current/entry - 1; short: entry/current - 1)
+    Compute PnL: (current_price - entry_price) / entry_price
     If PnL <= -stop_loss → close position
     If PnL >= +take_profit → close position
 
-  Compute portfolio equity = cash + sum(positions market value)
+  Compute portfolio equity = cash + sum(shares × current_price)
   Compute daily return and drawdown
 
   If drawdown >= max_drawdown_limit:
@@ -98,14 +98,12 @@ class Position:
     entry_date: dt.date
     shares: float
     cost_basis: float
-    direction: int  # 1 = long, -1 = short
 ```
 
-**Long position value**: `shares × current_price`
-**Short position value**: `2 × cost_basis - shares × current_price` (profit from price decline)
+All positions are **long-only**.
 
-**Closing a long**: `proceeds = shares × current_price × (1 - commission)`
-**Closing a short**: `proceeds = (cost_basis + shares × (entry_price - current_price)) × (1 - commission)`
+**Position value**: `shares × current_price`
+**Closing**: `proceeds = shares × current_price × (1 - commission)`
 
 ## Risk Management
 

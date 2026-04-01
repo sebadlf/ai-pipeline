@@ -29,31 +29,6 @@ from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import EXCLUDE_COLS
 
-def map_binary_to_signal(
-    probs: np.ndarray,
-    config: dict,
-) -> tuple[str, float, float, float, float]:
-    """Map binary model probabilities to BUY/HOLD/SELL signal for downstream compatibility.
-
-    Args:
-        probs: Array of shape (2,) — [prob_not_up, prob_up].
-        config: Full config dict.
-
-    Returns:
-        (prediction, confidence, prob_buy, prob_sell, prob_hold)
-    """
-    prob_up = float(probs[1])
-    sell_max = config.get("inference", {}).get("sell_proxy_max_prob_up", 0.20)
-
-    if prob_up >= 0.5:
-        return "BUY", prob_up, prob_up, 0.0, 1.0 - prob_up
-    elif prob_up <= sell_max:
-        return "SELL", 1.0 - prob_up, prob_up, 1.0 - prob_up, 0.0
-    else:
-        confidence = max(prob_up, 1.0 - prob_up)
-        return "HOLD", confidence, prob_up, 0.0, 1.0 - prob_up
-
-
 def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
     """Find the best model checkpoint for a cluster.
 
@@ -155,15 +130,11 @@ def run_inference_for_cluster(
         with torch.no_grad():
             probs = model.predict_proba(x).squeeze(0).numpy()
 
-        prediction, confidence, prob_buy, prob_sell, prob_hold = map_binary_to_signal(probs, config)
+        prob_up = float(probs[1])
         predictions.append({
             "symbol": symbol,
             "cluster_id": cluster_id,
-            "prediction": prediction,
-            "confidence": confidence,
-            "prob_hold": prob_hold,
-            "prob_buy": prob_buy,
-            "prob_sell": prob_sell,
+            "prob_up": prob_up,
         })
 
     return predictions
@@ -244,15 +215,11 @@ def run_inference_for_period(
         with torch.no_grad():
             probs = model.predict_proba(x).squeeze(0).numpy()
 
-        prediction, confidence, prob_buy, prob_sell, prob_hold = map_binary_to_signal(probs, config)
+        prob_up = float(probs[1])
         predictions.append({
             "symbol": symbol,
             "cluster_id": cluster_id,
-            "prediction": prediction,
-            "confidence": confidence,
-            "prob_hold": prob_hold,
-            "prob_buy": prob_buy,
-            "prob_sell": prob_sell,
+            "prob_up": prob_up,
         })
 
     return predictions
@@ -265,8 +232,7 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         config: Full config dict.
 
     Returns:
-        DataFrame with columns [symbol, cluster_id, prediction, confidence,
-        prob_buy, prob_sell, prob_hold, model_run_id].
+        DataFrame with columns [symbol, cluster_id, prob_up, model_run_id].
     """
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     split_dates = compute_split_dates(config)
@@ -314,9 +280,10 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
 
     # Summary
     if not result_df.is_empty():
-        for signal in ["BUY", "SELL", "HOLD"]:
-            count = result_df.filter(pl.col("prediction") == signal).height
-            print(f"  {signal}: {count} stocks")
+        n_actionable = result_df.filter(pl.col("prob_up") >= 0.70).height
+        mean_prob = result_df["prob_up"].mean()
+        print(f"  Actionable (prob_up >= 70%): {n_actionable} stocks")
+        print(f"  Mean prob_up: {mean_prob:.2%}")
 
     return result_df
 
@@ -347,18 +314,12 @@ def save_predictions(
         for row in result_df.iter_rows(named=True):
             stmt = text("""
                 INSERT INTO predictions
-                    (run_date, symbol, cluster_id, prediction, confidence,
-                     prob_buy, prob_sell, prob_hold, model_run_id)
+                    (run_date, symbol, cluster_id, prob_up, model_run_id)
                 VALUES
-                    (:run_date, :symbol, :cluster_id, :prediction, :confidence,
-                     :prob_buy, :prob_sell, :prob_hold, :model_run_id)
+                    (:run_date, :symbol, :cluster_id, :prob_up, :model_run_id)
                 ON CONFLICT (run_date, symbol) DO UPDATE SET
                     cluster_id = EXCLUDED.cluster_id,
-                    prediction = EXCLUDED.prediction,
-                    confidence = EXCLUDED.confidence,
-                    prob_buy = EXCLUDED.prob_buy,
-                    prob_sell = EXCLUDED.prob_sell,
-                    prob_hold = EXCLUDED.prob_hold,
+                    prob_up = EXCLUDED.prob_up,
                     model_run_id = EXCLUDED.model_run_id
             """)
             conn.execute(stmt, {**row, "run_date": run_date})
@@ -387,9 +348,9 @@ def main() -> None:
     mlflow.set_experiment("aggregation")
     with mlflow.start_run(run_name="prediction-aggregation"):
         mlflow.log_metric("total_predictions", len(result_df))
-        for signal in ["BUY", "SELL", "HOLD"]:
-            count = result_df.filter(pl.col("prediction") == signal).height
-            mlflow.log_metric(f"n_{signal.lower()}", count)
+        n_actionable = result_df.filter(pl.col("prob_up") >= 0.70).height
+        mlflow.log_metric("n_actionable", n_actionable)
+        mlflow.log_metric("mean_prob_up", result_df["prob_up"].mean())
         output_path = config.get("aggregation", {}).get("output_parquet", "data/predictions.parquet")
         mlflow.log_artifact(output_path)
     print("Logged aggregation results to MLflow")

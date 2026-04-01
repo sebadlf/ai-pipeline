@@ -560,6 +560,48 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
     return df
 
 
+def fill_nulls(df: pl.DataFrame) -> pl.DataFrame:
+    """Fill nulls in feature columns: forward-fill fundamentals, median-fill the rest.
+
+    Args:
+        df: DataFrame with feature columns (output of build_features).
+
+    Returns:
+        DataFrame with nulls filled. Rows with null critical columns are dropped.
+    """
+    meta_cols = {"id", "symbol", "date"}
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+
+    # Step 0: Convert float NaN to Polars null so fill operations work uniformly
+    float_cols = [c for c in feature_cols if df[c].dtype in (pl.Float32, pl.Float64)]
+    if float_cols:
+        df = df.with_columns([pl.col(c).fill_nan(None) for c in float_cols])
+
+    # Step 1: Forward-fill fundamental features per symbol (quarterly gaps are expected)
+    fundamental_cols = [c for c in feature_cols if c.startswith(("km_", "fr_"))]
+    if fundamental_cols:
+        df = df.with_columns(
+            [pl.col(c).forward_fill().over("symbol") for c in fundamental_cols]
+        )
+
+    # Step 2: Fill remaining nulls with per-symbol median for numeric features
+    remaining_null_cols = [c for c in feature_cols if df[c].null_count() > 0 and c != "target"]
+    if remaining_null_cols:
+        median_fills = []
+        for c in remaining_null_cols:
+            col_median = pl.col(c).median().over("symbol")
+            median_fills.append(pl.col(c).fill_null(col_median).alias(c))
+        df = df.with_columns(median_fills)
+
+    # Step 3: Drop rows that still have nulls in critical columns only
+    critical_cols = [c for c in ["return_1d", "return_5d", "return_20d", "target"]
+                     if c in df.columns]
+    if critical_cols:
+        df = df.drop_nulls(subset=critical_cols)
+
+    return df
+
+
 def main() -> None:
     """Generate features and save to parquet."""
     from src.config import resolve_dev_sectors
@@ -590,37 +632,10 @@ def main() -> None:
     df = build_features(df, config)
 
     initial_len = len(df)
+    df = fill_nulls(df)
+
     meta_cols = {"id", "symbol", "date"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
-
-    # Null diagnostics before filling
-    null_pcts = {c: df[c].null_count() / len(df) for c in feature_cols}
-    high_null = {c: pct for c, pct in null_pcts.items() if pct > 0.5}
-    if high_null:
-        print(f"  Features with >50% nulls ({len(high_null)}): "
-              + ", ".join(f"{c}({pct:.0%})" for c, pct in sorted(high_null.items(), key=lambda x: -x[1])[:10]))
-
-    # Step 1: Forward-fill fundamental features per symbol (quarterly gaps are expected)
-    fundamental_cols = [c for c in feature_cols if c.startswith(("km_", "fr_"))]
-    if fundamental_cols:
-        df = df.with_columns(
-            [pl.col(c).forward_fill().over("symbol") for c in fundamental_cols]
-        )
-
-    # Step 2: Fill remaining nulls with per-symbol median for numeric features
-    remaining_null_cols = [c for c in feature_cols if df[c].null_count() > 0 and c != "target"]
-    if remaining_null_cols:
-        median_fills = []
-        for c in remaining_null_cols:
-            col_median = pl.col(c).median().over("symbol")
-            median_fills.append(pl.col(c).fill_null(col_median).alias(c))
-        df = df.with_columns(median_fills)
-
-    # Step 3: Drop rows that still have nulls in critical columns only
-    critical_cols = [c for c in ["return_1d", "return_5d", "return_20d", "target"]
-                     if c in df.columns]
-    if critical_cols:
-        df = df.drop_nulls(subset=critical_cols)
 
     dropped = initial_len - len(df)
     print(f"  Dropped {dropped:,} rows with critical nulls ({dropped/max(initial_len,1):.1%})")

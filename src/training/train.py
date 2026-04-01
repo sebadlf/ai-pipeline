@@ -53,19 +53,16 @@ def _run_split_eval(
         print(f"    {prefix}: no predictions")
         return
 
-    # Count signals
-    n_buy = sum(1 for p in preds if p["prediction"] == "BUY")
-    n_sell = sum(1 for p in preds if p["prediction"] == "SELL")
-    n_hold = sum(1 for p in preds if p["prediction"] == "HOLD")
-    print(f"    {prefix}: {n_buy} BUY, {n_sell} SELL, {n_hold} HOLD")
+    # Summarize prob_up distribution
+    min_prob_up = 0.70  # default actionable threshold for eval
+    n_actionable = sum(1 for p in preds if p["prob_up"] >= min_prob_up)
+    n_total = len(preds)
+    mean_prob = sum(p["prob_up"] for p in preds) / n_total if n_total else 0
+    print(f"    {prefix}: {n_total} predictions, {n_actionable} actionable (prob_up >= {min_prob_up:.0%}), mean={mean_prob:.2%}")
 
-    # Log signal counts
-    for key, value in {
-        f"{prefix}_trade_n_buy": n_buy,
-        f"{prefix}_trade_n_sell": n_sell,
-        f"{prefix}_trade_n_hold": n_hold,
-    }.items():
-        client.log_metric(run_id, key, value)
+    # Log counts
+    client.log_metric(run_id, f"{prefix}_trade_n_actionable", n_actionable)
+    client.log_metric(run_id, f"{prefix}_trade_n_total", n_total)
 
     # Save CSV artifact
     trades_df = pl.DataFrame(preds)
@@ -73,19 +70,19 @@ def _run_split_eval(
         trades_df.write_csv(f.name)
         client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_trades")
 
-    # Filter actionable signals (BUY/SELL only) for backtest
-    actionable = [p for p in preds if p["prediction"] != "HOLD"]
+    # Filter actionable predictions (prob_up >= threshold) for backtest
+    actionable = [p for p in preds if p["prob_up"] >= min_prob_up]
     if not actionable:
-        print(f"    {prefix}: no actionable signals, skipping backtest")
+        print(f"    {prefix}: no actionable predictions, skipping backtest")
         for key in ["total_return", "sharpe", "sortino", "calmar",
                      "max_drawdown", "win_rate", "num_trades", "avg_return"]:
             client.log_metric(run_id, f"{prefix}_trade_{key}", 0.0)
         return
 
-    # Equal-weight allocation across actionable signals
+    # Equal-weight allocation across actionable predictions (long-only)
     weight = 1.0 / len(actionable)
     allocations_df = pl.DataFrame([
-        {"symbol": p["symbol"], "weight": weight, "signal": p["prediction"]}
+        {"symbol": p["symbol"], "weight": weight}
         for p in actionable
     ])
 

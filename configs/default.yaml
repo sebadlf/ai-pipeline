@@ -52,10 +52,6 @@ target:
   horizon: 21          # trading days ahead (~1 month)
   buy_threshold: 0.025 # +2.5% → UP (1), otherwise NOT_UP (0)
 
-# Inference signal mapping — binary prob_up → trading signals for portfolio optimizer
-inference:
-  sell_proxy_max_prob_up: 0.20  # prob_up <= this → SELL signal (short proxy for aggressive profile)
-
 # Model
 model:
   type: lstm
@@ -136,24 +132,21 @@ portfolio:
       validation_metric: information
       max_positions: 25
       max_sector_weight: 0.30
-      min_confidence: 0.50
-      allow_short: true
+      min_prob_up: 0.70            # minimum probability of UP to include in portfolio
     moderate:
       primary_metric: sharpe
       complementary_metric: calmar
       validation_metric: sortino
       max_positions: 20
       max_sector_weight: 0.25
-      min_confidence: 0.55
-      allow_short: false
+      min_prob_up: 0.75
     conservative:
       primary_metric: calmar
       complementary_metric: sortino
       validation_metric: sharpe
       max_positions: 15
       max_sector_weight: 0.20
-      min_confidence: 0.60
-      allow_short: false
+      min_prob_up: 0.80
   constraints:
     max_single_position: 0.10
     min_single_position: 0.01

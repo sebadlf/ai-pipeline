@@ -134,11 +134,7 @@ predictions = Table(
     Column("run_date", Date, nullable=False),
     Column("symbol", String(10), nullable=False),
     Column("cluster_id", String(50), nullable=False),
-    Column("prediction", String(4), nullable=False),
-    Column("confidence", Float, nullable=False),
-    Column("prob_buy", Float, nullable=False),
-    Column("prob_sell", Float, nullable=False),
-    Column("prob_hold", Float, nullable=False),
+    Column("prob_up", Float, nullable=False),
     Column("model_run_id", String(64)),
     UniqueConstraint("run_date", "symbol", name="uq_pred_run_symbol"),
 )
@@ -151,7 +147,7 @@ portfolio_allocations = Table(
     Column("profile", String(20), nullable=False),
     Column("symbol", String(10), nullable=False),
     Column("weight", Float, nullable=False),
-    Column("signal", String(4), nullable=False),
+    Column("prob_up", Float),
     Column("cluster_id", String(50), nullable=False),
     UniqueConstraint("run_date", "profile", "symbol", name="uq_alloc_run_profile_symbol"),
 )
@@ -190,6 +186,7 @@ def init_db(engine: Engine) -> None:
     metadata.create_all(engine)
 
     _migrate_treasury_columns(engine)
+    _migrate_predictions_to_prob_up(engine)
 
 
 def _migrate_treasury_columns(engine: Engine) -> None:
@@ -203,3 +200,29 @@ def _migrate_treasury_columns(engine: Engine) -> None:
             conn.execute(text(
                 f"ALTER TABLE treasury_rates ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION"
             ))
+
+
+def _migrate_predictions_to_prob_up(engine: Engine) -> None:
+    """Migrate predictions and portfolio_allocations tables to prob_up schema."""
+    with engine.begin() as conn:
+        # Predictions: add prob_up, backfill from prob_buy, drop old columns
+        conn.execute(text(
+            "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION"
+        ))
+        # Backfill: prob_buy already contained the raw prob_up value
+        conn.execute(text("""
+            UPDATE predictions SET prob_up = prob_buy
+            WHERE prob_up IS NULL AND prob_buy IS NOT NULL
+        """))
+        for col in ["prediction", "confidence", "prob_buy", "prob_sell", "prob_hold"]:
+            conn.execute(text(
+                f"ALTER TABLE predictions DROP COLUMN IF EXISTS {col}"
+            ))
+
+        # Portfolio allocations: add prob_up, drop signal
+        conn.execute(text(
+            "ALTER TABLE portfolio_allocations ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION"
+        ))
+        conn.execute(text(
+            "ALTER TABLE portfolio_allocations DROP COLUMN IF EXISTS signal"
+        ))

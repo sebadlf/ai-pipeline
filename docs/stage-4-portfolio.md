@@ -6,11 +6,11 @@
 
 ## Purpose
 
-Given unified predictions (BUY/SELL/HOLD with confidence scores for every stock), construct three risk-profiled portfolios by optimizing position weights. The optimization maximizes a combination of risk-adjusted return metrics (Sharpe, Sortino, Calmar, Omega, Information ratio) while enforcing diversification constraints.
+Given unified predictions with `prob_up` scores for every stock, construct three long-only risk-profiled portfolios by optimizing position weights. Each profile uses a different `min_prob_up` threshold to filter candidates. The optimization maximizes a combination of risk-adjusted return metrics (Sharpe, Sortino, Calmar, Omega, Information ratio) while enforcing diversification constraints.
 
 ## Three Risk Profiles
 
-The pipeline constructs three portfolios simultaneously, each targeting a different risk-return tradeoff:
+The pipeline constructs three portfolios simultaneously, each targeting a different risk-return tradeoff. All profiles are **long-only** — the `min_prob_up` threshold controls how selective each profile is.
 
 ### Aggressive
 
@@ -20,8 +20,7 @@ The pipeline constructs three portfolios simultaneously, each targeting a differ
 | Complementary metric | Omega | Captures full return distribution shape |
 | Max positions | 25 | Higher diversification allowance |
 | Max sector weight | 30% | Moderate sector concentration |
-| Min confidence | 50% | Lower threshold, more positions |
-| Allow short | Yes | Can take SELL signal positions |
+| Min prob_up | 70% | Lower threshold, more positions |
 
 ### Moderate
 
@@ -31,8 +30,7 @@ The pipeline constructs three portfolios simultaneously, each targeting a differ
 | Complementary metric | Calmar | Considers drawdown risk |
 | Max positions | 20 | Moderate diversification |
 | Max sector weight | 25% | Balanced sector exposure |
-| Min confidence | 55% | Medium confidence threshold |
-| Allow short | No | Long-only |
+| Min prob_up | 75% | Medium threshold |
 
 ### Conservative
 
@@ -42,8 +40,7 @@ The pipeline constructs three portfolios simultaneously, each targeting a differ
 | Complementary metric | Sortino | Downside protection |
 | Max positions | 15 | Concentrated, high-conviction |
 | Max sector weight | 20% | Strict sector limits |
-| Min confidence | 60% | Only high-confidence signals |
-| Allow short | No | Long-only |
+| Min prob_up | 80% | Only high-probability stocks |
 
 ## Optimization Algorithm
 
@@ -67,12 +64,6 @@ Validation period: val_start → val_end (1 year)
 
 Daily returns are loaded from `ohlcv_daily` for candidate symbols, pivoted into a `(n_days, n_symbols)` matrix, and portfolio returns are computed as `returns_matrix @ weights`.
 
-### Direction Handling
-
-For profiles that allow shorting (`allow_short: true`):
-- BUY signals use positive returns (standard long)
-- SELL signals negate returns in the matrix (short = profit from price decline)
-
 ### Constraints
 
 | Constraint | Type | Default | Description |
@@ -88,9 +79,8 @@ Sector constraints use the `stock_sectors` table to map each symbol to its GICS 
 
 Before optimization, candidates are filtered:
 
-1. **Confidence filter**: Only symbols with `confidence >= min_confidence` are included
-2. **Signal filter**: Long-only profiles keep only BUY predictions; short-enabled profiles keep BUY and SELL
-3. **Position limit**: Top N by confidence, where N = `max_positions`
+1. **prob_up filter**: Only symbols with `prob_up >= min_prob_up` (profile-specific) are included
+2. **Position limit**: Top N by `prob_up` descending, where N = `max_positions`
 
 If optimization fails (SLSQP doesn't converge), the optimizer falls back to equal-weight allocation across candidates.
 
@@ -155,8 +145,8 @@ Largest peak-to-trough decline as a fraction.
 | profile | str | "aggressive", "moderate", or "conservative" |
 | symbol | str | Stock ticker |
 | weight | float | Position weight (0.01 to 0.10) |
-| signal | str | "BUY" or "SELL" |
 | cluster_id | str | Which cluster the symbol belongs to |
+| prob_up | float | Probability of rising ≥ buy_threshold |
 
 ### `portfolio_allocations` table (PostgreSQL)
 

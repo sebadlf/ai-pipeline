@@ -153,7 +153,7 @@ def optimize_portfolio(
     """Optimize portfolio weights for a single profile.
 
     Args:
-        predictions: DataFrame with columns [symbol, cluster_id, prediction, confidence, ...].
+        predictions: DataFrame with columns [symbol, cluster_id, prob_up].
         returns_df: Historical daily returns [date, symbol, daily_return].
         profile_config: Profile configuration (metrics, constraints).
         constraints: Global constraints dict.
@@ -161,33 +161,26 @@ def optimize_portfolio(
         sectors_df: Optional DataFrame with [symbol, sector] for sector constraints.
 
     Returns:
-        DataFrame with columns [symbol, weight, signal, cluster_id].
+        DataFrame with columns [symbol, weight, cluster_id, prob_up].
     """
-    # Filter by confidence
-    candidates = predictions.filter(pl.col("confidence") >= profile_config.min_confidence)
+    empty_schema = {
+        "symbol": pl.Utf8, "weight": pl.Float64,
+        "cluster_id": pl.Utf8, "prob_up": pl.Float64,
+    }
 
-    # Filter by allowed signals
-    if profile_config.allow_short:
-        candidates = candidates.filter(pl.col("prediction").is_in(["BUY", "SELL"]))
-    else:
-        candidates = candidates.filter(pl.col("prediction") == "BUY")
+    # Filter by min_prob_up threshold
+    candidates = predictions.filter(pl.col("prob_up") >= profile_config.min_prob_up)
 
     if candidates.is_empty():
-        return pl.DataFrame(schema={
-            "symbol": pl.Utf8, "weight": pl.Float64,
-            "signal": pl.Utf8, "cluster_id": pl.Utf8,
-        })
+        return pl.DataFrame(schema=empty_schema)
 
-    # Limit to max_positions (sorted by confidence)
-    candidates = candidates.sort("confidence", descending=True).head(profile_config.max_positions)
+    # Limit to max_positions (sorted by prob_up)
+    candidates = candidates.sort("prob_up", descending=True).head(profile_config.max_positions)
     symbols = candidates["symbol"].to_list()
     n = len(symbols)
 
     if n == 0:
-        return pl.DataFrame(schema={
-            "symbol": pl.Utf8, "weight": pl.Float64,
-            "signal": pl.Utf8, "cluster_id": pl.Utf8,
-        })
+        return pl.DataFrame(schema=empty_schema)
 
     # Build returns matrix for candidates
     returns_matrix, _ = _build_returns_matrix(returns_df, symbols)
@@ -196,19 +189,9 @@ def optimize_portfolio(
         # Not enough data — equal weight fallback
         weights = np.ones(n) / n
     else:
-        # Handle short signals — negate returns for SELL positions
-        signal_map = dict(zip(
-            candidates["symbol"].to_list(),
-            candidates["prediction"].to_list(),
-        ))
-        direction = np.array([
-            -1.0 if signal_map.get(s) == "SELL" else 1.0 for s in symbols
-        ])
-        adjusted_matrix = returns_matrix[:, :n] * direction
-
-        # Optimization objective: maximize primary metric
+        # Optimization objective: maximize primary metric (long-only)
         def _objective(w: np.ndarray) -> float:
-            portfolio_returns = adjusted_matrix @ w
+            portfolio_returns = returns_matrix[:, :n] @ w
             # Deduct transaction costs at each rebalance period
             if commission_pct > 0 and rebalance_frequency_days > 0:
                 for day in range(0, len(portfolio_returns), rebalance_frequency_days):
@@ -276,8 +259,8 @@ def optimize_portfolio(
         rows.append({
             "symbol": symbol,
             "weight": float(weights[i]),
-            "signal": row["prediction"],
             "cluster_id": row["cluster_id"],
+            "prob_up": row["prob_up"],
         })
 
     return pl.DataFrame(rows)
@@ -400,12 +383,12 @@ def save_portfolios(
         for row in combined.iter_rows(named=True):
             stmt = text("""
                 INSERT INTO portfolio_allocations
-                    (run_date, profile, symbol, weight, signal, cluster_id)
+                    (run_date, profile, symbol, weight, prob_up, cluster_id)
                 VALUES
-                    (:run_date, :profile, :symbol, :weight, :signal, :cluster_id)
+                    (:run_date, :profile, :symbol, :weight, :prob_up, :cluster_id)
                 ON CONFLICT (run_date, profile, symbol) DO UPDATE SET
                     weight = EXCLUDED.weight,
-                    signal = EXCLUDED.signal,
+                    prob_up = EXCLUDED.prob_up,
                     cluster_id = EXCLUDED.cluster_id
             """)
             conn.execute(stmt, {**row, "run_date": run_date})

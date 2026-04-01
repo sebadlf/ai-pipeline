@@ -161,8 +161,7 @@ class PortfolioProfileConfig:
     validation_metric: str
     max_positions: int = 20
     max_sector_weight: float = 0.25
-    min_confidence: float = 0.55
-    allow_short: bool = False
+    min_prob_up: float = 0.70
 
     @classmethod
     def from_dict(cls, d: dict) -> PortfolioProfileConfig:
@@ -173,8 +172,7 @@ class PortfolioProfileConfig:
             validation_metric=d["validation_metric"],
             max_positions=d.get("max_positions", 20),
             max_sector_weight=d.get("max_sector_weight", 0.25),
-            min_confidence=d.get("min_confidence", 0.55),
-            allow_short=d.get("allow_short", False),
+            min_prob_up=d.get("min_prob_up", 0.70),
         )
 
 

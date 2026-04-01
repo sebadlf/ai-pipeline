@@ -9,7 +9,7 @@
 These two modules close the loop between model training and actionable trading recommendations:
 
 1. **Promotion** registers the best trained checkpoint per cluster in MLflow's Model Registry with a "champion" alias
-2. **Signal generation** loads the champion models, builds features from the latest data, and outputs BUY/SELL/HOLD recommendations with confidence scores
+2. **Signal generation** loads the champion models, builds features from the latest data, and outputs `prob_up` predictions (probability of rising ≥ buy_threshold) for each stock
 
 ## Model Promotion
 
@@ -20,7 +20,7 @@ For each cluster:
 1. Look up the MLflow experiment `{prefix}/{cluster_id}` (e.g., `cluster/Technology_0`)
 2. Search runs with `val_acc > 0`, ordered by `val_acc DESC`
 3. For each candidate run (best accuracy first):
-   - List artifacts looking for `.ckpt` files under `checkpoints/` or at root level
+   - List artifacts looking for `.ckpt` files in all artifact directories
    - If a checkpoint is found → register this run
    - If no checkpoint → try the next run
 4. Register the model:
@@ -50,19 +50,19 @@ The `champion` alias is a pointer that always resolves to the latest promoted ve
 1. Load all symbols from clusters.parquet (or --symbols override)
 2. Load OHLCV from database for those symbols
 3. Run build_features() — full feature engineering pipeline
-4. Drop all-null columns (e.g., adj_close when missing)
-5. Filter to selected features (if feature_selection.enabled)
-6. Drop rows with null features
+4. Run fill_nulls() — forward-fill fundamentals, fill_nan(None), median-fill
+5. Drop all-null columns
+6. Filter to selected features (if feature_selection.enabled)
 7. Compute normalization stats from training period only
-8. Load per-cluster checkpoint models
+8. Load per-cluster champion models from MLflow registry
 9. For each symbol:
    a. Find its cluster_id from clusters.parquet
    b. Extract last seq_len rows of features
    c. Z-score normalize using training statistics
    d. Forward pass through cluster model
-   e. predict_proba() → [P(HOLD), P(BUY), P(SELL)]
-   f. Classification: argmax → signal
-10. Output all signals as DataFrame
+   e. predict_proba() → [P(NOT_UP), P(UP)]
+   f. Extract prob_up = P(UP)
+10. Output all predictions as DataFrame
 ```
 
 ### Normalization
@@ -78,7 +78,7 @@ train_std  = train_df.select(feature_cols).to_numpy().std(axis=0)
 features = (raw_features - train_mean) / train_std
 ```
 
-This prevents data leakage from future data into the normalization statistics.
+This prevents data leakage from future data into the normalization statistics. Residual NaN values (from columns that are entirely null for a symbol) are replaced with 0.0 via `np.nan_to_num`.
 
 ### Feature Selection Integration
 
@@ -90,31 +90,24 @@ When `feature_selection.enabled` is true:
 
 ### Checkpoint Discovery
 
-The runner searches for checkpoints using glob patterns:
-
-```
-1. First pass: **/{cluster_id}-best-*.ckpt (excluding mlruns/)
-2. Fallback:   mlruns/**/{cluster_id}-best-*.ckpt
-```
-
-Within matches, the most recently modified file is selected. This allows the runner to find checkpoints whether they are stored directly by Lightning or as MLflow artifacts.
+The runner loads champion models from the MLflow Model Registry using `download_champion_checkpoint(cluster_id)`. If no champion is registered, it falls back to local checkpoint discovery via glob patterns.
 
 ### Output Format
 
-The `main()` function prints signals grouped by type, sorted by confidence:
+The `main()` function prints predictions in two groups, sorted by `prob_up` descending:
 
 ```
-=== BUY (15 stocks) ===
-  AAPL    conf=72.3%  buy=72.3%  sell=8.1%  hold=19.6%  [Technology_0]
-  MSFT    conf=68.1%  buy=68.1%  sell=5.2%  hold=26.7%  [Technology_0]
+=== ACTIONABLE (prob_up >= 70%) — 15 stocks ===
+  AAPL    prob_up=85.3%  [Technology_0]
+  MSFT    prob_up=78.1%  [Technology_0]
+  GOOGL   prob_up=72.4%  [Technology_1]
 
-=== SELL (8 stocks) ===
-  XOM     conf=65.0%  buy=12.0%  sell=65.0%  hold=23.0%  [Energy_1]
-
-=== HOLD (477 stocks) ===
+=== BELOW THRESHOLD — 488 stocks ===
+  JPM     prob_up=65.0%  [Finance_0]
   ...
 
-Target: +2.5% BUY / -1.5% SELL in 21 trading days (~1 month)
+Target: +2.5% in 21 trading days (~1 month)
+Min prob_up threshold: 70%
 ```
 
 ### DataFrame Schema (returned by `generate_signals`)
@@ -123,11 +116,7 @@ Target: +2.5% BUY / -1.5% SELL in 21 trading days (~1 month)
 |---|---|---|
 | symbol | str | Stock ticker |
 | date | date | Date of latest data used |
-| signal | str | "BUY", "SELL", or "HOLD" |
-| confidence | float | Max probability across 3 classes |
-| prob_buy | float | P(BUY) |
-| prob_sell | float | P(SELL) |
-| prob_hold | float | P(HOLD) |
+| prob_up | float | Probability of rising ≥ buy_threshold in 21 days |
 | cluster_id | str | Which cluster model produced this |
 
 ## CLI Arguments
@@ -147,10 +136,10 @@ Target: +2.5% BUY / -1.5% SELL in 21 trading days (~1 month)
 
 ## Typical Pipeline Integration
 
-In the full pipeline, promotion runs after backtesting and before signal generation:
+In the full pipeline, promotion runs after training and before aggregation:
 
 ```
-make train → make aggregate → make portfolio → make backtest → make promote → make signals
+make train → make promote → make aggregate → make portfolio → make backtest → make signals
 ```
 
 However, `make promote` and `make signals` can also be run independently:
