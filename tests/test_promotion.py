@@ -245,3 +245,4 @@ class TestCascadingCompare:
         beats, reason = candidate_beats_champion(cand, None, cascading_cfg)
         assert beats is True
         assert "no existing champion" in reason
+

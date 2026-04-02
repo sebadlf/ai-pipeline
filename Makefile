@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline pipeline-loop test
+.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline pipeline-loop clean-runs test
 
 setup:
 	uv venv
@@ -49,6 +49,9 @@ promote:
 
 signals:
 	uv run python -m src.strategy.runner
+
+clean-runs:
+	uv run python -m src.evaluation.clean_runs
 
 # --- Full pipeline ---
 pipeline: ingest features select-features cluster train promote aggregate portfolio backtest
