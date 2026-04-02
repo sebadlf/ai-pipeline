@@ -216,11 +216,16 @@ def _migrate_predictions_to_prob_up(engine: Engine) -> None:
         conn.execute(text(
             "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION"
         ))
-        # Backfill: prob_buy already contained the raw prob_up value
-        conn.execute(text("""
-            UPDATE predictions SET prob_up = prob_buy
-            WHERE prob_up IS NULL AND prob_buy IS NOT NULL
-        """))
+        # Backfill from prob_buy if it still exists (idempotent)
+        has_prob_buy = conn.execute(text("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'predictions' AND column_name = 'prob_buy'
+        """)).fetchone()
+        if has_prob_buy:
+            conn.execute(text("""
+                UPDATE predictions SET prob_up = prob_buy
+                WHERE prob_up IS NULL AND prob_buy IS NOT NULL
+            """))
         for col in ["prediction", "confidence", "prob_buy", "prob_sell", "prob_hold"]:
             conn.execute(text(
                 f"ALTER TABLE predictions DROP COLUMN IF EXISTS {col}"
