@@ -17,6 +17,8 @@ import datetime as dt
 from pathlib import Path
 
 import mlflow
+import warnings
+
 import numpy as np
 import polars as pl
 from sklearn.cluster import KMeans
@@ -435,7 +437,9 @@ def run_clustering(
         X = sector_df.select(feature_cols).to_numpy()
 
         # Fill NaN with column medians before scaling
-        col_medians = np.nanmedian(X, axis=0)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+            col_medians = np.nanmedian(X, axis=0)
         for j in range(X.shape[1]):
             mask = np.isnan(X[:, j])
             X[mask, j] = col_medians[j] if not np.isnan(col_medians[j]) else 0.0
@@ -479,13 +483,6 @@ def run_clustering(
         kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
         labels = kmeans.fit_predict(X_reduced)
 
-        # Recompute silhouette with final labels
-        n_unique = len(set(labels))
-        if n_unique > 1 and n_stocks > n_unique:
-            sil_score = float(silhouette_score(X_reduced, labels))
-        else:
-            sil_score = 0.0
-
         # Merge small clusters to nearest centroid
         symbols = sector_df["symbol"].to_list()
         cluster_counts: dict[int, list[int]] = {}
@@ -505,6 +502,13 @@ def run_clustering(
                             break
 
         unique_labels = sorted(set(labels))
+
+        # Compute silhouette AFTER merging so K=1 post-merge reports 0.0
+        n_unique = len(unique_labels)
+        if n_unique > 1 and n_stocks > n_unique:
+            sil_score = float(silhouette_score(X_reduced, labels))
+        else:
+            sil_score = 0.0
         label_map = {old: new for new, old in enumerate(unique_labels)}
 
         for idx, symbol in enumerate(symbols):
