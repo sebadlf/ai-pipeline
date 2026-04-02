@@ -28,7 +28,10 @@ services:
     environment:
       MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/mlflow
       MLFLOW_DEFAULT_ARTIFACT_ROOT: mlflow-artifacts:/mlruns
-      MLFLOW_ALLOW_ORIGINS: "*"
+      # MLflow 3.5+ validates Host headers (DNS rebinding). Default * allows any Host; set explicit
+      # hosts in .env for production (e.g. my-mac.local,203.0.113.10,localhost:*).
+      MLFLOW_SERVER_ALLOWED_HOSTS: ${MLFLOW_SERVER_ALLOWED_HOSTS:-*}
+      MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: ${MLFLOW_SERVER_CORS_ALLOWED_ORIGINS:-*}
     ports:
       - "5000:5000"
     volumes:
