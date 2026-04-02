@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline test
+.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline pipeline-loop test
 
 setup:
 	uv venv
@@ -52,6 +52,18 @@ signals:
 
 # --- Full pipeline ---
 pipeline: ingest features select-features cluster train promote aggregate portfolio backtest
+
+# --- Pipeline loop (infinite, Ctrl+C to stop) ---
+pipeline-loop:
+	@i=1; while true; do \
+		echo ""; \
+		echo "========================================"; \
+		echo "  Pipeline iteration $$i — $$(date)"; \
+		echo "========================================"; \
+		$(MAKE) pipeline || { echo "ERROR in iteration $$i"; exit 1; }; \
+		echo "  Iteration $$i complete — $$(date)"; \
+		i=$$((i + 1)); \
+	done
 
 # --- Tests ---
 test:
