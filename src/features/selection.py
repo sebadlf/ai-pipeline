@@ -51,17 +51,20 @@ def select_features(
     feature_cols = kept
 
     # 2. Remove near-zero variance features
-    numeric_df = df.select(feature_cols).to_pandas()
-    variances = numeric_df.var()
-    variance_threshold = variances.quantile(min_variance_pct)
-    low_var = variances[variances <= variance_threshold].index.tolist()
+    numeric_arr = df.select(feature_cols).to_numpy()
+    np.nan_to_num(numeric_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    variances = np.nanvar(numeric_arr, axis=0)
+    variance_threshold = np.nanquantile(variances, min_variance_pct)
+    low_var = [feature_cols[i] for i, v in enumerate(variances) if v <= variance_threshold]
     feature_cols = [c for c in feature_cols if c not in low_var]
     if verbose:
         print(f"  Variance filter (bottom {min_variance_pct:.0%}): dropped {len(low_var)}, kept {len(feature_cols)}")
 
     # 3. Remove highly correlated features (keep one from each correlated pair)
     if len(feature_cols) > 1:
-        corr_matrix = np.corrcoef(df.select(feature_cols).drop_nulls().to_numpy().T)
+        corr_arr = df.select(feature_cols).drop_nulls().to_numpy()
+        np.nan_to_num(corr_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        corr_matrix = np.corrcoef(corr_arr.T)
         np.fill_diagonal(corr_matrix, 0)
         to_drop: set[str] = set()
         for i in range(len(feature_cols)):

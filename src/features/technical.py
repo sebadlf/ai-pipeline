@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import warnings
 
 import polars as pl
 
@@ -232,8 +233,10 @@ def add_fundamental_features(
     ]
     fr_df = fr_df.with_columns(fr_qoq_exprs)
 
-    df = df.join_asof(km_df, on="date", by="symbol", strategy="backward")
-    df = df.join_asof(fr_df, on="date", by="symbol", strategy="backward")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Sortedness of columns cannot be checked")
+        df = df.join_asof(km_df, on="date", by="symbol", strategy="backward")
+        df = df.join_asof(fr_df, on="date", by="symbol", strategy="backward")
 
     return df
 
