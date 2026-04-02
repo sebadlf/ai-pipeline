@@ -352,6 +352,35 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     except Exception as e:
         print(f"  Confusion matrix logging failed: {e}")
 
+    # Precision-based evaluation with walk-forward stability
+    try:
+        from src.evaluation.precision_eval import evaluate_model as precision_evaluate, log_eval_to_mlflow
+        from src.config import PromotionEvalConfig
+
+        promotion_cfg = config.get("promotion", {})
+        if "evaluation" in promotion_cfg:
+            eval_config = PromotionEvalConfig.from_dict(promotion_cfg)
+            # Build sample_dates and forward_returns aligned with val valid_indices
+            seq_len = model_cfg["sequence_length"]
+            val_vi = dm.val_valid_indices
+            target_indices = val_vi + seq_len  # index of the target for each sample
+            sample_dates = dm.val_dates[target_indices] if dm.val_dates is not None and len(dm.val_dates) > 0 else np.array([])
+            fwd_returns = dm.val_forward_returns[target_indices] if dm.val_forward_returns is not None else None
+
+            eval_result = precision_evaluate(
+                model=model,
+                val_dataloader=dm.val_dataloader(),
+                eval_config=eval_config,
+                sample_dates=sample_dates,
+                forward_returns=fwd_returns,
+                buy_threshold=buy_thresh,
+            )
+            log_eval_to_mlflow(eval_result, client, run_id)
+            print(f"  Precision eval: stability_score={eval_result.stability_score:.4f}, "
+                  f"auc_pr={eval_result.auc_pr:.4f}, stage={eval_result.elimination_stage}")
+    except Exception as e:
+        print(f"  Precision evaluation failed: {e}")
+
     # Evaluate trading performance on test set
     try:
         _evaluate_cluster_trades(

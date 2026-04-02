@@ -39,7 +39,7 @@ def select_features(
     max_correlation = sel_cfg.get("max_correlation", 0.95)
     min_variance_pct = sel_cfg.get("min_variance_pct", 0.01)
 
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
+    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS and not c.startswith("forward_return_")]
     initial_count = len(feature_cols)
 
     # 1. Remove features with too many nulls

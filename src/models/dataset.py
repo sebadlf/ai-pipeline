@@ -16,6 +16,11 @@ _NUM_WORKERS = min(os.cpu_count() or 0, 8)
 EXCLUDE_COLS = {"id", "symbol", "date", "target", "adj_close"}
 
 
+def _is_feature_col(col: str) -> bool:
+    """Check if a column should be used as a model feature."""
+    return col not in EXCLUDE_COLS and not col.startswith("forward_return_")
+
+
 class TimeSeriesDataset(Dataset):
     """Sliding window dataset with symbol-boundary-aware indexing.
 
@@ -115,6 +120,10 @@ class TradingDataModule(L.LightningDataModule):
         self.train_ds: TimeSeriesDataset | None = None
         self.val_ds: TimeSeriesDataset | None = None
         self.test_ds: TimeSeriesDataset | None = None
+        # Evaluation support: dates and forward returns for walk-forward precision eval
+        self.val_dates: np.ndarray | None = None
+        self.val_forward_returns: np.ndarray | None = None
+        self.val_valid_indices: np.ndarray | None = None
 
     def setup(self, stage: str | None = None) -> None:
         """Load data, normalize, and create date-based temporal splits per symbol."""
@@ -134,13 +143,19 @@ class TradingDataModule(L.LightningDataModule):
             print(f"  Filtered to cluster {self.cluster_id}: {len(cluster_symbols)} symbols")
 
         sd = self.split_dates
-        self.feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
+        self.feature_cols = [c for c in df.columns if _is_feature_col(c)]
 
         all_train_x, all_train_y = [], []
         all_val_x, all_val_y = [], []
         all_test_x, all_test_y = [], []
         train_valid, val_valid, test_valid = [], [], []
         train_offset, val_offset, test_offset = 0, 0, 0
+
+        # Evaluation support: accumulate val dates and forward returns
+        all_val_dates: list[np.ndarray] = []
+        fwd_col = [c for c in df.columns if c.startswith("forward_return_")]
+        fwd_col_name = fwd_col[0] if fwd_col else None
+        all_val_fwd_ret: list[np.ndarray] = []
 
         for symbol in df["symbol"].unique().sort().to_list():
             sym_df = df.filter(pl.col("symbol") == symbol)
@@ -163,6 +178,12 @@ class TradingDataModule(L.LightningDataModule):
                     if n > self.seq_len:
                         valid_list.extend(range(offset, offset + n - self.seq_len))
 
+            # Accumulate val dates and forward returns for precision evaluation
+            if len(val_df) > 0:
+                all_val_dates.append(val_df["date"].to_numpy())
+                if fwd_col_name and fwd_col_name in val_df.columns:
+                    all_val_fwd_ret.append(val_df[fwd_col_name].to_numpy().astype(np.float64))
+
             train_offset += len(train_df)
             val_offset += len(val_df)
             test_offset += len(test_df)
@@ -176,6 +197,11 @@ class TradingDataModule(L.LightningDataModule):
 
         train_vi = np.array(train_valid, dtype=np.int64)
         val_vi = np.array(val_valid, dtype=np.int64)
+
+        # Store evaluation arrays for precision eval (indexed by val_vi + seq_len)
+        self.val_dates = np.concatenate(all_val_dates) if all_val_dates else np.array([], dtype="datetime64[ns]")
+        self.val_forward_returns = np.concatenate(all_val_fwd_ret) if all_val_fwd_ret else None
+        self.val_valid_indices = val_vi
         test_vi = np.array(test_valid, dtype=np.int64)
 
         print(

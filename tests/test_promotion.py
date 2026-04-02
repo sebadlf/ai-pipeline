@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.evaluation.promote import build_score_tuple, candidate_beats_champion
+from src.evaluation.promote import build_score_tuple, candidate_beats_champion, cascading_compare
 
 
 # --------------------------------------------------------------------------- #
@@ -113,3 +113,135 @@ class TestCandidateBeatsChampion:
         metrics = {"val_acc": 0.80, "val_acc_up": 0.70}
         beats, _ = candidate_beats_champion(metrics, metrics, promo_cfg)
         assert beats is False
+
+
+# --------------------------------------------------------------------------- #
+# Cascading elimination                                                        #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def cascading_cfg() -> dict:
+    return {
+        "evaluation": {
+            "thresholds": [0.50, 0.60, 0.70],
+            "primary_threshold": 0.60,
+            "min_recall": 0.10,
+            "min_signals_per_window": 5,
+        },
+        "walk_forward": {
+            "window_size": 63,
+            "step_size": 21,
+            "max_std_ratio": 0.15,
+            "stability_penalty": 1.5,
+        },
+        "ranking": {
+            "tiebreak_margin": 0.01,
+        },
+    }
+
+
+class TestCascadingCompare:
+    def test_no_champion_promotes(self, cascading_cfg: dict) -> None:
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.65,
+            "val_fp_severity": 0.01,
+        }
+        beats, reason = cascading_compare(cand, None, cascading_cfg)
+        assert beats is True
+        assert "no existing champion" in reason
+
+    def test_candidate_fails_filters(self, cascading_cfg: dict) -> None:
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_stability",
+            "val_stability_score": 0.80,
+        }
+        beats, reason = cascading_compare(cand, None, cascading_cfg)
+        assert beats is False
+        assert "failed filters" in reason
+
+    def test_champion_failed_candidate_passed(self, cascading_cfg: dict) -> None:
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.60,
+        }
+        champ = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_recall",
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "champion failed" in reason
+
+    def test_candidate_better_score(self, cascading_cfg: dict) -> None:
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.75,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.60,
+        }
+        beats, _ = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+
+    def test_candidate_worse_score(self, cascading_cfg: dict) -> None:
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.50,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.70,
+        }
+        beats, _ = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+
+    def test_tiebreak_by_fp_severity(self, cascading_cfg: dict) -> None:
+        """Within margin, prefer lower FP severity."""
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.700,
+            "val_fp_severity": 0.005,  # less severe
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.705,  # within 0.01 margin
+            "val_fp_severity": 0.020,  # more severe
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "tiebreak" in reason
+
+    def test_tiebreak_champion_wins(self, cascading_cfg: dict) -> None:
+        """Within margin, champion has better FP severity."""
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.700,
+            "val_fp_severity": 0.030,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.705,
+            "val_fp_severity": 0.010,
+        }
+        beats, _ = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+
+    def test_legacy_config_uses_legacy_path(self, promo_cfg: dict) -> None:
+        """Without 'evaluation' key, uses legacy tuple comparison."""
+        cand = {"val_acc": 0.85, "val_acc_up": 0.70}
+        champ = {"val_acc": 0.80, "val_acc_up": 0.75}
+        beats, _ = candidate_beats_champion(cand, champ, promo_cfg)
+        assert beats is True
+
+    def test_cascading_config_uses_cascading_path(self, cascading_cfg: dict) -> None:
+        """With 'evaluation' key, uses cascading comparison."""
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.75,
+        }
+        beats, reason = candidate_beats_champion(cand, None, cascading_cfg)
+        assert beats is True
+        assert "no existing champion" in reason

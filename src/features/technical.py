@@ -425,6 +425,7 @@ def add_binary_target(
     price_col = "adj_close" if "adj_close" in df.columns and df["adj_close"].null_count() < len(df) else "close"
     forward_return = pl.col(price_col).pct_change(horizon).shift(-horizon).over("symbol")
     return df.with_columns(
+        forward_return.alias(f"forward_return_{horizon}d"),
         pl.when(forward_return >= buy_threshold)
         .then(pl.lit(1))
         .otherwise(pl.lit(0))

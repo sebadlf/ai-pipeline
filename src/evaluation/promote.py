@@ -1,9 +1,11 @@
 """Promote the best trained model per cluster to MLflow Model Registry.
 
-For each cluster, finds the most recent training run with a checkpoint,
-scores it using validation-period trading metrics (val_trade_sortino by
-default), compares against the current registry champion, and only
-promotes the candidate when it strictly beats the champion.
+Supports two promotion modes:
+1. **Cascading elimination** (new): Precision-focused evaluation with walk-forward
+   stability, minimum recall, and FP severity tiebreaking. Activated when
+   `promotion.evaluation` section exists in config.
+2. **Legacy tuple comparison**: Simple metric comparison with tiebreakers.
+   Used as fallback when no `evaluation` section is present.
 
 Usage:
     uv run python -m src.evaluation.promote
@@ -19,14 +21,14 @@ import mlflow
 import polars as pl
 from mlflow.tracking import MlflowClient
 
-from src.config import ClusterConfig, load_config
+from src.config import ClusterConfig, PromotionEvalConfig, load_config
 from src.keys import MLFLOW_TRACKING_URI
 
 MODEL_NAME_PREFIX = "trading-forecaster"
 
 
 # --------------------------------------------------------------------------- #
-# Scoring helpers                                                              #
+# Legacy scoring helpers                                                       #
 # --------------------------------------------------------------------------- #
 
 def build_score_tuple(
@@ -54,6 +56,76 @@ def build_score_tuple(
     return tuple(score)
 
 
+# --------------------------------------------------------------------------- #
+# Cascading elimination                                                        #
+# --------------------------------------------------------------------------- #
+
+def cascading_compare(
+    cand_metrics: dict[str, Any],
+    champ_metrics: dict[str, Any] | None,
+    promotion_cfg: dict,
+) -> tuple[bool, str]:
+    """Compare candidate vs champion using cascading elimination.
+
+    Args:
+        cand_metrics: Candidate run metrics (includes params as strings).
+        champ_metrics: Champion run metrics, or None if no champion.
+        promotion_cfg: Full promotion config section.
+
+    Returns:
+        (should_promote, reason) tuple.
+    """
+    eval_config = PromotionEvalConfig.from_dict(promotion_cfg)
+
+    # Check candidate passed all filters
+    cand_passed = cand_metrics.get("val_passed_all_filters")
+    if cand_passed != "true":
+        cand_stage = cand_metrics.get("val_elimination_stage", "unknown")
+        return False, f"candidate failed filters ({cand_stage})"
+
+    cand_score = cand_metrics.get("val_stability_score")
+    if cand_score is None:
+        return False, "candidate missing val_stability_score"
+    cand_score = float(cand_score)
+
+    # No champion → promote
+    if champ_metrics is None:
+        return True, f"no existing champion (score={cand_score:.4f})"
+
+    # Check if champion passed filters
+    champ_passed = champ_metrics.get("val_passed_all_filters")
+    if champ_passed != "true":
+        return True, f"champion failed filters, candidate passed (score={cand_score:.4f})"
+
+    champ_score = champ_metrics.get("val_stability_score")
+    if champ_score is None:
+        return True, f"champion missing stability_score, candidate has {cand_score:.4f}"
+    champ_score = float(champ_score)
+
+    # Compare stability scores
+    margin = eval_config.tiebreak_margin
+    if cand_score > champ_score + margin:
+        return True, f"candidate score {cand_score:.4f} > champion {champ_score:.4f}"
+
+    if cand_score < champ_score - margin:
+        return False, f"candidate score {cand_score:.4f} <= champion {champ_score:.4f}"
+
+    # Within tiebreak margin — prefer lower FP severity
+    cand_fp_sev = float(cand_metrics.get("val_fp_severity", float("inf")))
+    champ_fp_sev = float(champ_metrics.get("val_fp_severity", float("inf")))
+
+    if cand_fp_sev < champ_fp_sev:
+        return True, (f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
+                      f"< champion {champ_fp_sev:.4f} (scores within {margin})")
+
+    return False, (f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
+                   f">= champion {champ_fp_sev:.4f} (scores within {margin})")
+
+
+# --------------------------------------------------------------------------- #
+# Unified comparison                                                           #
+# --------------------------------------------------------------------------- #
+
 def candidate_beats_champion(
     candidate_metrics: dict[str, Any],
     champion_metrics: dict[str, Any] | None,
@@ -61,9 +133,16 @@ def candidate_beats_champion(
 ) -> tuple[bool, str]:
     """Compare candidate vs champion using promotion config.
 
+    Uses cascading elimination when `evaluation` section exists in config,
+    otherwise falls back to legacy tuple comparison.
+
     Returns:
         (should_promote, reason) tuple.
     """
+    if "evaluation" in promotion_cfg:
+        return cascading_compare(candidate_metrics, champion_metrics, promotion_cfg)
+
+    # Legacy path
     cand_score = build_score_tuple(candidate_metrics, promotion_cfg)
 
     if cand_score is None:
@@ -111,13 +190,67 @@ def _find_run_checkpoint(client: MlflowClient, run_id: str) -> str | None:
 # Per-cluster promotion                                                        #
 # --------------------------------------------------------------------------- #
 
+def _find_best_candidate(
+    client: MlflowClient,
+    runs: list,
+    promotion_cfg: dict,
+) -> tuple[Any | None, str | None]:
+    """Find the best candidate run among recent runs.
+
+    For cascading mode: finds the run with highest val_stability_score
+    that passed all filters and has a checkpoint.
+
+    For legacy mode: finds the most recent run with a checkpoint.
+
+    Returns:
+        (run, checkpoint_path) or (None, None).
+    """
+    use_cascading = "evaluation" in promotion_cfg
+
+    if not use_cascading:
+        # Legacy: first run with checkpoint
+        for run in runs:
+            ckpt = _find_run_checkpoint(client, run.info.run_id)
+            if ckpt is not None:
+                return run, ckpt
+        return None, None
+
+    # Cascading: collect all runs with checkpoints and filter status
+    candidates = []
+    for run in runs:
+        ckpt = _find_run_checkpoint(client, run.info.run_id)
+        if ckpt is None:
+            continue
+
+        # Merge metrics and params for comparison
+        all_metrics = {**run.data.metrics, **run.data.params}
+        passed = all_metrics.get("val_passed_all_filters")
+        score = all_metrics.get("val_stability_score")
+
+        if passed == "true" and score is not None:
+            candidates.append((run, ckpt, float(score)))
+
+    if not candidates:
+        # Fallback: no run passed filters; try most recent with checkpoint
+        for run in runs:
+            ckpt = _find_run_checkpoint(client, run.info.run_id)
+            if ckpt is not None:
+                return run, ckpt
+        return None, None
+
+    # Rank by stability_score descending
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    best_run, best_ckpt, _ = candidates[0]
+    return best_run, best_ckpt
+
+
 def promote_cluster_model(
     client: MlflowClient,
     cluster_id: str,
     promotion_cfg: dict,
     prefix: str = "cluster",
 ) -> bool:
-    """Evaluate and conditionally promote the latest model for a cluster.
+    """Evaluate and conditionally promote the best model for a cluster.
 
     Args:
         client: MLflow client.
@@ -135,7 +268,7 @@ def promote_cluster_model(
         print(f"  No experiment found for {cluster_id}")
         return False
 
-    # Find the most recent run with a checkpoint (candidate)
+    # Find recent runs
     runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
         filter_string="",
@@ -147,27 +280,27 @@ def promote_cluster_model(
         print(f"  No runs found for {cluster_id}")
         return False
 
-    # Pick first run that has a usable checkpoint
-    candidate_run = None
-    best_ckpt = None
-    for run in runs:
-        ckpt = _find_run_checkpoint(client, run.info.run_id)
-        if ckpt is not None:
-            candidate_run = run
-            best_ckpt = ckpt
-            break
+    # Find best candidate
+    candidate_run, best_ckpt = _find_best_candidate(client, runs, promotion_cfg)
 
     if candidate_run is None:
         print(f"  No checkpoint found for {cluster_id}")
         return False
 
-    candidate_metrics = candidate_run.data.metrics
+    # Merge metrics and params for comparison
+    candidate_metrics = {**candidate_run.data.metrics, **candidate_run.data.params}
     run_id = candidate_run.info.run_id
     run_name = candidate_run.data.tags.get("mlflow.runName", run_id[:12])
 
-    primary = promotion_cfg.get("primary_metric", "val_trade_sortino")
-    primary_val = candidate_metrics.get(primary, "N/A")
-    print(f"  {cluster_id}: candidate run {run_name} ({primary}={primary_val})")
+    use_cascading = "evaluation" in promotion_cfg
+    if use_cascading:
+        score = candidate_metrics.get("val_stability_score", "N/A")
+        stage = candidate_metrics.get("val_elimination_stage", "N/A")
+        print(f"  {cluster_id}: candidate run {run_name} (stability_score={score}, stage={stage})")
+    else:
+        primary = promotion_cfg.get("primary_metric", "val_acc")
+        primary_val = candidate_metrics.get(primary, "N/A")
+        print(f"  {cluster_id}: candidate run {run_name} ({primary}={primary_val})")
 
     # Load current champion metrics (if any)
     model_name = f"{MODEL_NAME_PREFIX}-{cluster_id}"
@@ -176,9 +309,14 @@ def promote_cluster_model(
     try:
         mv = client.get_model_version_by_alias(model_name, "champion")
         champion_run = client.get_run(mv.run_id)
-        champion_metrics = champion_run.data.metrics
-        champ_primary = champion_metrics.get(primary, "N/A")
-        print(f"    current champion: run {mv.run_id[:12]} ({primary}={champ_primary})")
+        champion_metrics = {**champion_run.data.metrics, **champion_run.data.params}
+        if use_cascading:
+            champ_score = champion_metrics.get("val_stability_score", "N/A")
+            print(f"    current champion: run {mv.run_id[:12]} (stability_score={champ_score})")
+        else:
+            primary = promotion_cfg.get("primary_metric", "val_acc")
+            champ_primary = champion_metrics.get(primary, "N/A")
+            print(f"    current champion: run {mv.run_id[:12]} ({primary}={champ_primary})")
     except mlflow.exceptions.MlflowException:
         print(f"    no existing champion for {model_name}")
 
@@ -205,8 +343,15 @@ def promote_cluster_model(
     )
 
     # Set tags for audit
-    client.set_model_version_tag(model_name, mv.version, "promotion_metric", primary)
-    client.set_model_version_tag(model_name, mv.version, "promotion_score", str(primary_val))
+    if use_cascading:
+        score_val = candidate_metrics.get("val_stability_score", "N/A")
+        client.set_model_version_tag(model_name, mv.version, "promotion_metric", "val_stability_score")
+        client.set_model_version_tag(model_name, mv.version, "promotion_score", str(score_val))
+    else:
+        primary = promotion_cfg.get("primary_metric", "val_acc")
+        primary_val = candidate_metrics.get(primary, "N/A")
+        client.set_model_version_tag(model_name, mv.version, "promotion_metric", primary)
+        client.set_model_version_tag(model_name, mv.version, "promotion_score", str(primary_val))
     client.set_model_version_tag(model_name, mv.version, "promotion_reason", reason)
 
     client.set_registered_model_alias(model_name, "champion", mv.version)

@@ -175,9 +175,21 @@ backtest:
     cooldown_days: 2
   output_dir: data/backtest_reports
 
-# Model promotion — champion selection criteria
+# Model promotion — precision-focused cascading elimination
 promotion:
-  primary_metric: val_acc                 # classification accuracy on validation set
+  evaluation:
+    thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    primary_threshold: 0.65               # threshold for stability score and recall filters
+    min_recall: 0.10                      # minimum recall at primary_threshold
+    min_signals_per_window: 5             # minimum UP predictions per walk-forward window
+  walk_forward:
+    window_size: 63                       # 3x target horizon (trading days)
+    step_size: 21                         # = target horizon (trading days)
+    max_std_ratio: 0.15                   # max precision_std / precision_mean
+    stability_penalty: 1.5                # score = mean - penalty * std
+  ranking:
+    tiebreak_margin: 0.01                 # within this margin, tiebreak by FP severity
+  # Legacy fallback (used when evaluation section is absent)
+  primary_metric: val_stability_score
   higher_is_better: true
-  tiebreak_metrics:                       # ordered list; used when primary is tied
-    - val_acc_up                          # recall of UP class as tiebreaker
+  tiebreak_metrics: []

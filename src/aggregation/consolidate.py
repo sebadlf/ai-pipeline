@@ -27,7 +27,7 @@ from src.db import get_engine
 from src.evaluation.champion import download_champion_checkpoint
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
-from src.models.dataset import EXCLUDE_COLS
+from src.models.dataset import EXCLUDE_COLS, _is_feature_col
 
 def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
     """Find the best model checkpoint for a cluster.
@@ -87,7 +87,7 @@ def run_inference_for_cluster(
     if selected:
         feature_cols = [c for c in selected if c in features_df.columns]
     else:
-        feature_cols = [c for c in features_df.columns if c not in EXCLUDE_COLS]
+        feature_cols = [c for c in features_df.columns if _is_feature_col(c)]
 
     # Validate feature count matches model input_size
     expected = model.hparams.get("input_size", len(feature_cols))
@@ -179,7 +179,7 @@ def run_inference_for_period(
     if selected:
         feature_cols = [c for c in selected if c in features_df.columns]
     else:
-        feature_cols = [c for c in features_df.columns if c not in EXCLUDE_COLS]
+        feature_cols = [c for c in features_df.columns if _is_feature_col(c)]
 
     # Normalize with training-period statistics (always)
     train_df = features_df.filter(

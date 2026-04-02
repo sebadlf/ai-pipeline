@@ -173,9 +173,16 @@ backtest_results = Table(
 )
 
 
+_engine: Engine | None = None
+
+
 def get_engine() -> Engine:
-    """Create SQLAlchemy engine."""
-    return create_engine(get_db_url())
+    """Create SQLAlchemy engine (singleton) and run migrations on first call."""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(get_db_url())
+        init_db(_engine)
+    return _engine
 
 
 def init_db(engine: Engine) -> None:

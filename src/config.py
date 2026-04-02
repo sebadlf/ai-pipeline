@@ -200,6 +200,39 @@ class RegimeConfig:
         )
 
 
+@dataclass
+class PromotionEvalConfig:
+    """Configuration for precision-based model evaluation and promotion."""
+
+    thresholds: list[float] = field(default_factory=lambda: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80])
+    primary_threshold: float = 0.65
+    min_recall: float = 0.10
+    min_signals_per_window: int = 5
+    wf_window_size: int = 63
+    wf_step_size: int = 21
+    max_std_ratio: float = 0.15
+    stability_penalty: float = 1.5
+    tiebreak_margin: float = 0.01
+
+    @classmethod
+    def from_dict(cls, promotion_cfg: dict) -> PromotionEvalConfig:
+        """Create from the full promotion config section."""
+        eval_cfg = promotion_cfg.get("evaluation", {})
+        wf_cfg = promotion_cfg.get("walk_forward", {})
+        rank_cfg = promotion_cfg.get("ranking", {})
+        return cls(
+            thresholds=eval_cfg.get("thresholds", [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]),
+            primary_threshold=eval_cfg.get("primary_threshold", 0.65),
+            min_recall=eval_cfg.get("min_recall", 0.10),
+            min_signals_per_window=eval_cfg.get("min_signals_per_window", 5),
+            wf_window_size=wf_cfg.get("window_size", 63),
+            wf_step_size=wf_cfg.get("step_size", 21),
+            max_std_ratio=wf_cfg.get("max_std_ratio", 0.15),
+            stability_penalty=wf_cfg.get("stability_penalty", 1.5),
+            tiebreak_margin=rank_cfg.get("tiebreak_margin", 0.01),
+        )
+
+
 def get_features_parquet_path(config: dict) -> str:
     """Resolve the features parquet path based on feature selection config.
 

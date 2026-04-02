@@ -20,7 +20,7 @@ from src.config import ClusterConfig, compute_split_dates, get_selected_feature_
 from src.evaluation.champion import download_champion_checkpoint
 from src.features.technical import build_features, fill_nulls, load_ohlcv
 from src.models.base_model import LSTMForecaster
-from src.models.dataset import EXCLUDE_COLS
+from src.models.dataset import EXCLUDE_COLS, _is_feature_col
 
 
 
@@ -79,7 +79,7 @@ def generate_signals(
     if all_null_cols:
         df = df.drop(all_null_cols)
 
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS]
+    feature_cols = [c for c in df.columns if _is_feature_col(c)]
 
     selected_names = get_selected_feature_names(config)
     if selected_names:
