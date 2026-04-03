@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def select_features(
     df: pl.DataFrame,
     config: dict,
     *,
+    train_end: dt.date | None = None,
     verbose: bool = True,
 ) -> tuple[pl.DataFrame, list[str]]:
     """Apply feature selection filters and return filtered DataFrame + selected column names.
@@ -32,6 +34,8 @@ def select_features(
     Args:
         df: Full features DataFrame (including symbol, date, target).
         config: Full config dict with feature_selection section.
+        train_end: If provided, compute statistics only on data before this date
+            to prevent leaking val/test information into feature selection.
         verbose: Print summary of each filter step.
     """
     sel_cfg = config.get("feature_selection", {})
@@ -39,19 +43,24 @@ def select_features(
     max_correlation = sel_cfg.get("max_correlation", 0.95)
     min_variance_pct = sel_cfg.get("min_variance_pct", 0.01)
 
+    # Use only training data for computing statistics (avoid leaking val/test info)
+    stats_df = df.filter(pl.col("date") < train_end) if train_end else df
+    if verbose and train_end:
+        print(f"  Computing selection statistics on training data only (< {train_end}, {len(stats_df):,} rows)")
+
     feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS and not c.startswith("forward_return_")]
     initial_count = len(feature_cols)
 
-    # 1. Remove features with too many nulls
-    null_fracs = {c: df[c].null_count() / len(df) for c in feature_cols}
+    # 1. Remove features with too many nulls (computed on training data)
+    null_fracs = {c: stats_df[c].null_count() / len(stats_df) for c in feature_cols}
     kept = [c for c in feature_cols if null_fracs[c] <= max_null_pct]
     dropped_nulls = initial_count - len(kept)
     if verbose:
         print(f"  Null filter (>{max_null_pct:.0%}): dropped {dropped_nulls}, kept {len(kept)}")
     feature_cols = kept
 
-    # 2. Remove near-zero variance features
-    numeric_arr = df.select(feature_cols).to_numpy()
+    # 2. Remove near-zero variance features (computed on training data)
+    numeric_arr = stats_df.select(feature_cols).to_numpy()
     np.nan_to_num(numeric_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     variances = np.nanvar(numeric_arr, axis=0)
     variance_threshold = np.nanquantile(variances, min_variance_pct)
@@ -60,9 +69,9 @@ def select_features(
     if verbose:
         print(f"  Variance filter (bottom {min_variance_pct:.0%}): dropped {len(low_var)}, kept {len(feature_cols)}")
 
-    # 3. Remove highly correlated features (keep one from each correlated pair)
+    # 3. Remove highly correlated features (computed on training data)
     if len(feature_cols) > 1:
-        corr_arr = df.select(feature_cols).drop_nulls().to_numpy()
+        corr_arr = stats_df.select(feature_cols).drop_nulls().to_numpy()
         np.nan_to_num(corr_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         corr_matrix = np.corrcoef(corr_arr.T)
         np.fill_diagonal(corr_matrix, 0)
@@ -89,6 +98,8 @@ def select_features(
 
 def main() -> None:
     """Run feature selection on the features parquet and save result."""
+    from src.config import compute_split_dates
+
     config = load_config()
 
     parser = argparse.ArgumentParser(description="Feature selection")
@@ -105,8 +116,12 @@ def main() -> None:
     df = pl.read_parquet(args.input)
     print(f"  {len(df):,} rows, {len(df.columns)} columns")
 
+    # Use only training data for computing selection statistics (avoid data leakage)
+    split_dates = compute_split_dates(config)
+    train_end = split_dates.train_end
+
     print("Running feature selection...")
-    df_selected, selected_cols = select_features(df, config)
+    df_selected, selected_cols = select_features(df, config, train_end=train_end)
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df_selected.write_parquet(args.output)

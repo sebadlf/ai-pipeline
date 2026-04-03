@@ -402,6 +402,7 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
         split_dates=split_dates,
         cluster_id=cluster_id,
         clusters_parquet=cluster_cfg.output_parquet,
+        noise_std=train_cfg.get("noise_std", 0.01),
     )
     dm.setup()
 

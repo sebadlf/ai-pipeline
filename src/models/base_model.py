@@ -192,10 +192,10 @@ class LSTMForecaster(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.hparams.get("weight_decay", 0.0),
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=20, T_mult=2, eta_min=1e-6,
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss", "interval": "epoch"},
         }

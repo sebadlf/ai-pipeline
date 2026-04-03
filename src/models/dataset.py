@@ -94,6 +94,7 @@ class TradingDataModule(L.LightningDataModule):
         split_dates: "SplitDates | None" = None,
         cluster_id: str | None = None,
         clusters_parquet: str = "data/clusters.parquet",
+        noise_std: float = 0.01,
     ) -> None:
         super().__init__()
         from src.config import SplitDates
@@ -113,6 +114,7 @@ class TradingDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.split_dates = split_dates
         self.cluster_id = cluster_id
+        self.noise_std = noise_std
         self.clusters_parquet = clusters_parquet
 
         self.feature_cols: list[str] = []
@@ -248,7 +250,7 @@ class TradingDataModule(L.LightningDataModule):
         val_x = (val_x - self._mean) / self._std
         test_x = (test_x - self._mean) / self._std
 
-        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True)
+        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std)
         self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64)
         self.test_ds = TimeSeriesDataset(test_x, test_y, self.seq_len, test_vi, target_dtype=torch.int64)
 

@@ -564,11 +564,13 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
     return df
 
 
-def fill_nulls(df: pl.DataFrame) -> pl.DataFrame:
+def fill_nulls(df: pl.DataFrame, *, train_end: dt.date | None = None) -> pl.DataFrame:
     """Fill nulls in feature columns: forward-fill fundamentals, median-fill the rest.
 
     Args:
         df: DataFrame with feature columns (output of build_features).
+        train_end: If provided, compute fill medians only from data before this date
+            to prevent leaking val/test information into training features.
 
     Returns:
         DataFrame with nulls filled. Rows with null critical columns are dropped.
@@ -588,14 +590,19 @@ def fill_nulls(df: pl.DataFrame) -> pl.DataFrame:
             [pl.col(c).forward_fill().over("symbol") for c in fundamental_cols]
         )
 
-    # Step 2: Fill remaining nulls with per-symbol median for numeric features
+    # Step 2: Fill remaining nulls with median computed on training data only
     remaining_null_cols = [c for c in feature_cols if df[c].null_count() > 0 and c != "target"]
     if remaining_null_cols:
-        median_fills = []
-        for c in remaining_null_cols:
-            col_median = pl.col(c).median().over("symbol")
-            median_fills.append(pl.col(c).fill_null(col_median).alias(c))
-        df = df.with_columns(median_fills)
+        if train_end:
+            # Compute medians from training period only (avoid data leakage)
+            train_df = df.filter(pl.col("date") < train_end)
+            medians = {c: train_df[c].median() for c in remaining_null_cols}
+            median_fills = [pl.col(c).fill_null(pl.lit(medians[c])).alias(c) for c in remaining_null_cols if medians[c] is not None]
+        else:
+            # Fallback: per-symbol median over full dataset
+            median_fills = [pl.col(c).fill_null(pl.col(c).median().over("symbol")).alias(c) for c in remaining_null_cols]
+        if median_fills:
+            df = df.with_columns(median_fills)
 
     # Step 3: Drop rows that still have nulls in critical columns only
     critical_cols = [c for c in ["return_1d", "return_5d", "return_20d", "target"]
@@ -608,7 +615,7 @@ def fill_nulls(df: pl.DataFrame) -> pl.DataFrame:
 
 def main() -> None:
     """Generate features and save to parquet."""
-    from src.config import resolve_dev_sectors
+    from src.config import compute_split_dates, resolve_dev_sectors
 
     config = load_config()
 
@@ -635,8 +642,12 @@ def main() -> None:
     print("Building features...")
     df = build_features(df, config)
 
+    # Compute train_end to avoid data leakage in null filling
+    split_dates = compute_split_dates(config)
+    train_end = split_dates.train_end
+
     initial_len = len(df)
-    df = fill_nulls(df)
+    df = fill_nulls(df, train_end=train_end)
 
     meta_cols = {"id", "symbol", "date"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
