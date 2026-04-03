@@ -21,10 +21,119 @@ import polars as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
 
-from src.config import ClusterConfig, SplitDates, compute_split_dates, get_cluster_buy_threshold, get_features_parquet_path, load_config
+from src.config import ClusterConfig, SplitDates, compute_split_dates, get_cluster_buy_threshold, get_features_parquet_path, load_config, resolve_env_value
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
+
+
+def _load_entry_exit_prices(
+    symbols: list[str],
+    entry_date,
+    horizon: int,
+) -> pl.DataFrame:
+    """Load entry price at entry_date and exit price horizon trading days later.
+
+    Returns DataFrame with columns [symbol, date_entry, price_entry, date_exit, price_exit].
+    """
+    import datetime as dt
+    from src.db import get_engine
+
+    engine = get_engine()
+    placeholders = ", ".join(f"'{s}'" for s in symbols)
+    # Fetch enough days after entry to find the exit date
+    buffer_days = int(horizon * 2.5)
+    end_buffer = entry_date + dt.timedelta(days=buffer_days)
+    query = f"""
+        SELECT date, symbol, close FROM ohlcv_daily
+        WHERE symbol IN ({placeholders})
+          AND date >= '{entry_date}' AND date <= '{end_buffer}'
+        ORDER BY symbol, date
+    """
+    prices = pl.read_database(query, engine)
+    if prices.is_empty():
+        return pl.DataFrame(schema={
+            "symbol": pl.Utf8, "date_entry": pl.Date, "price_entry": pl.Float64,
+            "date_exit": pl.Date, "price_exit": pl.Float64,
+        })
+
+    rows = []
+    for symbol in symbols:
+        sym_prices = prices.filter(pl.col("symbol") == symbol).sort("date")
+        if sym_prices.is_empty():
+            continue
+        # Entry: first available date >= entry_date
+        price_entry = sym_prices["close"][0]
+        date_entry = sym_prices["date"][0]
+        # Exit: horizon trading days after entry
+        if len(sym_prices) > horizon:
+            price_exit = sym_prices["close"][horizon]
+            date_exit = sym_prices["date"][horizon]
+        else:
+            price_exit = sym_prices["close"][-1]
+            date_exit = sym_prices["date"][-1]
+        rows.append({
+            "symbol": symbol,
+            "date_entry": date_entry,
+            "price_entry": float(price_entry),
+            "date_exit": date_exit,
+            "price_exit": float(price_exit),
+        })
+    return pl.DataFrame(rows)
+
+
+def _build_trade_summary(trades_df: pl.DataFrame) -> dict:
+    """Build a summary dict from enriched trades DataFrame."""
+    if trades_df.is_empty() or "trade_return" not in trades_df.columns:
+        return {}
+
+    returns = trades_df["trade_return"].to_numpy()
+    returns = returns[np.isfinite(returns)]
+    if len(returns) == 0:
+        return {}
+
+    winners = returns[returns > 0]
+    losers = returns[returns < 0]
+    flat = returns[returns == 0]
+
+    summary = {
+        "total_trades": len(returns),
+        "winners": len(winners),
+        "losers": len(losers),
+        "flat": len(flat),
+        "win_rate": len(winners) / len(returns) if len(returns) > 0 else 0.0,
+        "avg_return": float(np.mean(returns)),
+        "median_return": float(np.median(returns)),
+        "std_return": float(np.std(returns)),
+        "total_return": float(np.sum(returns)),
+        "avg_winner": float(np.mean(winners)) if len(winners) > 0 else 0.0,
+        "avg_loser": float(np.mean(losers)) if len(losers) > 0 else 0.0,
+        "best_trade": float(np.max(returns)),
+        "worst_trade": float(np.min(returns)),
+        "profit_factor": float(np.sum(winners) / abs(np.sum(losers))) if len(losers) > 0 and np.sum(losers) != 0 else float("inf") if len(winners) > 0 else 0.0,
+        "expectancy": float(
+            (len(winners) / len(returns)) * (np.mean(winners) if len(winners) > 0 else 0)
+            + (len(losers) / len(returns)) * (np.mean(losers) if len(losers) > 0 else 0)
+        ) if len(returns) > 0 else 0.0,
+        "max_consecutive_winners": int(_max_consecutive(returns > 0)),
+        "max_consecutive_losers": int(_max_consecutive(returns < 0)),
+    }
+    return summary
+
+
+def _max_consecutive(mask: np.ndarray) -> int:
+    """Count the longest consecutive run of True values."""
+    if len(mask) == 0:
+        return 0
+    max_run = 0
+    current = 0
+    for v in mask:
+        if v:
+            current += 1
+            max_run = max(max_run, current)
+        else:
+            current = 0
+    return max_run
 
 
 def _run_split_eval(
@@ -38,20 +147,17 @@ def _run_split_eval(
 ) -> None:
     """Evaluate and log trade metrics for a single split period.
 
-    Args:
-        prefix: Metric prefix (e.g. "train", "val", "test").
-        preds: List of prediction dicts from run_inference_for_period().
-        period_start: Start date of the evaluation period.
-        period_end: End date of the evaluation period.
-        client: MLflow client instance.
-        run_id: MLflow run ID.
-        config: Full config dict.
+    Enriches predictions with entry/exit prices, computes per-trade returns,
+    and logs detailed trade artifacts and summary statistics to MLflow.
     """
     from src.evaluation.backtest import load_test_prices, run_portfolio_backtest
 
     if not preds:
         print(f"    {prefix}: no predictions")
         return
+
+    horizon = config.get("target", {}).get("horizon", 21)
+    buy_threshold = config.get("target", {}).get("buy_threshold", 0.025)
 
     # Summarize prob_up distribution
     min_prob_up = 0.70  # default actionable threshold for eval
@@ -64,14 +170,48 @@ def _run_split_eval(
     client.log_metric(run_id, f"{prefix}_trade_n_actionable", n_actionable)
     client.log_metric(run_id, f"{prefix}_trade_n_total", n_total)
 
-    # Save CSV artifact
-    trades_df = pl.DataFrame(preds)
-    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
-        trades_df.write_csv(f.name)
-        client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_trades")
-
-    # Filter actionable predictions (prob_up >= threshold) for backtest
+    # Filter actionable predictions
     actionable = [p for p in preds if p["prob_up"] >= min_prob_up]
+
+    # --- Detailed trade artifact with prices ---
+    if actionable:
+        symbols = [p["symbol"] for p in actionable]
+        price_data = _load_entry_exit_prices(symbols, period_end, horizon)
+
+        trade_rows = []
+        for p in actionable:
+            row = {"symbol": p["symbol"], "cluster_id": p["cluster_id"], "prob_up": p["prob_up"]}
+            sym_price = price_data.filter(pl.col("symbol") == p["symbol"])
+            if not sym_price.is_empty():
+                entry = float(sym_price["price_entry"][0])
+                exit_ = float(sym_price["price_exit"][0])
+                ret = (exit_ - entry) / entry if entry != 0 else 0.0
+                row["date_entry"] = sym_price["date_entry"][0]
+                row["date_exit"] = sym_price["date_exit"][0]
+                row["price_entry"] = round(entry, 2)
+                row["price_exit"] = round(exit_, 2)
+                row["trade_return"] = round(ret, 6)
+                row["result"] = "WIN" if ret >= buy_threshold else ("LOSS" if ret < 0 else "FLAT")
+            trade_rows.append(row)
+
+        trades_df = pl.DataFrame(trade_rows)
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+            trades_df.write_csv(f.name)
+            client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_trades")
+
+        # --- Trade summary artifact ---
+        summary = _build_trade_summary(trades_df)
+        if summary:
+            for key, val in summary.items():
+                safe_val = float(val) if np.isfinite(float(val)) else 0.0
+                client.log_metric(run_id, f"{prefix}_ts_{key}", safe_val)
+
+            summary_rows = [{"metric": k, "value": v} for k, v in summary.items()]
+            summary_df = pl.DataFrame(summary_rows)
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+                summary_df.write_csv(f.name)
+                client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_summary")
+
     if not actionable:
         print(f"    {prefix}: no actionable predictions, skipping backtest")
         for key in ["total_return", "sharpe", "sortino", "calmar",
@@ -314,7 +454,7 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
 
     # Trainer
     trainer = L.Trainer(
-        max_epochs=train_cfg["max_epochs"],
+        max_epochs=int(resolve_env_value(train_cfg["max_epochs"], default=200)),
         accelerator="mps",
         devices=1,
         logger=mlflow_logger,

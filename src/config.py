@@ -30,17 +30,20 @@ def load_config(path: str | None = None) -> dict:
         return yaml.safe_load(f)
 
 
+def resolve_env_value(value: int | float | dict, default: int | float = 0) -> int | float:
+    """Resolve a config value that may be a scalar or a dict with dev/prod keys."""
+    if isinstance(value, (int, float)):
+        return value
+    from src.keys import PIPELINE_ENV
+    return value.get(PIPELINE_ENV, value.get("dev", default))
+
+
 def resolve_start_years_back(config: dict) -> int:
     """Resolve start_years_back based on PIPELINE_ENV.
 
     Supports both int (legacy) and dict with dev/prod keys.
     """
-    from src.keys import PIPELINE_ENV
-
-    value = config["ingestion"]["start_years_back"]
-    if isinstance(value, int):
-        return value
-    return value.get(PIPELINE_ENV, value.get("dev", 5))
+    return int(resolve_env_value(config["ingestion"]["start_years_back"], default=5))
 
 
 def resolve_dev_sectors(config: dict) -> list[str] | None:

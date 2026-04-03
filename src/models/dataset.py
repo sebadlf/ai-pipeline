@@ -127,6 +127,9 @@ class TradingDataModule(L.LightningDataModule):
 
     def setup(self, stage: str | None = None) -> None:
         """Load data, normalize, and create date-based temporal splits per symbol."""
+        if self.train_ds is not None:
+            return  # Already set up — avoid re-loading and duplicate prints
+
         df = pl.read_parquet(self.parquet_path)
         df = df.sort(["symbol", "date"])
 
