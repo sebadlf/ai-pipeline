@@ -56,10 +56,10 @@ target:
 model:
   type: lstm
   input_size: null  # auto-calculated from features
-  hidden_size: 64
-  num_layers: 1
+  hidden_size: 96
+  num_layers: 2
   num_classes: 2    # NOT_UP=0, UP=1
-  dropout: 0.4
+  dropout: 0.35
   num_attention_heads: 0   # disabled to reduce overfitting
   sequence_length: 20
 
@@ -67,14 +67,14 @@ model:
 training:
   batch_size: 128
   max_epochs:
-    dev: 20
+    dev: 50
     prod: 200
   learning_rate: 0.0005
   weight_decay: 0.05
   label_smoothing: 0.05
   focal_gamma: 2.0          # focal loss gamma (0 = standard CrossEntropy)
   noise_std: 0.03           # Gaussian noise augmentation on training inputs
-  early_stopping_patience: 10
+  early_stopping_patience: 15
   per_cluster: true
   cluster_experiment_prefix: "cluster"
   # Temporal splits (relative to today, with purge gaps)
