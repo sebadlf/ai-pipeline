@@ -28,14 +28,14 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF = 2.0
 
 
-def _get_with_retry(url: str, params: dict, timeout: int = 30) -> httpx.Response:
+def _get_with_retry(url: str, params: dict, timeout: int = 60) -> httpx.Response:
     """HTTP GET with exponential backoff retry on transient connection errors."""
     for attempt in range(_MAX_RETRIES):
         try:
             resp = httpx.get(url, params=params, timeout=timeout)
             resp.raise_for_status()
             return resp
-        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError) as e:
+        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.TimeoutException) as e:
             if attempt == _MAX_RETRIES - 1:
                 raise
             wait = _RETRY_BACKOFF ** (attempt + 1)
@@ -711,8 +711,8 @@ def main() -> None:
             n = upsert_ohlcv(engine, rows)
             print(f"  {symbol}: {n} new rows inserted ({len(rows)} fetched)")
             total += n
-        except httpx.HTTPStatusError as e:
-            print(f"  {symbol}: SKIPPED (HTTP {e.response.status_code})")
+        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+            print(f"  {symbol}: SKIPPED ({type(e).__name__}: {e})")
             failed.append(symbol)
 
     print(f"\nOHLCV done. {total} total new rows inserted.")
@@ -741,7 +741,8 @@ def main() -> None:
                 if i % 50 == 0 or i == len(args.symbols):
                     print(f"  [{i}/{len(args.symbols)}] refreshed: {adj_refreshed}, "
                           f"skipped: {adj_skipped}, rows updated: {adj_total}")
-            except httpx.HTTPStatusError:
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+                print(f"  {symbol}: adj_close FAILED ({type(e).__name__})")
                 adj_failed.append(symbol)
         print(f"  Adjusted close done. {adj_refreshed} refreshed, "
               f"{adj_skipped} unchanged, {adj_total} rows updated.")
@@ -787,7 +788,8 @@ def main() -> None:
                 km_total += upsert_key_metrics(engine, km_rows)
                 fr_rows = fetch_financial_ratios(symbol, start_date=args.start)
                 fr_total += upsert_financial_ratios(engine, fr_rows)
-            except httpx.HTTPStatusError as e:
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+                print(f"  {symbol}: fundamentals FAILED ({type(e).__name__})")
                 fund_failed.append(symbol)
             if i % 50 == 0 or i == len(args.symbols):
                 print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, ratios: {fr_total}")
@@ -805,8 +807,8 @@ def main() -> None:
                 n = upsert_sector_performance(engine, sp_rows)
                 sp_total += n
                 print(f"  {sector}: {n} rows ({len(sp_rows)} fetched)")
-            except httpx.HTTPStatusError as e:
-                print(f"  {sector}: SKIPPED (HTTP {e.response.status_code})")
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+                print(f"  {sector}: SKIPPED ({type(e).__name__}: {e})")
         print(f"  Sector performance done. {sp_total} total rows.")
 
     # Mark today's ingestion as complete
