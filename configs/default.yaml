@@ -113,7 +113,7 @@ clustering:
     - fr_pricetoearningsratio
     - fr_pricetobookratio
     - fr_dividendyield
-  min_cluster_size: 3
+  min_cluster_size: 10
   output_parquet: data/clusters.parquet
   # Per-cluster buy_threshold overrides (populated after initial clustering run).
   # Keys are cluster_id strings; missing clusters use target.buy_threshold default.

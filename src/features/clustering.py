@@ -354,8 +354,8 @@ def _find_optimal_k(
     if max_k < 2:
         return 1, 0.0
 
-    best_k = 2
-    best_score = -1.0
+    best_k = 1
+    best_score = 0.0
 
     for k in range(2, max_k + 1):
         if n_samples < k + 1:

@@ -134,7 +134,7 @@ class ClusterConfig:
             "fr_pricetobookratio", "fr_dividendyield",
         ]
     )
-    min_cluster_size: int = 3
+    min_cluster_size: int = 10
     output_parquet: str = "data/clusters.parquet"
     cluster_thresholds: dict[str, dict[str, float]] = field(default_factory=dict)
 
