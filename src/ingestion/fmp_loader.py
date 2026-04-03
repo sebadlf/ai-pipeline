@@ -457,6 +457,7 @@ def fetch_key_metrics(
     period: str = "quarter",
     api_key: str | None = None,
     start_date: str | None = None,
+    limit: int = 84,
 ) -> list[dict]:
     """Fetch key metrics for a symbol from FMP API.
 
@@ -465,13 +466,15 @@ def fetch_key_metrics(
         period: Reporting period ('quarter' or 'annual').
         api_key: FMP API key.
         start_date: If provided, discard rows with date before this (YYYY-MM-DD).
+        limit: Maximum number of quarterly records to fetch (84 = 21 years, covers
+            prod's 20-year window plus 1 year margin for forward-fill).
     """
     api_key = api_key or FMP_API_KEY
     if not api_key:
         raise ValueError("FMP_API_KEY not set")
 
     url = f"{FMP_BASE_URL}/key-metrics"
-    params = {"symbol": symbol, "period": period, "apikey": api_key}
+    params = {"symbol": symbol, "period": period, "limit": limit, "apikey": api_key}
 
     resp = _get_with_retry(url, params=params)
     data = resp.json()
@@ -521,6 +524,7 @@ def fetch_financial_ratios(
     period: str = "quarter",
     api_key: str | None = None,
     start_date: str | None = None,
+    limit: int = 84,
 ) -> list[dict]:
     """Fetch financial ratios for a symbol from FMP API.
 
@@ -529,13 +533,15 @@ def fetch_financial_ratios(
         period: Reporting period ('quarter' or 'annual').
         api_key: FMP API key.
         start_date: If provided, discard rows with date before this (YYYY-MM-DD).
+        limit: Maximum number of quarterly records to fetch (84 = 21 years, covers
+            prod's 20-year window plus 1 year margin for forward-fill).
     """
     api_key = api_key or FMP_API_KEY
     if not api_key:
         raise ValueError("FMP_API_KEY not set")
 
     url = f"{FMP_BASE_URL}/ratios"
-    params = {"symbol": symbol, "period": period, "apikey": api_key}
+    params = {"symbol": symbol, "period": period, "limit": limit, "apikey": api_key}
 
     resp = _get_with_retry(url, params=params)
     data = resp.json()
