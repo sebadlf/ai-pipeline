@@ -174,6 +174,14 @@ _KEY_METRIC_FIELDS = [
     "capexToRevenue", "researchAndDevelopementToRevenue", "evToSales",
     "cashConversionCycle", "daysOfSalesOutstanding", "daysOfInventoryOutstanding",
     "evToFreeCashFlow", "evToOperatingCashFlow", "marketCap", "enterpriseValue",
+    "averageInventory", "averagePayables", "averageReceivables",
+    "capexToDepreciation", "capexToOperatingCashFlow",
+    "daysOfPayablesOutstanding", "freeCashFlowToEquity", "freeCashFlowToFirm",
+    "grahamNetNet", "grahamNumber", "intangiblesToTotalAssets", "interestBurden",
+    "investedCapital", "netCurrentAssetValue", "operatingCycle",
+    "operatingReturnOnAssets", "returnOnTangibleAssets",
+    "salesGeneralAndAdministrativeToRevenue", "stockBasedCompensationToRevenue",
+    "tangibleAssetValue", "taxBurden", "workingCapital",
 ]
 
 _RATIO_FIELDS = [
@@ -185,6 +193,24 @@ _RATIO_FIELDS = [
     "financialLeverageRatio", "receivablesTurnover", "inventoryTurnover",
     "assetTurnover", "operatingCashFlowSalesRatio",
     "freeCashFlowOperatingCashFlowRatio",
+    "bookValuePerShare", "bottomLineProfitMargin", "capexPerShare",
+    "capitalExpenditureCoverageRatio", "cashPerShare",
+    "continuousOperationsProfitMargin", "debtServiceCoverageRatio",
+    "debtToCapitalRatio", "debtToMarketCap",
+    "dividendPaidAndCapexCoverageRatio", "dividendPayoutRatio",
+    "dividendPerShare", "dividendYieldPercentage", "ebitMargin",
+    "ebitdaMargin", "ebtPerEbit", "effectiveTaxRate",
+    "enterpriseValueMultiple", "fixedAssetTurnover",
+    "forwardPriceToEarningsGrowthRatio", "freeCashFlowPerShare",
+    "interestDebtPerShare", "longTermDebtToCapitalRatio",
+    "netIncomePerEBT", "netIncomePerShare",
+    "operatingCashFlowCoverageRatio", "operatingCashFlowPerShare",
+    "operatingCashFlowRatio", "payablesTurnover", "pretaxProfitMargin",
+    "priceToEarningsGrowthRatio", "priceToFairValue",
+    "priceToOperatingCashFlowRatio", "revenuePerShare",
+    "shareholdersEquityPerShare",
+    "shortTermOperatingCashFlowCoverageRatio", "solvencyRatio",
+    "tangibleBookValuePerShare", "workingCapitalTurnoverRatio",
 ]
 
 

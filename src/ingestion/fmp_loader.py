@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+import time
+
 import httpx
 from sqlalchemy import text
 
@@ -21,6 +23,25 @@ from src.db import get_engine, init_db
 from src.keys import FMP_API_KEY
 
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
+
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = 2.0
+
+
+def _get_with_retry(url: str, params: dict, timeout: int = 30) -> httpx.Response:
+    """HTTP GET with exponential backoff retry on transient connection errors."""
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = httpx.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except (httpx.ConnectError, httpx.ReadError, httpx.WriteError) as e:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            wait = _RETRY_BACKOFF ** (attempt + 1)
+            print(f"  Connection error ({e}), retrying in {wait:.0f}s...")
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
 
 
 def fetch_sp500_constituents(
@@ -41,8 +62,7 @@ def fetch_sp500_constituents(
         raise ValueError("FMP_API_KEY not set")
 
     url = f"{FMP_BASE_URL}/sp500-constituent"
-    resp = httpx.get(url, params={"apikey": api_key}, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params={"apikey": api_key})
     data = resp.json()
 
     if sectors:
@@ -77,8 +97,7 @@ def fetch_ohlcv(
     url = f"{FMP_BASE_URL}/historical-price-eod/full"
     params = {"symbol": symbol, "from": start_date, "to": end_date, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
@@ -127,8 +146,7 @@ def fetch_treasury_rates(
     url = f"{FMP_BASE_URL}/treasury-rates"
     params = {"from": start_date, "to": end_date, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
@@ -183,8 +201,7 @@ def fetch_vix(
     url = f"{FMP_BASE_URL}/historical-price-eod/full"
     params = {"symbol": "^VIX", "from": start_date, "to": end_date, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
@@ -280,8 +297,7 @@ def fetch_sectors(
         url = f"{FMP_BASE_URL}/profile"
         params = {"symbol": symbol, "apikey": api_key}
         try:
-            resp = httpx.get(url, params=params, timeout=30)
-            resp.raise_for_status()
+            resp = _get_with_retry(url, params=params)
             data = resp.json()
             if data and len(data) > 0:
                 profile = data[0]
@@ -351,8 +367,7 @@ def fetch_adj_close(
     url = f"{FMP_BASE_URL}/historical-price-eod/dividend-adjusted"
     params = {"symbol": symbol, "from": start_date, "to": end_date, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
@@ -458,8 +473,7 @@ def fetch_key_metrics(
     url = f"{FMP_BASE_URL}/key-metrics"
     params = {"symbol": symbol, "period": period, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
@@ -523,8 +537,7 @@ def fetch_financial_ratios(
     url = f"{FMP_BASE_URL}/ratios"
     params = {"symbol": symbol, "period": period, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
@@ -596,8 +609,7 @@ def fetch_sector_performance(
     url = f"{FMP_BASE_URL}/historical-sector-performance"
     params = {"sector": sector, "from": start_date, "to": end_date, "apikey": api_key}
 
-    resp = httpx.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params=params)
     data = resp.json()
 
     if not data:
