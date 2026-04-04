@@ -87,6 +87,21 @@ def select_features(
         if verbose:
             print(f"  Correlation filter (>{max_correlation}): dropped {len(to_drop)}, kept {len(feature_cols)}")
 
+    # 4. Remove features with low mutual information vs target
+    min_mi = sel_cfg.get("min_mutual_info", 0.0)
+    if min_mi > 0 and "target" in stats_df.columns and len(feature_cols) > 0:
+        from sklearn.feature_selection import mutual_info_classif
+
+        mi_df = stats_df.select(feature_cols + ["target"]).drop_nulls()
+        X = mi_df.select(feature_cols).to_numpy()
+        y = mi_df["target"].to_numpy()
+        np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        mi_scores = mutual_info_classif(X, y, random_state=42)
+        low_mi = [feature_cols[i] for i, s in enumerate(mi_scores) if s < min_mi]
+        feature_cols = [c for c in feature_cols if c not in low_mi]
+        if verbose:
+            print(f"  MI filter (>={min_mi}): dropped {len(low_mi)}, kept {len(feature_cols)}")
+
     if verbose:
         print(f"  Feature selection: {initial_count} -> {len(feature_cols)} features")
 
