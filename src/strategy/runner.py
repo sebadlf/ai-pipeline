@@ -16,6 +16,7 @@ import numpy as np
 import polars as pl
 import torch
 
+from src.aggregation.consolidate import resolve_feature_cols
 from src.config import ClusterConfig, compute_split_dates, get_selected_feature_names, load_config
 from src.evaluation.champion import download_champion_checkpoint
 from src.features.technical import build_features, fill_nulls, load_ohlcv
@@ -79,25 +80,6 @@ def generate_signals(
     if all_null_cols:
         df = df.drop(all_null_cols)
 
-    feature_cols = [c for c in df.columns if _is_feature_col(c)]
-
-    selected_names = get_selected_feature_names(config)
-    if selected_names:
-        feature_cols = [c for c in selected_names if c in feature_cols]
-        print(f"  Using {len(feature_cols)} selected features (from manifest)")
-
-    # Compute normalization from training period
-    train_df = df.filter(pl.col("date") < train_end)
-    if train_df.is_empty():
-        print("No training data available for normalization.")
-        return pl.DataFrame()
-
-    train_matrix = train_df.select(feature_cols).to_numpy()
-    np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    train_mean = train_matrix.mean(axis=0)
-    train_std = train_matrix.std(axis=0)
-    train_std[train_std == 0] = 1.0
-
     # Load models per cluster
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
     models: dict[str, LSTMForecaster] = {}
@@ -109,6 +91,25 @@ def generate_signals(
         else:
             print(f"  WARNING: No model found for {cid}")
 
+    # Resolve features and normalization per cluster (cached)
+    cluster_feature_cols: dict[str, list[str]] = {}
+    cluster_norm: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for cid, model in models.items():
+        fcols = resolve_feature_cols(model, df, config)
+        cluster_feature_cols[cid] = fcols
+        cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cid)["symbol"].to_list()
+        train_df = df.filter(
+            (pl.col("date") < train_end) & pl.col("symbol").is_in(cluster_symbols)
+        ).drop_nulls(subset=fcols)
+        if train_df.is_empty():
+            continue
+        train_matrix = train_df.select(fcols).to_numpy()
+        np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        mean = train_matrix.mean(axis=0)
+        std = train_matrix.std(axis=0)
+        std[std == 0] = 1.0
+        cluster_norm[cid] = (mean, std)
+
     # Generate predictions per symbol
     results = []
     for symbol in symbols:
@@ -119,11 +120,13 @@ def generate_signals(
             continue
 
         cluster_id = sym_cluster["cluster_id"][0]
-        if cluster_id not in models:
+        if cluster_id not in models or cluster_id not in cluster_norm:
             print(f"  {symbol}: no model for cluster {cluster_id}")
             continue
 
         model = models[cluster_id]
+        feature_cols = cluster_feature_cols[cluster_id]
+        train_mean, train_std = cluster_norm[cluster_id]
         sym_df = df.filter(pl.col("symbol") == symbol).sort("date")
 
         if len(sym_df) < seq_len:

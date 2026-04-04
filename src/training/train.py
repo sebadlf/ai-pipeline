@@ -427,6 +427,7 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
         class_weights=dm.class_weights,
         num_attention_heads=model_cfg.get("num_attention_heads", 4),
         focal_gamma=train_cfg.get("focal_gamma", 2.0),
+        feature_names=dm.feature_cols,
     )
 
     # MLflow logger — separate experiment per cluster

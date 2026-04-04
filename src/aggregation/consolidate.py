@@ -55,6 +55,47 @@ def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
     return max(unique, key=lambda p: os.path.getmtime(p))
 
 
+def resolve_feature_cols(
+    model: LSTMForecaster,
+    features_df: pl.DataFrame,
+    config: dict,
+) -> list[str]:
+    """Resolve feature columns for inference, preferring model-embedded names.
+
+    Priority:
+        1. feature_names from model checkpoint (authoritative)
+        2. Feature selection manifest (fallback for older checkpoints)
+        3. DataFrame column discovery (last resort)
+    """
+    # Priority 1: feature names stored in checkpoint
+    saved_names = model.hparams.get("feature_names")
+    if saved_names:
+        missing = [c for c in saved_names if c not in features_df.columns]
+        if missing:
+            raise ValueError(
+                f"Model requires {len(missing)} features not in DataFrame: "
+                f"{missing[:5]}... Load the correct features parquet."
+            )
+        return list(saved_names)
+
+    # Priority 2: feature selection manifest
+    selected = get_selected_feature_names(config)
+    if selected:
+        feature_cols = [c for c in selected if c in features_df.columns]
+    else:
+        # Priority 3: discover from DataFrame columns
+        feature_cols = [c for c in features_df.columns if _is_feature_col(c)]
+
+    # Validate count against model input_size
+    expected = model.hparams.get("input_size", len(feature_cols))
+    if len(feature_cols) != expected:
+        raise ValueError(
+            f"Feature mismatch: model expects {expected} features "
+            f"but resolved {len(feature_cols)}. Retrain or fix feature selection."
+        )
+    return feature_cols
+
+
 def run_inference_for_cluster(
     cluster_id: str,
     model: LSTMForecaster,
@@ -82,20 +123,7 @@ def run_inference_for_cluster(
     cluster_symbols = (
         clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
     )
-    # Use selected features if available, else fall back to all non-meta columns
-    selected = get_selected_feature_names(config)
-    if selected:
-        feature_cols = [c for c in selected if c in features_df.columns]
-    else:
-        feature_cols = [c for c in features_df.columns if _is_feature_col(c)]
-
-    # Validate feature count matches model input_size
-    expected = model.hparams.get("input_size", len(feature_cols))
-    if len(feature_cols) != expected:
-        raise ValueError(
-            f"Feature mismatch for {cluster_id}: model expects {expected} features "
-            f"but got {len(feature_cols)}. Re-run feature selection or retrain."
-        )
+    feature_cols = resolve_feature_cols(model, features_df, config)
 
     # Compute normalization from training period
     train_df = features_df.filter(
@@ -175,11 +203,7 @@ def run_inference_for_period(
     cluster_symbols = (
         clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
     )
-    selected = get_selected_feature_names(config)
-    if selected:
-        feature_cols = [c for c in selected if c in features_df.columns]
-    else:
-        feature_cols = [c for c in features_df.columns if _is_feature_col(c)]
+    feature_cols = resolve_feature_cols(model, features_df, config)
 
     # Normalize with training-period statistics (always)
     train_df = features_df.filter(

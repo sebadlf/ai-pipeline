@@ -73,6 +73,7 @@ class LSTMForecaster(L.LightningModule):
         class_weights: list[float] | None = None,
         num_attention_heads: int = 4,
         focal_gamma: float = 2.0,
+        feature_names: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
