@@ -1,7 +1,9 @@
 """Full pipeline cleanup: MLflow experiments, checkpoints, and artifacts.
 
-Deletes all MLflow experiments (and their runs), registered models,
+Permanently deletes all MLflow experiments, runs, registered models,
 local checkpoints, MLflow artifact storage, and pipeline output parquets.
+Uses direct SQL against the MLflow database for hard delete (MLflow's API
+only supports soft-delete for experiments).
 
 Usage:
     uv run python -m src.evaluation.clean_runs
@@ -14,10 +16,11 @@ import argparse
 import shutil
 from pathlib import Path
 
-import mlflow
-from mlflow.tracking import MlflowClient
+from sqlalchemy import create_engine, text
 
-from src.keys import MLFLOW_TRACKING_URI
+from src.keys import POSTGRES_HOST, POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_USER
+
+MLFLOW_DB = "mlflow"
 
 CLEANUP_PARQUETS = [
     "data/clusters.parquet",
@@ -25,37 +28,37 @@ CLEANUP_PARQUETS = [
     "data/portfolios.parquet",
 ]
 
+def _get_mlflow_engine():
+    """Build SQLAlchemy engine for the MLflow database."""
+    url = f"postgresql+psycopg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{MLFLOW_DB}"
+    return create_engine(url)
+
 
 def cleanup_all(dry_run: bool = False) -> None:
     """Delete all MLflow state, checkpoints, and pipeline outputs."""
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    client = MlflowClient()
 
-    # 1. Delete all registered models
-    models = client.search_registered_models()
-    for model in models:
-        if dry_run:
-            print(f"  [DRY RUN] Would delete model: {model.name}")
-        else:
-            client.delete_registered_model(model.name)
-            print(f"  Deleted model: {model.name}")
-    print(f"{'Would delete' if dry_run else 'Deleted'}: {len(models)} registered models")
+    # 1. Drop and recreate the entire MLflow database
+    engine = _get_mlflow_engine()
+    if dry_run:
+        print("  [DRY RUN] Would drop and recreate mlflow database")
+    else:
+        # Connect to 'postgres' db to drop/create mlflow
+        root_url = f"postgresql+psycopg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/postgres"
+        root_engine = create_engine(root_url, isolation_level="AUTOCOMMIT")
+        with root_engine.connect() as conn:
+            # Terminate active connections to mlflow DB
+            conn.execute(text(f"""
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = '{MLFLOW_DB}' AND pid <> pg_backend_pid()
+            """))
+            conn.execute(text(f"DROP DATABASE IF EXISTS {MLFLOW_DB}"))
+            conn.execute(text(f"CREATE DATABASE {MLFLOW_DB} OWNER {POSTGRES_USER}"))
+        root_engine.dispose()
+        print("  Dropped and recreated mlflow database")
+    engine.dispose()
 
-    # 2. Delete all experiments (and their runs)
-    experiments = client.search_experiments()
-    n_deleted = 0
-    for exp in experiments:
-        if exp.name == "Default":
-            continue
-        if dry_run:
-            print(f"  [DRY RUN] Would delete experiment: {exp.name}")
-        else:
-            client.delete_experiment(exp.experiment_id)
-            print(f"  Deleted experiment: {exp.name}")
-        n_deleted += 1
-    print(f"{'Would delete' if dry_run else 'Deleted'}: {n_deleted} experiments")
-
-    # 3. Delete local checkpoints directory
+    # 2. Delete local checkpoints directory
     ckpt_dir = Path("checkpoints")
     if ckpt_dir.exists():
         if dry_run:
@@ -67,7 +70,7 @@ def cleanup_all(dry_run: bool = False) -> None:
     else:
         print("  checkpoints/ not found, skipping")
 
-    # 4. Delete local MLflow artifacts (mlruns/mlruns/)
+    # 3. Delete local MLflow artifacts (mlruns/mlruns/)
     mlruns_inner = Path("mlruns/mlruns")
     if mlruns_inner.exists():
         if dry_run:
@@ -79,7 +82,7 @@ def cleanup_all(dry_run: bool = False) -> None:
     else:
         print("  mlruns/mlruns/ not found, skipping")
 
-    # 5. Delete pipeline output parquets
+    # 4. Delete pipeline output parquets
     for parquet in CLEANUP_PARQUETS:
         p = Path(parquet)
         if p.exists():
@@ -89,7 +92,10 @@ def cleanup_all(dry_run: bool = False) -> None:
                 p.unlink()
                 print(f"  Deleted {parquet}")
 
-    print("\nCleanup complete." if not dry_run else "\n[DRY RUN] No files were deleted.")
+    if dry_run:
+        print("\n[DRY RUN] No files were deleted.")
+    else:
+        print("\nCleanup complete. Restart MLflow to reinitialize: docker compose restart mlflow")
 
 
 def main() -> None:

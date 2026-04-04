@@ -835,10 +835,19 @@ def main() -> None:
                 print(f"  {sector}: SKIPPED ({type(e).__name__}: {e})")
         print(f"  Sector performance done. {sp_total} total rows.")
 
-    # Mark today's ingestion as complete
+    # Mark today's ingestion as complete and whether new data was ingested
+    adj_new = adj_total > 0 if not args.skip_adjclose else False
+    has_new_data = total > 0 or adj_new
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.write_text(today.isoformat())
-    print(f"\nIngestion complete. Marker written to {marker_path}")
+
+    new_data_marker = Path("data/.new_data")
+    if has_new_data:
+        new_data_marker.write_text(today.isoformat())
+        print(f"\nIngestion complete. New data flag set.")
+    else:
+        new_data_marker.unlink(missing_ok=True)
+        print(f"\nIngestion complete. No new price data.")
 
 
 if __name__ == "__main__":

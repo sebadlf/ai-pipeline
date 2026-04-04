@@ -52,9 +52,18 @@ signals:
 
 cleanup:
 	uv run python -m src.evaluation.clean_runs
+	docker compose restart mlflow
 
 # --- Full pipeline ---
-pipeline: ingest features select-features cluster train promote aggregate portfolio backtest
+pipeline:
+	$(MAKE) ingest
+	@if [ -f data/.new_data ]; then \
+		echo "New data detected, rebuilding features/clusters..."; \
+		$(MAKE) features select-features cluster; \
+	else \
+		echo "No new data, skipping features/selection/clustering."; \
+	fi
+	$(MAKE) train promote aggregate portfolio backtest
 
 # --- Pipeline loop (infinite, Ctrl+C to stop) ---
 pipeline-loop:
