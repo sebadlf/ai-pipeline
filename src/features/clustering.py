@@ -1,9 +1,9 @@
-"""Stock clustering by GICS sector with KMeans (Stage 1).
+"""Global stock clustering with KMeans (Stage 1).
 
-Divides stocks first by sector, then clusters within each sector using
-behavioral, fundamental, and macro features computed from the training
-period only. Uses PCA for dimensionality reduction and automatic K
-selection via silhouette analysis.
+Clusters all stocks together using behavioral, fundamental, and macro
+features computed from the training period only. Optionally includes
+one-hot encoded sector as a clustering feature. Uses PCA for
+dimensionality reduction and automatic K selection via silhouette analysis.
 
 Usage:
     uv run python -m src.features.clustering
@@ -337,6 +337,7 @@ def _find_optimal_k(
     X: np.ndarray,
     max_k: int,
     min_cluster_size: int,
+    min_k: int = 2,
 ) -> tuple[int, float]:
     """Find the optimal number of clusters via silhouette analysis.
 
@@ -344,6 +345,7 @@ def _find_optimal_k(
         X: Scaled feature matrix.
         max_k: Maximum number of clusters to try.
         min_cluster_size: Minimum samples per cluster.
+        min_k: Minimum number of clusters to try.
 
     Returns:
         Tuple of (best_k, best_silhouette_score).
@@ -357,7 +359,7 @@ def _find_optimal_k(
     best_k = 1
     best_score = 0.0
 
-    for k in range(2, max_k + 1):
+    for k in range(min_k, max_k + 1):
         if n_samples < k + 1:
             break
 
@@ -381,36 +383,29 @@ def run_clustering(
     config: dict,
     reference_date: dt.date | None = None,
 ) -> tuple[pl.DataFrame, dict]:
-    """Assign stocks to clusters within GICS sectors.
+    """Assign stocks to clusters using global KMeans.
 
     Uses PCA for dimensionality reduction and automatic K selection
-    via silhouette analysis.
+    via silhouette analysis. Optionally includes one-hot encoded sector
+    as a clustering feature.
 
     Args:
         config: Full config dict.
         reference_date: Date for split computation. Defaults to today.
 
     Returns:
-        Tuple of (result_df, sector_stats) where result_df has columns
-        [symbol, sector, cluster_id, silhouette_score] and sector_stats
-        contains per-sector diagnostics for MLflow logging.
+        Tuple of (result_df, cluster_stats) where result_df has columns
+        [symbol, sector, cluster_id, silhouette_score] and cluster_stats
+        contains global diagnostics for MLflow logging.
     """
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     split_dates = compute_split_dates(config, reference_date)
-
-    from src.config import resolve_dev_sectors
 
     engine = get_engine()
     sectors_df = load_sectors(engine)
 
     if sectors_df.is_empty():
         raise RuntimeError("No sector data found. Run ingestion first.")
-
-    # In dev mode, filter to configured sectors
-    dev_sectors = resolve_dev_sectors(config)
-    if dev_sectors:
-        sectors_df = sectors_df.filter(pl.col("sector").is_in(dev_sectors))
-        print(f"Dev mode: filtered to {len(sectors_df)} symbols in sectors: {', '.join(dev_sectors)}")
 
     all_symbols = sectors_df["symbol"].to_list()
     print(f"Computing clustering features for {len(all_symbols)} symbols...")
@@ -423,121 +418,142 @@ def run_clustering(
     feature_cols = [c for c in feat_df.columns if c not in {"symbol", "sector"}]
     print(f"  {len(feature_cols)} clustering features computed")
 
-    results = []
-    sector_stats: dict[str, dict] = {}
-    sector_list = feat_df["sector"].unique().sort().to_list()
+    n_stocks = len(feat_df)
+    X = feat_df.select(feature_cols).to_numpy()
 
-    for sector in sector_list:
-        sector_df = feat_df.filter(pl.col("sector") == sector)
-        n_stocks = len(sector_df)
+    # Optionally add one-hot encoded sector as clustering features
+    if cluster_cfg.include_sector_features:
+        sector_dummies = feat_df.select("sector").to_dummies()
+        X = np.hstack([X, sector_dummies.to_numpy().astype(float)])
+        print(f"  Added {sector_dummies.width} sector one-hot features")
 
-        if n_stocks == 0:
-            continue
+    # Fill NaN with column medians before scaling
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        col_medians = np.nanmedian(X, axis=0)
+    for j in range(X.shape[1]):
+        mask = np.isnan(X[:, j])
+        X[mask, j] = col_medians[j] if not np.isnan(col_medians[j]) else 0.0
 
-        X = sector_df.select(feature_cols).to_numpy()
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Fill NaN with column medians before scaling
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="All-NaN slice encountered")
-            col_medians = np.nanmedian(X, axis=0)
-        for j in range(X.shape[1]):
-            mask = np.isnan(X[:, j])
-            X[mask, j] = col_medians[j] if not np.isnan(col_medians[j]) else 0.0
+    # PCA dimensionality reduction
+    n_components_before = X_scaled.shape[1]
+    max_components = min(n_stocks - 1, n_components_before)
+    if max_components >= 2:
+        pca = PCA(n_components=min(cluster_cfg.pca_variance_ratio, max_components))
+        X_reduced = pca.fit_transform(X_scaled)
+        variance_explained = float(np.sum(pca.explained_variance_ratio_))
+        n_components_after = X_reduced.shape[1]
+    else:
+        X_reduced = X_scaled
+        variance_explained = 1.0
+        n_components_after = n_components_before
 
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # PCA dimensionality reduction
-        n_components_before = X_scaled.shape[1]
-        max_components = min(n_stocks - 1, n_components_before)
-        if max_components >= 2:
-            pca = PCA(n_components=min(cluster_cfg.pca_variance_ratio, max_components))
-            X_reduced = pca.fit_transform(X_scaled)
-            variance_explained = float(np.sum(pca.explained_variance_ratio_))
-            n_components_after = X_reduced.shape[1]
-        else:
-            X_reduced = X_scaled
-            variance_explained = 1.0
-            n_components_after = n_components_before
-
-        if n_stocks < 4:
-            for symbol in sector_df["symbol"].to_list():
-                results.append({
-                    "symbol": symbol,
-                    "sector": sector,
-                    "cluster_id": f"{sector}_0",
-                    "silhouette_score": None,
-                })
-            sector_stats[sector] = {
-                "n_stocks": n_stocks, "k_selected": 1, "silhouette": 0.0,
-                "pca_components": n_components_after, "pca_variance": variance_explained,
-            }
-            continue
-
-        # Auto-select optimal K
-        best_k, best_sil = _find_optimal_k(
-            X_reduced, cluster_cfg.max_clusters_per_sector, cluster_cfg.min_cluster_size
-        )
-
-        kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(X_reduced)
-
-        # Merge small clusters to nearest centroid
-        symbols = sector_df["symbol"].to_list()
-        cluster_counts: dict[int, list[int]] = {}
-        for idx, label in enumerate(labels):
-            cluster_counts.setdefault(label, []).append(idx)
-
-        for label, indices in list(cluster_counts.items()):
-            if len(indices) < cluster_cfg.min_cluster_size and best_k > 1:
-                for idx in indices:
-                    distances = np.linalg.norm(
-                        kmeans.cluster_centers_ - X_reduced[idx], axis=1
-                    )
-                    sorted_clusters = np.argsort(distances)
-                    for candidate in sorted_clusters:
-                        if candidate != label:
-                            labels[idx] = candidate
-                            break
-
-        unique_labels = sorted(set(labels))
-
-        # Compute silhouette AFTER merging so K=1 post-merge reports 0.0
-        n_unique = len(unique_labels)
-        if n_unique > 1 and n_stocks > n_unique:
-            sil_score = float(silhouette_score(X_reduced, labels))
-        else:
-            sil_score = 0.0
-        label_map = {old: new for new, old in enumerate(unique_labels)}
-
-        for idx, symbol in enumerate(symbols):
-            results.append({
-                "symbol": symbol,
-                "sector": sector,
-                "cluster_id": f"{sector}_{label_map[labels[idx]]}",
-                "silhouette_score": sil_score,
-            })
-
-        sector_stats[sector] = {
-            "n_stocks": n_stocks,
-            "k_selected": len(unique_labels),
-            "silhouette": sil_score,
-            "pca_components": n_components_after,
-            "pca_variance": variance_explained,
+    if n_stocks < 4:
+        # Too few stocks for meaningful clustering
+        symbols = feat_df["symbol"].to_list()
+        sectors = feat_df["sector"].to_list()
+        results = [
+            {"symbol": s, "sector": sec, "cluster_id": "Miscellaneous", "silhouette_score": None}
+            for s, sec in zip(symbols, sectors)
+        ]
+        cluster_stats = {
+            "n_stocks": n_stocks, "k_selected": 1, "silhouette": 0.0,
+            "pca_components": n_components_after, "pca_variance": variance_explained,
         }
-        print(f"  {sector}: K={len(unique_labels)}, silhouette={sil_score:.3f}, "
-              f"PCA {n_components_before}->{n_components_after} ({variance_explained:.1%})")
+        return pl.DataFrame(results), cluster_stats
+
+    # Auto-select optimal K
+    best_k, best_sil = _find_optimal_k(
+        X_reduced, cluster_cfg.max_clusters, cluster_cfg.min_cluster_size,
+        min_k=cluster_cfg.min_clusters,
+    )
+
+    kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X_reduced)
+
+    # Merge small clusters to nearest centroid
+    symbols = feat_df["symbol"].to_list()
+    sectors = feat_df["sector"].to_list()
+    cluster_counts: dict[int, list[int]] = {}
+    for idx, label in enumerate(labels):
+        cluster_counts.setdefault(label, []).append(idx)
+
+    for label, indices in list(cluster_counts.items()):
+        if len(indices) < cluster_cfg.min_cluster_size and best_k > 1:
+            for idx in indices:
+                distances = np.linalg.norm(
+                    kmeans.cluster_centers_ - X_reduced[idx], axis=1
+                )
+                sorted_clusters = np.argsort(distances)
+                for candidate in sorted_clusters:
+                    if candidate != label:
+                        labels[idx] = candidate
+                        break
+
+    unique_labels = sorted(set(labels))
+
+    # Compute silhouette AFTER merging so K=1 post-merge reports 0.0
+    n_unique = len(unique_labels)
+    if n_unique > 1 and n_stocks > n_unique:
+        sil_score = float(silhouette_score(X_reduced, labels))
+    else:
+        sil_score = 0.0
+
+    # Build descriptive cluster names based on sector composition
+    cluster_sectors: dict[int, set[str]] = {}
+    for idx, label in enumerate(labels):
+        cluster_sectors.setdefault(label, set()).add(sectors[idx])
+
+    name_counts: dict[str, int] = {}
+    label_to_name: dict[int, str] = {}
+    for label in unique_labels:
+        label_sectors = sorted(cluster_sectors[label])
+        if len(label_sectors) <= 3:
+            base_name = "-".join(s.replace(" ", "") for s in label_sectors)
+        else:
+            base_name = "Miscellaneous"
+        count = name_counts.get(base_name, 0)
+        name_counts[base_name] = count + 1
+        label_to_name[label] = f"{base_name}_{count}"
+
+    # If a base name appeared only once, strip the _0 suffix
+    single_names = {name for name, count in name_counts.items() if count == 1}
+    for label, name in label_to_name.items():
+        base = name.rsplit("_", 1)[0]
+        if base in single_names:
+            label_to_name[label] = base
+
+    results = []
+    for idx, symbol in enumerate(symbols):
+        results.append({
+            "symbol": symbol,
+            "sector": sectors[idx],
+            "cluster_id": label_to_name[labels[idx]],
+            "silhouette_score": sil_score,
+        })
+
+    cluster_stats = {
+        "n_stocks": n_stocks,
+        "k_selected": len(unique_labels),
+        "silhouette": sil_score,
+        "pca_components": n_components_after,
+        "pca_variance": variance_explained,
+    }
+    print(f"  Global: K={len(unique_labels)}, silhouette={sil_score:.3f}, "
+          f"PCA {n_components_before}->{n_components_after} ({variance_explained:.1%})")
 
     result_df = pl.DataFrame(results)
 
-    print(f"\nClustering summary ({len(result_df)} stocks, {len(sector_list)} sectors, "
-          f"{result_df['cluster_id'].n_unique()} clusters):")
+    print(f"\nClustering summary ({len(result_df)} stocks, {result_df['cluster_id'].n_unique()} clusters):")
     for cluster_id in result_df["cluster_id"].unique().sort().to_list():
         count = result_df.filter(pl.col("cluster_id") == cluster_id).height
         print(f"  {cluster_id}: {count} stocks")
 
-    return result_df, sector_stats
+    return result_df, cluster_stats
 
 
 def save_clusters(
@@ -583,16 +599,16 @@ def save_clusters(
 
 def main() -> None:
     """Run stock clustering pipeline."""
-    parser = argparse.ArgumentParser(description="Cluster stocks by sector")
+    parser = argparse.ArgumentParser(description="Cluster stocks globally")
     parser.add_argument("--config", default=None, help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    result_df, sector_stats = run_clustering(config)
+    result_df, cluster_stats = run_clustering(config)
 
     # Cluster stability check: compare with previous assignments
-    cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
-    prev_path = Path(cluster_cfg.output_parquet)
+    cluster_cfg_obj = ClusterConfig.from_dict(config.get("clustering", {}))
+    prev_path = Path(cluster_cfg_obj.output_parquet)
     if prev_path.exists():
         prev_df = pl.read_parquet(str(prev_path))
         merged = result_df.select(["symbol", "cluster_id"]).join(
@@ -616,26 +632,21 @@ def main() -> None:
         cluster_cfg = config.get("clustering", {})
         mlflow.log_params({
             "method": cluster_cfg.get("method", "kmeans"),
-            "max_clusters_per_sector": cluster_cfg.get("max_clusters_per_sector", 6),
-            "min_cluster_size": cluster_cfg.get("min_cluster_size", 3),
+            "max_clusters": cluster_cfg.get("max_clusters", 10),
+            "min_clusters": cluster_cfg.get("min_clusters", 3),
+            "include_sector_features": cluster_cfg.get("include_sector_features", True),
+            "min_cluster_size": cluster_cfg.get("min_cluster_size", 10),
             "pca_variance_ratio": cluster_cfg.get("pca_variance_ratio", 0.95),
             "n_stocks": len(result_df),
-            "n_clusters_total": result_df["cluster_id"].n_unique(),
-            "n_sectors": len(sector_stats),
+            "n_clusters": result_df["cluster_id"].n_unique(),
         })
 
-        for sector, stats in sector_stats.items():
-            safe_sector = sector.replace(" ", "_")
-            mlflow.log_metrics({
-                f"{safe_sector}/k_selected": stats["k_selected"],
-                f"{safe_sector}/silhouette": stats["silhouette"],
-                f"{safe_sector}/pca_components": stats["pca_components"],
-                f"{safe_sector}/pca_variance": stats["pca_variance"],
-                f"{safe_sector}/n_stocks": stats["n_stocks"],
-            })
-
-        avg_sil = np.mean([s["silhouette"] for s in sector_stats.values()])
-        mlflow.log_metric("avg_silhouette", float(avg_sil))
+        mlflow.log_metrics({
+            "k_selected": cluster_stats["k_selected"],
+            "silhouette": cluster_stats["silhouette"],
+            "pca_components": cluster_stats["pca_components"],
+            "pca_variance": cluster_stats["pca_variance"],
+        })
 
         mlflow.log_artifact(cluster_cfg.get("output_parquet", "data/clusters.parquet"))
     print("Logged clustering results to MLflow")

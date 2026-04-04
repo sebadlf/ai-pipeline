@@ -8,11 +8,6 @@ ingestion:
   start_years_back:
     dev: 8             # dev: 8 years (~6yr training after splits)
     prod: 20           # prod: 20 years (full history)
-  # In dev mode, limit to these sectors for faster iteration (null = all sectors)
-  dev_sectors:
-    - Technology
-    - Consumer Defensive
-    - Energy
   # Resolved at runtime via PIPELINE_ENV (default: dev)
   end_date: null  # null = today
 
@@ -66,16 +61,20 @@ model:
 
 # Training
 training:
-  batch_size: 128
+  batch_size:
+    dev: 256
+    prod: 128
   max_epochs:
-    dev: 50
+    dev: 20
     prod: 200
   learning_rate: 0.0005
   weight_decay: 0.05
   label_smoothing: 0.05
   focal_gamma: 2.0          # focal loss gamma (0 = standard CrossEntropy)
   noise_std: 0.03           # Gaussian noise augmentation on training inputs
-  early_stopping_patience: 15
+  early_stopping_patience:
+    dev: 7
+    prod: 15
   per_cluster: true
   cluster_experiment_prefix: "cluster"
   # Temporal splits (relative to today, with purge gaps)
@@ -83,10 +82,12 @@ training:
   val_years: 1         # 1 year before test = validation
   purge_days: 21       # gap between splits = target horizon (avoids label leakage)
 
-# Clustering — Stage 1
+# Clustering — Stage 1 (single-level global KMeans)
 clustering:
   method: kmeans
-  max_clusters_per_sector: 6   # auto-selects optimal K in [2..6] via silhouette
+  max_clusters: 10             # auto-selects optimal K in [min..max] via silhouette
+  min_clusters: 3
+  include_sector_features: true  # one-hot encode sector as clustering input
   pca_variance_ratio: 0.95     # PCA retains 95% of variance before clustering
   features_for_clustering:
     # Behavioral
@@ -120,7 +121,7 @@ clustering:
   # Keys are cluster_id strings; missing clusters use target.buy_threshold default.
   cluster_thresholds: {}
     # Example:
-    # Technology_0:
+    # Technology-Healthcare:
     #   buy_threshold: 0.07
 
 # Aggregation — Stage 3

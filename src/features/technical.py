@@ -641,7 +641,7 @@ def fill_nulls(df: pl.DataFrame, *, train_end: dt.date | None = None) -> pl.Data
 
 def main() -> None:
     """Generate features and save to parquet."""
-    from src.config import compute_split_dates, resolve_dev_sectors
+    from src.config import compute_split_dates
 
     config = load_config()
 
@@ -650,16 +650,7 @@ def main() -> None:
     parser.add_argument("--output", default="data/features.parquet")
     args = parser.parse_args()
 
-    # In dev mode, filter to configured sectors
     symbols = args.symbols
-    if symbols is None:
-        dev_sectors = resolve_dev_sectors(config)
-        if dev_sectors:
-            sector_set = set(dev_sectors)
-            query = "SELECT symbol, sector FROM stock_sectors ORDER BY symbol"
-            sectors_df = pl.read_database(query, get_engine())
-            symbols = sectors_df.filter(pl.col("sector").is_in(sector_set))["symbol"].to_list()
-            print(f"Dev mode: filtered to {len(symbols)} symbols in sectors: {', '.join(dev_sectors)}")
 
     print("Loading OHLCV data...")
     df = load_ohlcv(symbols)

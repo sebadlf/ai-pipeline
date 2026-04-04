@@ -665,9 +665,8 @@ def main() -> None:
 
     # Resolve symbol list: dynamic from API or static from config
     source = ingestion_cfg.get("source", "static")
-    dev_sectors = ingestion_cfg.get("dev_sectors") if PIPELINE_ENV == "dev" else None
     if source == "sp500":
-        all_symbols = fetch_sp500_constituents(sectors=dev_sectors)
+        all_symbols = fetch_sp500_constituents()
     else:
         all_symbols = list(ingestion_cfg["symbols"])
 
@@ -777,23 +776,48 @@ def main() -> None:
         print(f"  Sectors: {n_sectors} rows inserted/updated ({len(sector_rows)} symbols)")
 
     # --- Fundamentals: key metrics + financial ratios ---
+    # Only re-download if last data for a symbol is older than 90 days
     if not args.skip_fundamentals:
         print("\nFetching key metrics and financial ratios (quarterly)...")
+        freshness_cutoff = (today - dt.timedelta(days=90)).isoformat()
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT symbol, MAX(date) FROM key_metrics_quarterly GROUP BY symbol"
+            ))
+            km_last = {row[0]: str(row[1]) for row in result}
+            result = conn.execute(text(
+                "SELECT symbol, MAX(date) FROM financial_ratios_quarterly GROUP BY symbol"
+            ))
+            fr_last = {row[0]: str(row[1]) for row in result}
+
         km_total = 0
         fr_total = 0
+        fund_skipped = 0
         fund_failed: list[str] = []
         for i, symbol in enumerate(args.symbols, 1):
+            km_fresh = km_last.get(symbol, "") >= freshness_cutoff
+            fr_fresh = fr_last.get(symbol, "") >= freshness_cutoff
+            if km_fresh and fr_fresh:
+                fund_skipped += 1
+                if i % 50 == 0 or i == len(args.symbols):
+                    print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, "
+                          f"ratios: {fr_total}, skipped: {fund_skipped}")
+                continue
             try:
-                km_rows = fetch_key_metrics(symbol, start_date=args.start)
-                km_total += upsert_key_metrics(engine, km_rows)
-                fr_rows = fetch_financial_ratios(symbol, start_date=args.start)
-                fr_total += upsert_financial_ratios(engine, fr_rows)
+                if not km_fresh:
+                    km_rows = fetch_key_metrics(symbol, start_date=args.start)
+                    km_total += upsert_key_metrics(engine, km_rows)
+                if not fr_fresh:
+                    fr_rows = fetch_financial_ratios(symbol, start_date=args.start)
+                    fr_total += upsert_financial_ratios(engine, fr_rows)
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
                 print(f"  {symbol}: fundamentals FAILED ({type(e).__name__})")
                 fund_failed.append(symbol)
             if i % 50 == 0 or i == len(args.symbols):
-                print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, ratios: {fr_total}")
-        print(f"  Fundamentals done. KM: {km_total}, Ratios: {fr_total}")
+                print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, "
+                      f"ratios: {fr_total}, skipped: {fund_skipped}")
+        print(f"  Fundamentals done. KM: {km_total}, Ratios: {fr_total}, "
+              f"skipped (fresh): {fund_skipped}")
         if fund_failed:
             print(f"  Failed ({len(fund_failed)}): {', '.join(fund_failed[:10])}...")
 

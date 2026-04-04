@@ -46,15 +46,6 @@ def resolve_start_years_back(config: dict) -> int:
     return int(resolve_env_value(config["ingestion"]["start_years_back"], default=5))
 
 
-def resolve_dev_sectors(config: dict) -> list[str] | None:
-    """Return the sector filter list for dev mode, or None for prod (all sectors)."""
-    from src.keys import PIPELINE_ENV
-
-    if PIPELINE_ENV != "dev":
-        return None
-    return config.get("ingestion", {}).get("dev_sectors")
-
-
 @dataclass
 class SplitDates:
     """Date boundaries for temporal train/val/test splits with purge gaps.
@@ -121,7 +112,9 @@ class ClusterConfig:
     """Configuration for stock clustering (Stage 1)."""
 
     method: str = "kmeans"
-    max_clusters_per_sector: int = 6
+    max_clusters: int = 10
+    min_clusters: int = 3
+    include_sector_features: bool = True
     pca_variance_ratio: float = 0.95
     features_for_clustering: list[str] = field(
         default_factory=lambda: [
@@ -143,13 +136,15 @@ class ClusterConfig:
         """Create from config dict section."""
         return cls(
             method=d.get("method", "kmeans"),
-            max_clusters_per_sector=d.get("max_clusters_per_sector", 6),
+            max_clusters=d.get("max_clusters", 10),
+            min_clusters=d.get("min_clusters", 3),
+            include_sector_features=d.get("include_sector_features", True),
             pca_variance_ratio=d.get("pca_variance_ratio", 0.95),
             features_for_clustering=d.get(
                 "features_for_clustering",
                 cls.__dataclass_fields__["features_for_clustering"].default_factory(),
             ),
-            min_cluster_size=d.get("min_cluster_size", 3),
+            min_cluster_size=d.get("min_cluster_size", 10),
             output_parquet=d.get("output_parquet", "data/clusters.parquet"),
             cluster_thresholds=d.get("cluster_thresholds", {}),
         )

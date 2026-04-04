@@ -398,7 +398,7 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     dm = TradingDataModule(
         parquet_path=features_path,
         seq_len=model_cfg["sequence_length"],
-        batch_size=train_cfg["batch_size"],
+        batch_size=int(resolve_env_value(train_cfg["batch_size"], default=128)),
         split_dates=split_dates,
         cluster_id=cluster_id,
         clusters_parquet=cluster_cfg.output_parquet,
@@ -443,7 +443,7 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     # Callbacks
     early_stop = EarlyStopping(
         monitor="val_acc",
-        patience=train_cfg["early_stopping_patience"],
+        patience=int(resolve_env_value(train_cfg["early_stopping_patience"], default=15)),
         mode="max",
     )
     checkpoint = ModelCheckpoint(

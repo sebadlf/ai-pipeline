@@ -115,23 +115,50 @@ def test_single_stock_sector_no_crash() -> None:
 
 
 def test_cluster_id_format(sample_clustering_features: pl.DataFrame) -> None:
-    """Cluster IDs should follow the '{sector}_{n}' format."""
+    """Cluster IDs should be descriptive based on sector composition."""
+    from src.features.clustering import run_clustering
+
+    # Build a minimal config that exercises run_clustering's naming logic
+    # We test the naming logic directly instead
     feature_cols = [
         "return_20d_mean", "volatility_60d", "volume_profile", "rsi_14_mean", "beta_60d"
     ]
+    sectors = sample_clustering_features["sector"].to_list()
 
-    sector = "Technology"
-    sector_df = sample_clustering_features.filter(pl.col("sector") == sector)
-    X = sector_df.select(feature_cols).to_numpy()
+    X = sample_clustering_features.select(feature_cols).to_numpy()
     X_scaled = StandardScaler().fit_transform(X)
 
     kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
     labels = kmeans.fit_predict(X_scaled)
 
+    # Replicate the naming logic
     unique_labels = sorted(set(labels))
-    label_map = {old: new for new, old in enumerate(unique_labels)}
+    cluster_sectors: dict[int, set[str]] = {}
+    for idx, label in enumerate(labels):
+        cluster_sectors.setdefault(label, set()).add(sectors[idx])
 
-    for idx, symbol in enumerate(sector_df["symbol"].to_list()):
-        cluster_id = f"{sector}_{label_map[labels[idx]]}"
-        assert cluster_id.startswith("Technology_")
-        assert cluster_id.split("_")[-1].isdigit()
+    name_counts: dict[str, int] = {}
+    label_to_name: dict[int, str] = {}
+    for label in unique_labels:
+        label_sectors = sorted(cluster_sectors[label])
+        if len(label_sectors) <= 3:
+            base_name = "-".join(s.replace(" ", "") for s in label_sectors)
+        else:
+            base_name = "Miscellaneous"
+        count = name_counts.get(base_name, 0)
+        name_counts[base_name] = count + 1
+        label_to_name[label] = f"{base_name}_{count}"
+
+    single_names = {name for name, count in name_counts.items() if count == 1}
+    for label, name in label_to_name.items():
+        base = name.rsplit("_", 1)[0]
+        if base in single_names:
+            label_to_name[label] = base
+
+    # Each cluster_id should be a non-empty string
+    for label in unique_labels:
+        cluster_id = label_to_name[label]
+        assert len(cluster_id) > 0
+        # With 2 sectors (Technology, Healthcare) and 2 clusters,
+        # names should contain sector names or Miscellaneous
+        assert any(s in cluster_id for s in ["Technology", "Healthcare", "Miscellaneous"])

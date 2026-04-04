@@ -1,8 +1,7 @@
-"""Delete MLflow runs that lack precision evaluation metrics.
+"""Full pipeline cleanup: MLflow experiments, checkpoints, and artifacts.
 
-Removes legacy training runs that were created before the precision-focused
-evaluation system was added. Also deletes all registered model versions
-and aliases so promotion starts fresh.
+Deletes all MLflow experiments (and their runs), registered models,
+local checkpoints, MLflow artifact storage, and pipeline output parquets.
 
 Usage:
     uv run python -m src.evaluation.clean_runs
@@ -12,53 +11,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
+from pathlib import Path
 
 import mlflow
 from mlflow.tracking import MlflowClient
 
 from src.keys import MLFLOW_TRACKING_URI
 
+CLEANUP_PARQUETS = [
+    "data/clusters.parquet",
+    "data/predictions.parquet",
+    "data/portfolios.parquet",
+]
 
-def clean_legacy_runs(dry_run: bool = False) -> None:
-    """Delete all runs that lack val_passed_all_filters param."""
+
+def cleanup_all(dry_run: bool = False) -> None:
+    """Delete all MLflow state, checkpoints, and pipeline outputs."""
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = MlflowClient()
 
-    experiments = client.search_experiments()
-    total_deleted = 0
-    total_kept = 0
-
-    for exp in experiments:
-        if exp.name == "Default":
-            continue
-
-        runs = client.search_runs(
-            experiment_ids=[exp.experiment_id],
-            max_results=1000,
-        )
-
-        for run in runs:
-            has_eval = "val_passed_all_filters" in run.data.params
-
-            if not has_eval:
-                if dry_run:
-                    print(f"  [DRY RUN] Would delete: {exp.name} / {run.info.run_id[:12]}")
-                else:
-                    client.delete_run(run.info.run_id)
-                    print(f"  Deleted: {exp.name} / {run.info.run_id[:12]}")
-                total_deleted += 1
-            else:
-                total_kept += 1
-
-    print(f"\n{'Would delete' if dry_run else 'Deleted'}: {total_deleted} legacy runs")
-    print(f"Kept: {total_kept} runs with precision eval")
-
-
-def clean_registered_models(dry_run: bool = False) -> None:
-    """Delete all registered models so promotion starts fresh."""
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    client = MlflowClient()
-
+    # 1. Delete all registered models
     models = client.search_registered_models()
     for model in models:
         if dry_run:
@@ -66,20 +39,66 @@ def clean_registered_models(dry_run: bool = False) -> None:
         else:
             client.delete_registered_model(model.name)
             print(f"  Deleted model: {model.name}")
+    print(f"{'Would delete' if dry_run else 'Deleted'}: {len(models)} registered models")
 
-    print(f"\n{'Would delete' if dry_run else 'Deleted'}: {len(models)} registered models")
+    # 2. Delete all experiments (and their runs)
+    experiments = client.search_experiments()
+    n_deleted = 0
+    for exp in experiments:
+        if exp.name == "Default":
+            continue
+        if dry_run:
+            print(f"  [DRY RUN] Would delete experiment: {exp.name}")
+        else:
+            client.delete_experiment(exp.experiment_id)
+            print(f"  Deleted experiment: {exp.name}")
+        n_deleted += 1
+    print(f"{'Would delete' if dry_run else 'Deleted'}: {n_deleted} experiments")
+
+    # 3. Delete local checkpoints directory
+    ckpt_dir = Path("checkpoints")
+    if ckpt_dir.exists():
+        if dry_run:
+            n_files = sum(1 for _ in ckpt_dir.rglob("*") if _.is_file())
+            print(f"  [DRY RUN] Would delete checkpoints/ ({n_files} files)")
+        else:
+            shutil.rmtree(ckpt_dir)
+            print("  Deleted checkpoints/")
+    else:
+        print("  checkpoints/ not found, skipping")
+
+    # 4. Delete local MLflow artifacts (mlruns/mlruns/)
+    mlruns_inner = Path("mlruns/mlruns")
+    if mlruns_inner.exists():
+        if dry_run:
+            n_files = sum(1 for _ in mlruns_inner.rglob("*") if _.is_file())
+            print(f"  [DRY RUN] Would delete mlruns/mlruns/ ({n_files} files)")
+        else:
+            shutil.rmtree(mlruns_inner)
+            print("  Deleted mlruns/mlruns/")
+    else:
+        print("  mlruns/mlruns/ not found, skipping")
+
+    # 5. Delete pipeline output parquets
+    for parquet in CLEANUP_PARQUETS:
+        p = Path(parquet)
+        if p.exists():
+            if dry_run:
+                print(f"  [DRY RUN] Would delete {parquet}")
+            else:
+                p.unlink()
+                print(f"  Deleted {parquet}")
+
+    print("\nCleanup complete." if not dry_run else "\n[DRY RUN] No files were deleted.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Clean legacy MLflow runs")
+    parser = argparse.ArgumentParser(description="Full pipeline cleanup")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without deleting")
     args = parser.parse_args()
 
-    print("=== Cleaning legacy runs (no precision eval metrics) ===")
-    clean_legacy_runs(dry_run=args.dry_run)
-
-    print("\n=== Cleaning registered models ===")
-    clean_registered_models(dry_run=args.dry_run)
+    print("=== Pipeline Cleanup ===\n")
+    cleanup_all(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
