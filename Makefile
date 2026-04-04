@@ -57,11 +57,11 @@ cleanup:
 # --- Full pipeline ---
 pipeline:
 	$(MAKE) ingest
-	@if [ -f data/.new_data ]; then \
-		echo "New data detected, rebuilding features/clusters..."; \
+	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
+		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features cluster; \
 	else \
-		echo "No new data, skipping features/selection/clustering."; \
+		echo "No new data and clusters exist, skipping features/selection/clustering."; \
 	fi
 	$(MAKE) train promote aggregate portfolio backtest
 
