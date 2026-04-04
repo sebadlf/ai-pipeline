@@ -27,7 +27,6 @@ from src.db import get_engine
 from src.evaluation.champion import download_champion_checkpoint
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
-from src.models.dataset import EXCLUDE_COLS, _is_feature_col
 
 def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
     """Find the best model checkpoint for a cluster.
@@ -60,40 +59,38 @@ def resolve_feature_cols(
     features_df: pl.DataFrame,
     config: dict,
 ) -> list[str]:
-    """Resolve feature columns for inference, preferring model-embedded names.
+    """Resolve feature columns for inference from model checkpoint.
 
-    Priority:
-        1. feature_names from model checkpoint (authoritative)
-        2. Feature selection manifest (fallback for older checkpoints)
-        3. DataFrame column discovery (last resort)
+    Uses feature_names stored in checkpoint (authoritative). Falls back to
+    the feature selection manifest for models trained before feature_names
+    was added to the checkpoint.
     """
-    # Priority 1: feature names stored in checkpoint
     saved_names = model.hparams.get("feature_names")
     if saved_names:
         missing = [c for c in saved_names if c not in features_df.columns]
         if missing:
             raise ValueError(
                 f"Model requires {len(missing)} features not in DataFrame: "
-                f"{missing[:5]}... Load the correct features parquet."
+                f"{missing[:5]}..."
             )
         return list(saved_names)
 
-    # Priority 2: feature selection manifest
+    # Fallback for models trained before feature_names was added
     selected = get_selected_feature_names(config)
     if selected:
         feature_cols = [c for c in selected if c in features_df.columns]
-    else:
-        # Priority 3: discover from DataFrame columns
-        feature_cols = [c for c in features_df.columns if _is_feature_col(c)]
+        expected = model.hparams.get("input_size", len(feature_cols))
+        if len(feature_cols) != expected:
+            raise ValueError(
+                f"Feature mismatch: model expects {expected} features "
+                f"but manifest has {len(feature_cols)}. Retrain models."
+            )
+        return feature_cols
 
-    # Validate count against model input_size
-    expected = model.hparams.get("input_size", len(feature_cols))
-    if len(feature_cols) != expected:
-        raise ValueError(
-            f"Feature mismatch: model expects {expected} features "
-            f"but resolved {len(feature_cols)}. Retrain or fix feature selection."
-        )
-    return feature_cols
+    raise ValueError(
+        "Model checkpoint has no feature_names and no feature selection manifest found. "
+        "Retrain models with current code."
+    )
 
 
 def run_inference_for_cluster(

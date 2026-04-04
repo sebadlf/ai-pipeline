@@ -17,11 +17,10 @@ import polars as pl
 import torch
 
 from src.aggregation.consolidate import resolve_feature_cols
-from src.config import ClusterConfig, compute_split_dates, get_selected_feature_names, load_config
+from src.config import ClusterConfig, compute_split_dates, load_config
 from src.evaluation.champion import download_champion_checkpoint
 from src.features.technical import build_features, fill_nulls, load_ohlcv
 from src.models.base_model import LSTMForecaster
-from src.models.dataset import EXCLUDE_COLS, _is_feature_col
 
 
 

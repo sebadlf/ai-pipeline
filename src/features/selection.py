@@ -18,8 +18,7 @@ import numpy as np
 import polars as pl
 
 from src.config import load_config
-
-EXCLUDE_COLS = {"id", "symbol", "date", "target"}
+from src.models.dataset import _is_feature_col
 
 
 def select_features(
@@ -48,7 +47,7 @@ def select_features(
     if verbose and train_end:
         print(f"  Computing selection statistics on training data only (< {train_end}, {len(stats_df):,} rows)")
 
-    feature_cols = [c for c in df.columns if c not in EXCLUDE_COLS and not c.startswith("forward_return_")]
+    feature_cols = [c for c in df.columns if _is_feature_col(c)]
     initial_count = len(feature_cols)
 
     # 1. Remove features with too many nulls (computed on training data)

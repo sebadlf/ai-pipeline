@@ -239,14 +239,17 @@ class PromotionEvalConfig:
 def get_features_parquet_path(config: dict) -> str:
     """Resolve the features parquet path based on feature selection config.
 
-    Returns features_selected.parquet when feature selection is enabled,
-    otherwise falls back to features.parquet.
+    Returns features_selected.parquet when feature selection is enabled.
+    Raises FileNotFoundError if enabled but file missing.
     """
     sel_cfg = config.get("feature_selection", {})
     if sel_cfg.get("enabled", False):
         selected_path = "data/features_selected.parquet"
         if Path(selected_path).exists():
             return selected_path
+        raise FileNotFoundError(
+            f"{selected_path} not found. Run `make select-features` first."
+        )
     return "data/features.parquet"
 
 

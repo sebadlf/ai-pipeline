@@ -84,25 +84,13 @@ def test_resolve_feature_cols_missing_column_raises() -> None:
         resolve_feature_cols(model, df, config)
 
 
-def test_resolve_feature_cols_fallback_discovery() -> None:
-    """Without feature_names or manifest, discover from DataFrame columns."""
+def test_resolve_feature_cols_no_feature_names_no_manifest_raises() -> None:
+    """Without feature_names or manifest, raise ValueError requiring retrain."""
     from src.aggregation.consolidate import resolve_feature_cols
 
     model = _make_model(input_size=3)
     df = _make_df(["f1", "f2", "f3"])
     config = {"feature_selection": {"enabled": False}}
 
-    result = resolve_feature_cols(model, df, config)
-    assert result == ["f1", "f2", "f3"]
-
-
-def test_resolve_feature_cols_fallback_mismatch_raises() -> None:
-    """Without feature_names, mismatch between input_size and columns raises."""
-    from src.aggregation.consolidate import resolve_feature_cols
-
-    model = _make_model(input_size=5)
-    df = _make_df(["f1", "f2", "f3"])
-    config = {"feature_selection": {"enabled": False}}
-
-    with pytest.raises(ValueError, match="Feature mismatch"):
+    with pytest.raises(ValueError, match="Retrain models"):
         resolve_feature_cols(model, df, config)
