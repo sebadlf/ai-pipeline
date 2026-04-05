@@ -319,6 +319,10 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
 
     # Load portfolio allocations
     output_path = portfolio_cfg.get("output_parquet", "data/portfolios.parquet")
+    if not Path(output_path).exists():
+        print(f"Portfolio file not found: {output_path}. Run portfolio optimization first.")
+        return []
+
     portfolios = pl.read_parquet(output_path)
 
     if portfolios.is_empty():

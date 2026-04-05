@@ -370,6 +370,13 @@ def save_portfolios(
     all_dfs = [df for df in results.values() if not df.is_empty()]
     if not all_dfs:
         print("No portfolio allocations to save.")
+        # Write empty parquet so downstream stages can detect and handle gracefully
+        empty = pl.DataFrame(schema={
+            "symbol": pl.Utf8, "weight": pl.Float64,
+            "cluster_id": pl.Utf8, "prob_up": pl.Float64, "profile": pl.Utf8,
+        })
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        empty.write_parquet(output_path)
         return
 
     combined = pl.concat(all_dfs)

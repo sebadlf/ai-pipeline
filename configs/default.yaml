@@ -146,21 +146,21 @@ portfolio:
       validation_metric: information
       max_positions: 25
       max_sector_weight: 0.30
-      min_prob_up: 0.70            # minimum probability of UP to include in portfolio
+      min_prob_up: 0.60            # minimum probability of UP to include in portfolio
     moderate:
       primary_metric: sharpe
       complementary_metric: calmar
       validation_metric: sortino
       max_positions: 20
       max_sector_weight: 0.25
-      min_prob_up: 0.75
+      min_prob_up: 0.65
     conservative:
       primary_metric: calmar
       complementary_metric: sortino
       validation_metric: sharpe
       max_positions: 15
       max_sector_weight: 0.20
-      min_prob_up: 0.80
+      min_prob_up: 0.70
   constraints:
     max_single_position: 0.10
     min_single_position: 0.01
