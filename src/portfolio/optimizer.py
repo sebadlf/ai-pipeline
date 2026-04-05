@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import traceback
 from pathlib import Path
 
 import mlflow
@@ -421,12 +422,18 @@ def main() -> None:
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment("portfolio-optimization")
     with mlflow.start_run(run_name="portfolio-design"):
-        for profile_name, allocation in results.items():
-            if not allocation.is_empty():
-                mlflow.log_metric(f"{profile_name}_n_positions", len(allocation))
-                mlflow.log_metric(f"{profile_name}_max_weight", float(allocation["weight"].max()))
-        if Path(output_path).exists():
-            mlflow.log_artifact(output_path)
+        try:
+            for profile_name, allocation in results.items():
+                if not allocation.is_empty():
+                    mlflow.log_metric(f"{profile_name}_n_positions", len(allocation))
+                    mlflow.log_metric(f"{profile_name}_max_weight", float(allocation["weight"].max()))
+            if Path(output_path).exists():
+                mlflow.log_artifact(output_path)
+        except Exception as e:
+            mlflow.set_tag("error_type", type(e).__name__)
+            mlflow.set_tag("error_message", str(e)[:5000])
+            mlflow.set_tag("error_traceback", traceback.format_exc()[:5000])
+            raise
     print("Logged portfolio results to MLflow")
 
 

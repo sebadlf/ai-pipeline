@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import tempfile
+import traceback
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -35,6 +36,26 @@ from src.config import (
 from src.keys import MLFLOW_TRACKING_URI, OPTUNA_STORAGE_URL
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
+
+_MLFLOW_TAG_MAX = 5000
+
+
+def _log_exception_to_mlflow_run(
+    client: mlflow.MlflowClient,
+    mlflow_logger: MLFlowLogger | None,
+    exc: BaseException,
+) -> None:
+    """Write error type, message, and truncated traceback as tags on the active run."""
+    run_id = getattr(mlflow_logger, "run_id", None) if mlflow_logger else None
+    if not run_id:
+        ar = mlflow.active_run()
+        run_id = ar.info.run_id if ar else None
+    if not run_id:
+        return
+    tb = traceback.format_exc()
+    client.set_tag(run_id, "error_type", type(exc).__name__)
+    client.set_tag(run_id, "error_message", str(exc)[:_MLFLOW_TAG_MAX])
+    client.set_tag(run_id, "error_traceback", tb[:_MLFLOW_TAG_MAX])
 
 
 def suggest_hyperparams(trial: optuna.Trial) -> dict[str, Any]:
@@ -371,42 +392,46 @@ def train_final_model(
         gradient_clip_val=1.0,
     )
 
-    # Train
-    print(f"  Training with {dm.input_size} features, seq_len={best_params['sequence_length']}")
-    trainer.fit(model, dm)
-
-    # Test
-    test_results = trainer.test(model, dm)
-    print(f"  Test results: {test_results}")
-
-    # Log checkpoint
-    if checkpoint.best_model_path:
-        mlflow.log_artifact(checkpoint.best_model_path, artifact_path="checkpoints")
-        print(f"  Best checkpoint: {checkpoint.best_model_path}")
-
-    # Log params to MLflow
-    run_id = mlflow_logger.run_id
     client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    print(f"  Training with {dm.input_size} features, seq_len={best_params['sequence_length']}")
+    try:
+        trainer.fit(model, dm)
 
-    # Log best hyperparams + cluster info
-    params_to_log = {
-        "cluster_id": cluster_id,
-        "buy_threshold": buy_thresh,
-        "num_classes": 2,
-        "optuna_n_trials": config["training"].get("optuna", {}).get("n_trials", 30),
-        **{f"optuna_{k}": v for k, v in best_params.items()},
-    }
-    for key, value in params_to_log.items():
-        client.log_param(run_id, key, value)
+        # Test
+        test_results = trainer.test(model, dm)
+        print(f"  Test results: {test_results}")
 
-    # Confusion matrix + precision/recall/f1
-    _log_confusion_matrix(model, dm, client, run_id)
+        # Log checkpoint
+        if checkpoint.best_model_path:
+            mlflow.log_artifact(checkpoint.best_model_path, artifact_path="checkpoints")
+            print(f"  Best checkpoint: {checkpoint.best_model_path}")
 
-    # Precision-based evaluation with walk-forward stability
-    _run_precision_eval(model, dm, config, client, run_id, buy_thresh)
+        # Log params to MLflow
+        run_id = mlflow_logger.run_id
 
-    # Trade evaluation
-    _run_trade_eval(model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet)
+        # Log best hyperparams + cluster info
+        params_to_log = {
+            "cluster_id": cluster_id,
+            "buy_threshold": buy_thresh,
+            "num_classes": 2,
+            "optuna_n_trials": config["training"].get("optuna", {}).get("n_trials", 30),
+            **{f"optuna_{k}": v for k, v in best_params.items()},
+        }
+        for key, value in params_to_log.items():
+            client.log_param(run_id, key, value)
+
+        # Confusion matrix + precision/recall/f1
+        _log_confusion_matrix(model, dm, client, run_id)
+
+        # Precision-based evaluation with walk-forward stability
+        _run_precision_eval(model, dm, config, client, run_id, buy_thresh)
+
+        # Trade evaluation
+        _run_trade_eval(model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet)
+    except Exception as e:
+        _log_exception_to_mlflow_run(client, mlflow_logger, e)
+        print(f"  ERROR: {e}")
+        raise
 
 
 def _log_confusion_matrix(
