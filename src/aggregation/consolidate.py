@@ -297,7 +297,7 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
             p["model_run_id"] = model_run_id
         all_predictions.extend(preds)
 
-    result_df = pl.DataFrame(all_predictions)
+    result_df = pl.DataFrame(all_predictions, infer_schema_length=None)
 
     # Summary
     if not result_df.is_empty():

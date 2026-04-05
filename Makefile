@@ -60,6 +60,7 @@ pipeline:
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
 		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features cluster; \
+		rm -f data/.new_data; \
 	else \
 		echo "No new data and clusters exist, skipping features/selection/clustering."; \
 	fi
