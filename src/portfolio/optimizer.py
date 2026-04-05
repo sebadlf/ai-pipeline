@@ -410,6 +410,7 @@ def main() -> None:
     save_portfolios(results, config)
 
     # Log to MLflow
+    output_path = config.get("portfolio", {}).get("output_parquet", "data/portfolios.parquet")
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment("portfolio-optimization")
     with mlflow.start_run(run_name="portfolio-design"):
@@ -417,8 +418,8 @@ def main() -> None:
             if not allocation.is_empty():
                 mlflow.log_metric(f"{profile_name}_n_positions", len(allocation))
                 mlflow.log_metric(f"{profile_name}_max_weight", float(allocation["weight"].max()))
-        output_path = config.get("portfolio", {}).get("output_parquet", "data/portfolios.parquet")
-        mlflow.log_artifact(output_path)
+        if Path(output_path).exists():
+            mlflow.log_artifact(output_path)
     print("Logged portfolio results to MLflow")
 
 
