@@ -175,8 +175,10 @@ class LSTMForecaster(L.LightningModule):
             tp = (up_preds & up_targets).float().sum()
             fp = (up_preds & ~up_targets).float().sum()
             fn = (~up_preds & up_targets).float().sum()
-            precision_up = tp / (tp + fp) if (tp + fp) > 0 else torch.tensor(0.0)
-            recall_up = tp / (tp + fn) if (tp + fn) > 0 else torch.tensor(0.0)
+            denom_prec = tp + fp
+            denom_rec = tp + fn
+            precision_up = tp / denom_prec if denom_prec > 0 else torch.zeros(1, device=x.device).squeeze()
+            recall_up = tp / denom_rec if denom_rec > 0 else torch.zeros(1, device=x.device).squeeze()
             self.log("val_precision_up", precision_up, prog_bar=True)
             self.log("val_recall_up", recall_up, prog_bar=True)
 
