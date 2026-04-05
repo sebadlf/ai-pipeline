@@ -16,6 +16,8 @@ dependencies = [
     "rich>=14.3.3",
     "scikit-learn>=1.5",
     "scipy>=1.14",
+    "optuna>=3.6",
+    "optuna-integration>=3.6",
 ]
 
 [project.optional-dependencies]

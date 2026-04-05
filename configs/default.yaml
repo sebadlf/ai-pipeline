@@ -77,6 +77,13 @@ training:
     prod: 15
   per_cluster: true
   cluster_experiment_prefix: "cluster"
+  # Optuna hyperparameter optimization
+  optuna:
+    n_trials: 30                # number of trials per cluster
+    min_recall_up: 0.10         # minimum recall before penalizing objective
+    epochs_per_trial: 30        # reduced epochs during search
+    patience_per_trial: 7       # aggressive early stopping in trials
+    startup_trials: 5           # trials without pruning at start
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation

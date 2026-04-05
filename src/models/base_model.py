@@ -169,6 +169,17 @@ class LSTMForecaster(L.LightningModule):
             probs = torch.softmax(logits, dim=-1)
             self.log("val_mean_prob_up", probs[:, 1].mean(), prog_bar=True)
 
+            # Precision and recall for UP class (class 1)
+            up_preds = preds == 1
+            up_targets = y == 1
+            tp = (up_preds & up_targets).float().sum()
+            fp = (up_preds & ~up_targets).float().sum()
+            fn = (~up_preds & up_targets).float().sum()
+            precision_up = tp / (tp + fp) if (tp + fp) > 0 else torch.tensor(0.0)
+            recall_up = tp / (tp + fn) if (tp + fn) > 0 else torch.tensor(0.0)
+            self.log("val_precision_up", precision_up, prog_bar=True)
+            self.log("val_recall_up", recall_up, prog_bar=True)
+
             # Per-class accuracy
             for cls_idx, cls_name in enumerate(["not_up", "up"]):
                 mask = y == cls_idx

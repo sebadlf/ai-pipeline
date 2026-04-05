@@ -1,7 +1,8 @@
-"""Model training with PyTorch Lightning and MLflow logging.
+"""Model training with Optuna hyperparameter optimization.
 
 Supports per-cluster training (Stage 2) where each cluster gets its own
-MLflow experiment and model checkpoint.
+Optuna study that optimizes for precision of the UP class, then trains
+a final model with the best hyperparameters.
 
 Usage:
     uv run python -m src.training.train
@@ -14,17 +15,19 @@ from __future__ import annotations
 import argparse
 import tempfile
 
-import lightning as L
 import mlflow
 import numpy as np
 import polars as pl
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
-from lightning.pytorch.loggers import MLFlowLogger
 
-from src.config import ClusterConfig, SplitDates, compute_split_dates, get_cluster_buy_threshold, get_features_parquet_path, load_config, resolve_env_value
+from src.config import (
+    ClusterConfig,
+    SplitDates,
+    compute_split_dates,
+    get_cluster_buy_threshold,
+    get_features_parquet_path,
+    load_config,
+)
 from src.keys import MLFLOW_TRACKING_URI
-from src.models.base_model import LSTMForecaster
-from src.models.dataset import TradingDataModule
 
 
 def _load_entry_exit_prices(
@@ -41,7 +44,6 @@ def _load_entry_exit_prices(
 
     engine = get_engine()
     placeholders = ", ".join(f"'{s}'" for s in symbols)
-    # Fetch enough days after entry to find the exit date
     buffer_days = int(horizon * 2.5)
     end_buffer = entry_date + dt.timedelta(days=buffer_days)
     query = f"""
@@ -62,10 +64,8 @@ def _load_entry_exit_prices(
         sym_prices = prices.filter(pl.col("symbol") == symbol).sort("date")
         if sym_prices.is_empty():
             continue
-        # Entry: first available date >= entry_date
         price_entry = sym_prices["close"][0]
         date_entry = sym_prices["date"][0]
-        # Exit: horizon trading days after entry
         if len(sym_prices) > horizon:
             price_exit = sym_prices["close"][horizon]
             date_exit = sym_prices["date"][horizon]
@@ -145,11 +145,7 @@ def _run_split_eval(
     run_id: str,
     config: dict,
 ) -> None:
-    """Evaluate and log trade metrics for a single split period.
-
-    Enriches predictions with entry/exit prices, computes per-trade returns,
-    and logs detailed trade artifacts and summary statistics to MLflow.
-    """
+    """Evaluate and log trade metrics for a single split period."""
     from src.evaluation.backtest import load_test_prices, run_portfolio_backtest
 
     if not preds:
@@ -159,21 +155,17 @@ def _run_split_eval(
     horizon = config.get("target", {}).get("horizon", 21)
     buy_threshold = config.get("target", {}).get("buy_threshold", 0.025)
 
-    # Summarize prob_up distribution
-    min_prob_up = 0.70  # default actionable threshold for eval
+    min_prob_up = 0.70
     n_actionable = sum(1 for p in preds if p["prob_up"] >= min_prob_up)
     n_total = len(preds)
     mean_prob = sum(p["prob_up"] for p in preds) / n_total if n_total else 0
     print(f"    {prefix}: {n_total} predictions, {n_actionable} actionable (prob_up >= {min_prob_up:.0%}), mean={mean_prob:.2%}")
 
-    # Log counts
     client.log_metric(run_id, f"{prefix}_trade_n_actionable", n_actionable)
     client.log_metric(run_id, f"{prefix}_trade_n_total", n_total)
 
-    # Filter actionable predictions
     actionable = [p for p in preds if p["prob_up"] >= min_prob_up]
 
-    # --- Detailed trade artifact with prices ---
     if actionable:
         symbols = [p["symbol"] for p in actionable]
         price_data = _load_entry_exit_prices(symbols, period_end, horizon)
@@ -199,7 +191,6 @@ def _run_split_eval(
             trades_df.write_csv(f.name)
             client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_trades")
 
-        # --- Trade summary artifact ---
         summary = _build_trade_summary(trades_df)
         if summary:
             for key, val in summary.items():
@@ -219,14 +210,12 @@ def _run_split_eval(
             client.log_metric(run_id, f"{prefix}_trade_{key}", 0.0)
         return
 
-    # Equal-weight allocation across actionable predictions (long-only)
     weight = 1.0 / len(actionable)
     allocations_df = pl.DataFrame([
         {"symbol": p["symbol"], "weight": weight}
         for p in actionable
     ])
 
-    # Load prices for the period
     symbols = [p["symbol"] for p in actionable]
     prices_df = load_test_prices(symbols, period_start, period_end)
 
@@ -234,11 +223,9 @@ def _run_split_eval(
         print(f"    {prefix}: no price data for period")
         return
 
-    # Run backtest
     bt_config = config.get("backtest", {})
     result = run_portfolio_backtest(allocations_df, prices_df, bt_config)
 
-    # Log all backtest metrics with prefix
     metrics = {
         f"{prefix}_trade_total_return": result.total_return,
         f"{prefix}_trade_sharpe": result.sharpe_ratio,
@@ -259,89 +246,20 @@ def _run_split_eval(
           f"win_rate={result.win_rate:.1%}")
 
 
-def _log_confusion_matrix(
-    model: LSTMForecaster,
-    dm: TradingDataModule,
-    client,
-    run_id: str,
-) -> None:
-    """Compute and log confusion matrix + classification metrics to MLflow.
-
-    Evaluates the model on both validation and test sets, logs precision/recall/f1
-    for the UP class, and saves confusion matrix images as artifacts.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, precision_recall_fscore_support
-
-    import torch
-
-    model.eval()
-    class_names = ["NOT_UP", "UP"]
-
-    for split_name, dataloader in [("val", dm.val_dataloader()), ("test", dm.test_dataloader())]:
-        all_preds = []
-        all_targets = []
-
-        with torch.no_grad():
-            for batch in dataloader:
-                x, y = batch
-                logits = model(x)
-                preds = logits.argmax(dim=-1)
-                all_preds.append(preds.cpu())
-                all_targets.append(y.cpu())
-
-        all_preds = torch.cat(all_preds).numpy()
-        all_targets = torch.cat(all_targets).numpy()
-
-        # Confusion matrix
-        cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
-
-        # Precision, recall, F1 for UP class (index 1)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_targets, all_preds, labels=[0, 1], zero_division=0.0,
-        )
-        client.log_metric(run_id, f"{split_name}_precision_up", float(precision[1]))
-        client.log_metric(run_id, f"{split_name}_recall_up", float(recall[1]))
-        client.log_metric(run_id, f"{split_name}_f1_up", float(f1[1]))
-
-        print(f"  {split_name} — precision_up={precision[1]:.3f}, "
-              f"recall_up={recall[1]:.3f}, f1_up={f1[1]:.3f}")
-
-        # Save confusion matrix image
-        fig, ax = plt.subplots(figsize=(5, 4))
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-        disp.plot(ax=ax, cmap="Blues", values_format="d")
-        ax.set_title(f"Confusion Matrix — {split_name}")
-        fig.tight_layout()
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            fig.savefig(f.name, dpi=100)
-            client.log_artifact(run_id, f.name, artifact_path="confusion_matrix")
-        plt.close(fig)
-
-
 def _evaluate_cluster_trades(
-    model: LSTMForecaster,
+    model,
     config: dict,
     cluster_id: str,
     split_dates: SplitDates,
     run_id: str,
     clusters_parquet: str,
 ) -> None:
-    """Run mini-backtests for a cluster across train/val/test splits.
-
-    Generates predictions for each temporal split, simulates trades with
-    equal-weight allocation, and logs all metrics + trade details as
-    MLflow artifacts with split-specific prefixes.
-    """
+    """Run mini-backtests for a cluster across train/val/test splits."""
     from src.aggregation.consolidate import run_inference_for_period
 
     features_path = get_features_parquet_path(config)
     features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
 
-    # Drop all-null columns (same as aggregation)
     all_null_cols = [c for c in features_df.columns if features_df[c].null_count() == len(features_df)]
     if all_null_cols:
         features_df = features_df.drop(all_null_cols)
@@ -370,167 +288,14 @@ def _evaluate_cluster_trades(
 
 
 def train_single_cluster(config: dict, cluster_id: str) -> None:
-    """Train a model for a single cluster.
+    """Train a model for a single cluster using Optuna optimization.
 
     Args:
         config: Full config dict.
         cluster_id: Cluster identifier (e.g. "Technology_0").
     """
-    model_cfg = config["model"]
-    train_cfg = config["training"]
-
-    split_dates = compute_split_dates(config)
-    print(f"\n{'='*60}")
-    print(f"Training cluster: {cluster_id}")
-    print(f"{'='*60}")
-    print("Temporal splits:")
-    print(split_dates.summary())
-
-    # Resolve per-cluster threshold
-    buy_thresh = get_cluster_buy_threshold(config, cluster_id)
-    print(f"  Threshold — UP: +{buy_thresh:.1%}")
-
-    cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
-
-    # Data
-    features_path = get_features_parquet_path(config)
-    print(f"  Features source: {features_path}")
-    dm = TradingDataModule(
-        parquet_path=features_path,
-        seq_len=model_cfg["sequence_length"],
-        batch_size=int(resolve_env_value(train_cfg["batch_size"], default=128)),
-        split_dates=split_dates,
-        cluster_id=cluster_id,
-        clusters_parquet=cluster_cfg.output_parquet,
-        noise_std=train_cfg.get("noise_std", 0.01),
-    )
-    dm.setup()
-
-    # Skip clusters with insufficient data for sequence creation
-    train_samples = len(dm.train_ds)
-    val_samples = len(dm.val_ds)
-    if train_samples <= 0 or val_samples <= 0:
-        print(f"  SKIPPING {cluster_id}: insufficient valid sequences (train={train_samples}, val={val_samples})")
-        return
-
-    # Model
-    num_classes = model_cfg.get("num_classes", 3)
-    model = LSTMForecaster(
-        input_size=dm.input_size,
-        hidden_size=model_cfg["hidden_size"],
-        num_layers=model_cfg["num_layers"],
-        num_classes=num_classes,
-        dropout=model_cfg["dropout"],
-        learning_rate=train_cfg["learning_rate"],
-        weight_decay=train_cfg.get("weight_decay", 0.0),
-        label_smoothing=train_cfg.get("label_smoothing", 0.05),
-        class_weights=dm.class_weights,
-        num_attention_heads=model_cfg.get("num_attention_heads", 4),
-        focal_gamma=train_cfg.get("focal_gamma", 2.0),
-        feature_names=dm.feature_cols,
-    )
-
-    # MLflow logger — separate experiment per cluster
-    prefix = train_cfg.get("cluster_experiment_prefix", "cluster")
-    experiment_name = f"{prefix}/{cluster_id}"
-    mlflow_logger = MLFlowLogger(
-        experiment_name=experiment_name,
-        tracking_uri=MLFLOW_TRACKING_URI,
-        log_model=True,
-        save_dir="checkpoints",
-    )
-
-    # Callbacks
-    early_stop = EarlyStopping(
-        monitor="val_acc",
-        patience=int(resolve_env_value(train_cfg["early_stopping_patience"], default=15)),
-        mode="max",
-    )
-    checkpoint = ModelCheckpoint(
-        dirpath="checkpoints",
-        monitor="val_acc",
-        mode="max",
-        save_top_k=1,
-        filename=f"{cluster_id}-best-{{epoch}}-{{val_acc:.4f}}",
-    )
-
-    # Trainer
-    trainer = L.Trainer(
-        max_epochs=int(resolve_env_value(train_cfg["max_epochs"], default=200)),
-        accelerator="mps",
-        devices=1,
-        logger=mlflow_logger,
-        callbacks=[early_stop, checkpoint, RichProgressBar()],
-        log_every_n_steps=10,
-        gradient_clip_val=1.0,
-    )
-
-    # Train
-    print(f"Training with {dm.input_size} features, seq_len={model_cfg['sequence_length']}")
-    trainer.fit(model, dm)
-
-    # Test
-    test_results = trainer.test(model, dm)
-    print(f"Test results: {test_results}")
-
-    # Log best checkpoint and cluster params to MLflow
-    if checkpoint.best_model_path:
-        mlflow.log_artifact(checkpoint.best_model_path, artifact_path="checkpoints")
-        print(f"Best checkpoint: {checkpoint.best_model_path}")
-
-    # Log cluster params to the same MLflow run used by the Lightning logger
-    run_id = mlflow_logger.run_id
-    client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    for key, value in {
-        "cluster_id": cluster_id,
-        "buy_threshold": buy_thresh,
-        "num_classes": num_classes,
-    }.items():
-        client.log_param(run_id, key, value)
-
-    # Confusion matrix + precision/recall/f1
-    try:
-        _log_confusion_matrix(model, dm, client, run_id)
-    except Exception as e:
-        print(f"  Confusion matrix logging failed: {e}")
-
-    # Precision-based evaluation with walk-forward stability
-    try:
-        from src.evaluation.precision_eval import evaluate_model as precision_evaluate, log_eval_to_mlflow
-        from src.config import PromotionEvalConfig
-
-        promotion_cfg = config.get("promotion", {})
-        if "evaluation" in promotion_cfg:
-            eval_config = PromotionEvalConfig.from_dict(promotion_cfg)
-            # Build sample_dates and forward_returns aligned with val valid_indices
-            seq_len = model_cfg["sequence_length"]
-            val_vi = dm.val_valid_indices
-            target_indices = val_vi + seq_len  # index of the target for each sample
-            sample_dates = dm.val_dates[target_indices] if dm.val_dates is not None and len(dm.val_dates) > 0 else np.array([])
-            fwd_returns = dm.val_forward_returns[target_indices] if dm.val_forward_returns is not None else None
-
-            eval_result = precision_evaluate(
-                model=model,
-                val_dataloader=dm.val_dataloader(),
-                eval_config=eval_config,
-                sample_dates=sample_dates,
-                forward_returns=fwd_returns,
-                buy_threshold=buy_thresh,
-            )
-            log_eval_to_mlflow(eval_result, client, run_id)
-            print(f"  Precision eval: stability_score={eval_result.stability_score:.4f}, "
-                  f"auc_pr={eval_result.auc_pr:.4f}, stage={eval_result.elimination_stage}")
-    except Exception as e:
-        print(f"  Precision evaluation failed: {e}")
-
-    # Evaluate trading performance on test set
-    try:
-        _evaluate_cluster_trades(
-            model, config, cluster_id, split_dates,
-            run_id, cluster_cfg.output_parquet,
-        )
-    except Exception as e:
-        print(f"  Trade evaluation failed: {e}")
+    from src.training.optimize import optimize_cluster
+    optimize_cluster(config, cluster_id)
 
 
 def train_all_clusters(config: dict) -> None:
