@@ -231,7 +231,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     optuna_cfg = config["training"].get("optuna", {})
     n_trials = optuna_cfg.get("n_trials", 30)
     startup_trials = optuna_cfg.get("startup_trials", 5)
-    max_history_days = optuna_cfg.get("max_history_days", 30)
+    max_history_days = int(resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30))
 
     print(f"\n{'='*60}")
     print(f"Optimizing cluster: {cluster_id}")

@@ -84,8 +84,10 @@ training:
     epochs_per_trial: 30        # reduced epochs during search
     patience_per_trial: 7       # aggressive early stopping in trials
     startup_trials: 5           # trials without pruning at start
-    persist: true               # persist studies in PostgreSQL for warm-starting
-    max_history_days: 30        # purge trials older than this (0 = keep all)
+    persist: true               # always persist studies in PostgreSQL for warm-starting
+    max_history_days:
+      dev: 7                    # purge trials older than 7 days in dev
+      prod: 30                  # keep 30 days of history in prod
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation

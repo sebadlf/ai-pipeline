@@ -18,7 +18,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
-from src.keys import POSTGRES_HOST, POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_USER
+from src.keys import POSTGRES_HOST, POSTGRES_DB, POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_USER
 
 MLFLOW_DB = "mlflow"
 
@@ -82,7 +82,34 @@ def cleanup_all(dry_run: bool = False) -> None:
     else:
         print("  mlruns/mlruns/ not found, skipping")
 
-    # 4. Delete pipeline output parquets
+    # 4. Delete Optuna studies from the trading database
+    trading_url = f"postgresql+psycopg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    trading_engine = create_engine(trading_url)
+    with trading_engine.connect() as conn:
+        # Check if Optuna tables exist before attempting cleanup
+        result = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'studies')"
+        ))
+        has_optuna = result.scalar()
+
+    if has_optuna:
+        if dry_run:
+            import optuna
+            storage = optuna.storages.RDBStorage(trading_url)
+            studies = optuna.study.get_all_study_names(storage)
+            print(f"  [DRY RUN] Would delete {len(studies)} Optuna studies: {studies}")
+        else:
+            import optuna
+            storage = optuna.storages.RDBStorage(trading_url)
+            studies = optuna.study.get_all_study_names(storage)
+            for name in studies:
+                optuna.delete_study(study_name=name, storage=storage)
+            print(f"  Deleted {len(studies)} Optuna studies")
+    else:
+        print("  No Optuna tables found, skipping")
+    trading_engine.dispose()
+
+    # 5. Delete pipeline output parquets
     for parquet in CLEANUP_PARQUETS:
         p = Path(parquet)
         if p.exists():
