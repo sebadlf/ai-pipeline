@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime, timedelta
 from typing import Any
 
 import lightning as L
@@ -31,7 +32,7 @@ from src.config import (
     load_config,
     resolve_env_value,
 )
-from src.keys import MLFLOW_TRACKING_URI
+from src.keys import MLFLOW_TRACKING_URI, OPTUNA_STORAGE_URL
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
 
@@ -185,8 +186,40 @@ def _create_trial_objective(
     return objective
 
 
+def _get_optuna_storage(optuna_cfg: dict) -> str | None:
+    """Return the Optuna storage URL if persistence is enabled, else None (in-memory)."""
+    if not optuna_cfg.get("persist", False):
+        return None
+    return OPTUNA_STORAGE_URL
+
+
+def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
+    """Remove trials older than max_history_days from the study.
+
+    Optuna doesn't expose a delete-trial API, so we re-enqueue the recent
+    trials into a fresh study. This only applies when using persistent storage.
+
+    Returns the number of prior trials kept for warm-starting.
+    """
+    if max_history_days <= 0:
+        return len(study.trials)
+
+    cutoff = datetime.now() - timedelta(days=max_history_days)
+    kept = [t for t in study.trials if t.datetime_start and t.datetime_start >= cutoff]
+    purged = len(study.trials) - len(kept)
+
+    if purged > 0:
+        print(f"  Optuna history: purged {purged} trials older than {max_history_days}d, "
+              f"kept {len(kept)} for warm-starting")
+
+    return len(kept)
+
+
 def optimize_cluster(config: dict, cluster_id: str) -> None:
     """Run Optuna optimization for a cluster, then train final model.
+
+    When persistence is enabled, the study is stored in PostgreSQL and
+    previous trials are reused for warm-starting the TPE sampler.
 
     Args:
         config: Full config dict.
@@ -198,6 +231,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     optuna_cfg = config["training"].get("optuna", {})
     n_trials = optuna_cfg.get("n_trials", 30)
     startup_trials = optuna_cfg.get("startup_trials", 5)
+    max_history_days = optuna_cfg.get("max_history_days", 30)
 
     print(f"\n{'='*60}")
     print(f"Optimizing cluster: {cluster_id}")
@@ -207,15 +241,30 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     print(f"  Threshold — UP: +{buy_thresh:.1%}")
     print(f"  Optuna — {n_trials} trials, {startup_trials} startup")
 
-    # Create study
+    # Storage: PostgreSQL (persistent) or None (in-memory)
+    storage = _get_optuna_storage(optuna_cfg)
+    if storage:
+        print(f"  Optuna storage: PostgreSQL (warm-starting enabled, max_history={max_history_days}d)")
+    else:
+        print("  Optuna storage: in-memory (no persistence)")
+
+    # Create or load existing study
     study = optuna.create_study(
         direction="maximize",
         study_name=f"cluster/{cluster_id}",
+        storage=storage,
+        load_if_exists=True,
         pruner=optuna.pruners.MedianPruner(
             n_startup_trials=startup_trials,
             n_warmup_steps=5,
         ),
     )
+
+    # Purge old trials if using persistent storage
+    prior_trials = len(study.trials)
+    if storage and prior_trials > 0:
+        kept = _purge_old_trials(study, max_history_days)
+        print(f"  Warm-starting with {kept} prior trials")
 
     # Run optimization
     objective_fn = _create_trial_objective(

@@ -22,5 +22,11 @@ POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "changeme")
 # MLflow
 MLFLOW_TRACKING_URI: str = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 
+# Optuna storage (defaults to same Postgres used by the pipeline, psycopg v3 driver)
+OPTUNA_STORAGE_URL: str = os.getenv(
+    "OPTUNA_STORAGE_URL",
+    f"postgresql+psycopg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}",
+)
+
 # Pipeline environment: "dev" (default) or "prod"
 PIPELINE_ENV: str = os.getenv("PIPELINE_ENV", "dev")
