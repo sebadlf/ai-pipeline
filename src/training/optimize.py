@@ -199,6 +199,8 @@ def _create_trial_objective(
             raise
         except Exception as e:
             print(f"    Trial {trial.number} failed: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0
 
         # Compute objective on validation set

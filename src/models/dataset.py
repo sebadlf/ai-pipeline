@@ -11,7 +11,9 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-_NUM_WORKERS = min(os.cpu_count() or 0, 8)
+# Use 0 workers on macOS to avoid multiprocessing issues with MPS
+# DataLoader with persistent_workers can cause AttributeError on macOS
+_NUM_WORKERS = 0 if os.uname().sysname == "Darwin" else min(os.cpu_count() or 0, 8)
 
 EXCLUDE_COLS = {"id", "symbol", "date", "target", "adj_close"}
 
