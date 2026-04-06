@@ -11,9 +11,13 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-# Use 0 workers on macOS to avoid multiprocessing issues with MPS
-# DataLoader with persistent_workers can cause AttributeError on macOS
-_NUM_WORKERS = 0 if os.uname().sysname == "Darwin" else min(os.cpu_count() or 0, 8)
+def _get_num_workers() -> int:
+    """Get number of DataLoader workers.
+
+    Use 0 workers on macOS to avoid multiprocessing issues with MPS,
+    DataLoader with workers can cause AttributeError on macOS.
+    """
+    return 0 if os.uname().sysname == "Darwin" else min(os.cpu_count() or 0, 8)
 
 EXCLUDE_COLS = {"id", "symbol", "date", "target", "adj_close"}
 
@@ -263,28 +267,31 @@ class TradingDataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         assert self.train_ds is not None
+        num_workers = _get_num_workers()
         return DataLoader(
             self.train_ds,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=_NUM_WORKERS,
-            persistent_workers=_NUM_WORKERS > 0,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
         assert self.val_ds is not None
+        num_workers = _get_num_workers()
         return DataLoader(
             self.val_ds,
             batch_size=self.batch_size,
-            num_workers=_NUM_WORKERS,
-            persistent_workers=_NUM_WORKERS > 0,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
         assert self.test_ds is not None
+        num_workers = _get_num_workers()
         return DataLoader(
             self.test_ds,
             batch_size=self.batch_size,
-            num_workers=_NUM_WORKERS,
-            persistent_workers=_NUM_WORKERS > 0,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
         )
