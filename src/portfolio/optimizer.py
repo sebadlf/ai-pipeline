@@ -285,6 +285,13 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
     # Load predictions
     agg_cfg = config.get("aggregation", {})
     pred_path = agg_cfg.get("output_parquet", "data/predictions.parquet")
+
+    if not Path(pred_path).exists():
+        print(f"ERROR: Predictions file not found: {pred_path}")
+        print("This usually means no models were trained successfully.")
+        print("Please run training first: make train")
+        return {}
+
     predictions = pl.read_parquet(pred_path)
 
     if predictions.is_empty():
