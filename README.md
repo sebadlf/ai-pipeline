@@ -2,6 +2,8 @@
 
 Local ML pipeline for evaluating stock trading strategies on S&P 500 stocks available as CEDEARs in the Argentine market. Runs on a Mac Mini M4 Pro (24GB RAM) using a hybrid architecture: infrastructure in Docker, compute native on macOS to leverage Apple MPS GPU acceleration.
 
+> **For Developers**: See [AGENTS.md](AGENTS.md) for detailed technical context, architecture decisions, and AI assistant instructions.
+
 ## Architecture
 
 ```
@@ -42,7 +44,8 @@ Local ML pipeline for evaluating stock trading strategies on S&P 500 stocks avai
 ## Project Structure
 
 ```
-├── CLAUDE.md                      # AI assistant instructions
+├── AGENTS.md                      # AI assistant context — technical reference
+├── CLAUDE.md                      # Legacy Cursor/Claude specific context
 ├── Makefile                       # Task runner
 ├── docker-compose.yml             # Postgres + MLflow
 ├── pyproject.toml                 # Dependencies (UV)
