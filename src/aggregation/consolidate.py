@@ -93,6 +93,40 @@ def resolve_feature_cols(
     )
 
 
+def validate_champion_features(
+    cluster_id: str,
+    features_df: pl.DataFrame,
+    config: dict,
+) -> tuple[bool, list[str] | None, str]:
+    """Validate that champion model can run inference with current features.
+
+    Args:
+        cluster_id: Cluster identifier.
+        features_df: Current features DataFrame.
+        config: Full config dict.
+
+    Returns:
+        (is_valid, feature_cols, message): Whether validation passed,
+            the list of feature columns (if valid), and a status message.
+    """
+    try:
+        champion_path, model_run_id = download_champion_checkpoint(cluster_id)
+    except FileNotFoundError:
+        # No champion, will try local fallback
+        return True, None, f"No champion for {cluster_id}, will try local fallback"
+
+    try:
+        model = LSTMForecaster.load_from_checkpoint(
+            str(champion_path), map_location="cpu", weights_only=False
+        )
+        feature_cols = resolve_feature_cols(model, features_df, config)
+        return True, feature_cols, f"Champion for {cluster_id} validated with {len(feature_cols)} features"
+    except ValueError as e:
+        if "Feature mismatch" in str(e) or "features not in DataFrame" in str(e):
+            return False, None, f"Feature mismatch for {cluster_id}: {e}"
+        raise
+
+
 def run_inference_for_cluster(
     cluster_id: str,
     model: LSTMForecaster,
@@ -271,6 +305,8 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         features_df = features_df.drop(all_null_cols)
 
     all_predictions = []
+    skipped_clusters = []
+    feature_mismatch_count = 0
 
     for cluster_id in cluster_ids:
         # Load champion model from MLflow registry; fall back to local checkpoint
@@ -287,7 +323,19 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
                 continue
             print(f"  Loading local fallback for {cluster_id} from {ckpt_path}")
 
-        model = LSTMForecaster.load_from_checkpoint(ckpt_path, map_location="cpu", weights_only=False)
+        # Validate model features before loading
+        try:
+            model = LSTMForecaster.load_from_checkpoint(ckpt_path, map_location="cpu", weights_only=False)
+            feature_cols = resolve_feature_cols(model, features_df, config)
+            print(f"    ✓ Features validated: {len(feature_cols)} features")
+        except ValueError as e:
+            if "features not in DataFrame" in str(e) or "Feature mismatch" in str(e):
+                print(f"    ✗ Feature mismatch: {e}")
+                skipped_clusters.append((cluster_id, str(e)))
+                feature_mismatch_count += 1
+                continue
+            raise
+
         model.eval()
 
         preds = run_inference_for_cluster(
@@ -296,6 +344,13 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         for p in preds:
             p["model_run_id"] = model_run_id
         all_predictions.extend(preds)
+
+    if feature_mismatch_count > 0:
+        print(f"\n  WARNING: {feature_mismatch_count} clusters skipped due to feature mismatches.")
+        print("  Models were trained with different features than current data.")
+        print("  Recommendation: Retrain models after feature selection changes.")
+        for cid, err in skipped_clusters:
+            print(f"    - {cid}: {err[:100]}...")
 
     result_df = pl.DataFrame(all_predictions, infer_schema_length=None)
 
@@ -371,7 +426,7 @@ def main() -> None:
         mlflow.log_metric("total_predictions", len(result_df))
         n_actionable = result_df.filter(pl.col("prob_up") >= 0.70).height
         mlflow.log_metric("n_actionable", n_actionable)
-        mlflow.log_metric("mean_prob_up", result_df["prob_up"].mean())
+        mlflow.log_metric("mean_prob_up", float(result_df["prob_up"].mean()))
         output_path = config.get("aggregation", {}).get("output_parquet", "data/predictions.parquet")
         mlflow.log_artifact(output_path)
     print("Logged aggregation results to MLflow")

@@ -110,6 +110,42 @@ def select_features(
     return df.select(keep_cols), feature_cols
 
 
+def _detect_feature_changes(selected_cols: list[str], manifest_path: Path) -> dict:
+    """Compare selected features with previous manifest and detect changes.
+
+    Returns:
+        dict with 'added', 'removed', 'unchanged' feature lists and 'significant_change' bool.
+    """
+    if not manifest_path.exists():
+        return {"added": selected_cols, "removed": [], "unchanged": [], "significant_change": True}
+
+    try:
+        with open(manifest_path) as f:
+            prev = json.load(f)
+        prev_features = set(prev.get("features", []))
+        curr_features = set(selected_cols)
+
+        added = list(curr_features - prev_features)
+        removed = list(prev_features - curr_features)
+        unchanged = list(curr_features & prev_features)
+
+        # Consider significant if >10% features changed or any feature removed
+        total_prev = len(prev_features) if prev_features else 1
+        change_ratio = (len(added) + len(removed)) / total_prev
+        significant = change_ratio > 0.1 or len(removed) > 0
+
+        return {
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+            "significant_change": significant,
+            "prev_count": len(prev_features),
+            "curr_count": len(selected_cols),
+        }
+    except (json.JSONDecodeError, IOError):
+        return {"added": selected_cols, "removed": [], "unchanged": [], "significant_change": True}
+
+
 def main() -> None:
     """Run feature selection on the features parquet and save result."""
     from src.config import compute_split_dates
@@ -137,13 +173,29 @@ def main() -> None:
     print("Running feature selection...")
     df_selected, selected_cols = select_features(df, config, train_end=train_end)
 
+    # Detect changes from previous manifest
+    manifest_path = Path(args.manifest)
+    changes = _detect_feature_changes(selected_cols, manifest_path)
+
+    if changes["significant_change"] and manifest_path.exists():
+        print(f"\n  ⚠️  WARNING: Significant feature changes detected!")
+        print(f"     Previous: {changes.get('prev_count', 0)} features")
+        print(f"     Current:  {changes['curr_count']} features")
+        if changes["added"]:
+            print(f"     Added:   {len(changes['added'])} features")
+        if changes["removed"]:
+            print(f"     Removed: {len(changes['removed'])} features")
+        print(f"\n     ... existing models were trained with DIFFERENT features.")
+        print(f"     ... you MUST retrain models: make train")
+        print(f"     ... otherwise aggregate/signals will fail or be unreliable.\n")
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df_selected.write_parquet(args.output)
     print(f"  Saved {len(df_selected):,} rows to {args.output}")
 
-    with open(args.manifest, "w") as f:
+    with open(manifest_path, "w") as f:
         json.dump({"features": selected_cols, "count": len(selected_cols)}, f, indent=2)
-    print(f"  Feature manifest saved to {args.manifest}")
+    print(f"  Feature manifest saved to {manifest_path}")
 
 
 if __name__ == "__main__":
