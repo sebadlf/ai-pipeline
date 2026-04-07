@@ -556,6 +556,54 @@ def run_clustering(
     return result_df, cluster_stats
 
 
+def run_sector_clustering(
+    config: dict,
+    reference_date: dt.date | None = None,
+) -> tuple[pl.DataFrame, dict]:
+    """Assign stocks to clusters by GICS sector directly (fast, dev mode).
+
+    Instead of computing features and running KMeans, simply use the
+    GICS sector as the cluster_id. This is much faster and sufficient
+    for development/testing.
+
+    Args:
+        config: Full config dict.
+        reference_date: Date for split computation. Defaults to today.
+
+    Returns:
+        Tuple of (result_df, cluster_stats) with same format as run_clustering().
+    """
+    engine = get_engine()
+    sectors_df = load_sectors(engine)
+
+    if sectors_df.is_empty():
+        raise RuntimeError("No sector data found. Run ingestion first.")
+
+    # Use sector as cluster_id directly
+    result_df = sectors_df.select(["symbol", "sector"]).with_columns(
+        pl.col("sector").alias("cluster_id"),
+        pl.lit(0.0).alias("silhouette_score"),
+    )
+
+    cluster_stats = {
+        "n_stocks": len(result_df),
+        "k_selected": result_df["cluster_id"].n_unique(),
+        "silhouette": 0.0,
+        "pca_components": 0,
+        "pca_variance": 0.0,
+        "method": "sector",
+    }
+
+    print(f"Sector clustering (dev mode): {len(result_df)} stocks, "
+          f"{result_df['cluster_id'].n_unique()} clusters (by GICS sector)")
+
+    for cluster_id in result_df["cluster_id"].unique().sort().to_list():
+        count = result_df.filter(pl.col("cluster_id") == cluster_id).height
+        print(f"  {cluster_id}: {count} stocks")
+
+    return result_df, cluster_stats
+
+
 def save_clusters(
     result_df: pl.DataFrame,
     config: dict,
@@ -599,12 +647,22 @@ def save_clusters(
 
 def main() -> None:
     """Run stock clustering pipeline."""
+    from src.keys import PIPELINE_ENV
+
     parser = argparse.ArgumentParser(description="Cluster stocks globally")
     parser.add_argument("--config", default=None, help="Path to config YAML")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    result_df, cluster_stats = run_clustering(config)
+
+    # In dev, use sector-based clustering (fast)
+    # In prod, use full KMeans clustering
+    if PIPELINE_ENV == "dev":
+        print("Running in DEV mode: Using sector-based clustering (fast)")
+        result_df, cluster_stats = run_sector_clustering(config)
+    else:
+        print("Running in PROD mode: Using KMeans clustering")
+        result_df, cluster_stats = run_clustering(config)
 
     # Cluster stability check: compare with previous assignments
     cluster_cfg_obj = ClusterConfig.from_dict(config.get("clustering", {}))

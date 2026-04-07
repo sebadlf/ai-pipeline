@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest features select-features cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup test mlflow-report mlflow-report-prod pipeline pipeline-loop
+.PHONY: setup up down ingest ingest-force features select-features cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
 
 # =============================================================================
 # Infrastructure
@@ -18,7 +18,13 @@ down:
 # Stage 0: Data Ingestion & Feature Engineering
 # =============================================================================
 
+# Ingestion - manual only in dev, use 'make ingest-force' when needed
+# In prod, this runs automatically via pipeline-prod
 ingest:
+	@echo "In dev, ingestion is skipped by default."
+	@echo "Run 'make ingest-force' if you need fresh data."
+
+ingest-force:
 	uv run python -m src.ingestion.fmp_loader
 
 features:
@@ -89,8 +95,8 @@ signals:
 # Full Pipeline
 # =============================================================================
 
+# Pipeline for dev - skips ingestion by default
 pipeline:
-	$(MAKE) ingest
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
 		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features cluster; \
@@ -100,7 +106,19 @@ pipeline:
 	fi
 	$(MAKE) train-global promote aggregate portfolio backtest
 
-# Pipeline loop (infinite, Ctrl+C to stop)
+# Pipeline for prod - includes ingestion
+pipeline-prod:
+	$(MAKE) ingest-force
+	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
+		echo "Rebuilding features/clusters..."; \
+		$(MAKE) features select-features cluster; \
+		rm -f data/.new_data; \
+	else \
+		echo "No new data and clusters exist, skipping features/selection/clustering."; \
+	fi
+	$(MAKE) train-global promote aggregate portfolio backtest
+
+# Pipeline loop (infinite, Ctrl+C to stop) - uses dev pipeline (no ingestion)
 pipeline-loop:
 	@i=1; while true; do \
 		echo ""; \
@@ -117,8 +135,8 @@ pipeline-loop:
 # =============================================================================
 
 cleanup:
-    uv run python -m src.evaluation.clean_runs
-    docker compose restart mlflow
+	uv run python -m src.evaluation.clean_runs
+	docker compose restart mlflow
 
 test:
 	uv run pytest tests/ -v

@@ -18,7 +18,13 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
-from src.keys import POSTGRES_HOST, POSTGRES_DB, POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_USER
+from src.keys import (
+    POSTGRES_HOST,
+    POSTGRES_DB,
+    POSTGRES_PASSWORD,
+    POSTGRES_PORT,
+    POSTGRES_USER,
+)
 
 MLFLOW_DB = "mlflow"
 
@@ -27,6 +33,7 @@ CLEANUP_PARQUETS = [
     "data/predictions.parquet",
     "data/portfolios.parquet",
 ]
+
 
 def _get_mlflow_engine():
     """Build SQLAlchemy engine for the MLflow database."""
@@ -47,11 +54,15 @@ def cleanup_all(dry_run: bool = False) -> None:
         root_engine = create_engine(root_url, isolation_level="AUTOCOMMIT")
         with root_engine.connect() as conn:
             # Terminate active connections to mlflow DB
-            conn.execute(text(f"""
+            conn.execute(
+                text(
+                    f"""
                 SELECT pg_terminate_backend(pid)
                 FROM pg_stat_activity
                 WHERE datname = '{MLFLOW_DB}' AND pid <> pg_backend_pid()
-            """))
+            """
+                )
+            )
             conn.execute(text(f"DROP DATABASE IF EXISTS {MLFLOW_DB}"))
             conn.execute(text(f"CREATE DATABASE {MLFLOW_DB} OWNER {POSTGRES_USER}"))
         root_engine.dispose()
@@ -87,19 +98,23 @@ def cleanup_all(dry_run: bool = False) -> None:
     trading_engine = create_engine(trading_url)
     with trading_engine.connect() as conn:
         # Check if Optuna tables exist before attempting cleanup
-        result = conn.execute(text(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'studies')"
-        ))
+        result = conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'studies')"
+            )
+        )
         has_optuna = result.scalar()
 
     if has_optuna:
         if dry_run:
             import optuna
+
             storage = optuna.storages.RDBStorage(trading_url)
             studies = optuna.study.get_all_study_names(storage)
             print(f"  [DRY RUN] Would delete {len(studies)} Optuna studies: {studies}")
         else:
             import optuna
+
             storage = optuna.storages.RDBStorage(trading_url)
             studies = optuna.study.get_all_study_names(storage)
             for name in studies:
@@ -121,13 +136,15 @@ def cleanup_all(dry_run: bool = False) -> None:
 
     if dry_run:
         print("\n[DRY RUN] No files were deleted.")
-    else:
-        print("\nCleanup complete. Restart MLflow to reinitialize: docker compose restart mlflow")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Full pipeline cleanup")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without deleting")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be deleted without deleting",
+    )
     args = parser.parse_args()
 
     print("=== Pipeline Cleanup ===\n")
