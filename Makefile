@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline pipeline-loop cleanup test
+.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline pipeline-loop cleanup test mlflow-report mlflow-report-prod
 
 setup:
 	uv venv
@@ -53,6 +53,13 @@ signals:
 cleanup:
 	uv run python -m src.evaluation.clean_runs
 	docker compose restart mlflow
+
+# --- MLflow summary (uses MLFLOW_TRACKING_URI from .env) ---
+mlflow-report:
+	uv run python scripts/mlflow_report.py
+
+mlflow-report-prod:
+	MLFLOW_TRACKING_URI=http://192.168.68.64:5000 uv run python scripts/mlflow_report.py
 
 # --- Full pipeline ---
 pipeline:
