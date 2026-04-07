@@ -287,36 +287,53 @@ def _evaluate_cluster_trades(
         )
 
 
-def train_single_cluster(config: dict, cluster_id: str) -> None:
-    """Train a model for a single cluster using Optuna optimization.
+def train_single_cluster(config: dict, cluster_id: str, global_params: dict | None = None) -> None:
+    """Train a model for a single cluster using Optuna optimization or global params.
 
     Args:
         config: Full config dict.
         cluster_id: Cluster identifier (e.g. "Technology_0").
+        global_params: Optional pre-computed hyperparameters from global optimization.
+                      If provided, skips Optuna and trains directly with these params.
     """
-    from src.training.optimize import optimize_cluster
-    optimize_cluster(config, cluster_id)
+    from src.training.optimize import optimize_cluster, train_final_model
+    from src.config import compute_split_dates
+
+    if global_params is not None:
+        # Use pre-computed global hyperparameters
+        print(f"Using global hyperparameters for {cluster_id}")
+        split_dates = compute_split_dates(config)
+        train_final_model(config, cluster_id, global_params, split_dates)
+    else:
+        # Run per-cluster optimization
+        optimize_cluster(config, cluster_id)
 
 
-def train_all_clusters(config: dict) -> None:
+def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
     """Train one model per cluster.
 
     Args:
         config: Full config dict.
+        global_params: Optional pre-computed hyperparameters from global optimization.
+                      If provided, all clusters use these params.
     """
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
 
-    print(f"Found {len(cluster_ids)} clusters to train")
+    mode = " (using global hyperparameters)" if global_params else " (with per-cluster optimization)"
+    print(f"Found {len(cluster_ids)} clusters to train{mode}")
+
     failed = []
     for i, cluster_id in enumerate(cluster_ids, 1):
         n_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id).height
         print(f"\n[{i}/{len(cluster_ids)}] Cluster {cluster_id} ({n_symbols} symbols)")
         try:
-            train_single_cluster(config, cluster_id)
+            train_single_cluster(config, cluster_id, global_params)
         except Exception as e:
             print(f"  ERROR training {cluster_id}: {e}")
+            import traceback
+            traceback.print_exc()
             failed.append(cluster_id)
 
     print(f"\nTraining complete: {len(cluster_ids) - len(failed)}/{len(cluster_ids)} clusters succeeded.")
@@ -329,14 +346,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train trading model")
     parser.add_argument("--config", default=None, help="Path to config YAML")
     parser.add_argument("--cluster", default=None, help="Train a single cluster ID")
+    parser.add_argument("--use-global-params", action="store_true",
+                        help="Use pre-computed global hyperparameters from optimize-global")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
+    # Load global hyperparameters if requested
+    global_params = None
+    if args.use_global_params:
+        from src.training.optimize import load_global_best_params
+        global_params = load_global_best_params()
+        if global_params is None:
+            print("ERROR: No global hyperparameters found. Run 'make optimize-global' first.")
+            return
+        print(f"Loaded global hyperparameters: {global_params}")
+
     if args.cluster:
-        train_single_cluster(config, args.cluster)
+        train_single_cluster(config, args.cluster, global_params)
     else:
-        train_all_clusters(config)
+        train_all_clusters(config, global_params)
 
 
 if __name__ == "__main__":

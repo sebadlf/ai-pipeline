@@ -79,8 +79,9 @@ training:
   cluster_experiment_prefix: "cluster"
   # Optuna hyperparameter optimization
   optuna:
-    n_trials: 30                # number of trials per cluster
-    min_recall_up: 0.10         # minimum recall before penalizing objective
+    n_trials: 30                # number of trials per cluster (for per-cluster optimization)
+    n_trials_global: 50         # number of trials for global optimization (all symbols)
+    min_recall_up: 0.15         # minimum recall before penalizing objective (increased from 0.10)
     epochs_per_trial: 30        # reduced epochs during search
     patience_per_trial: 7       # aggressive early stopping in trials
     startup_trials: 5           # trials without pruning at start
@@ -88,6 +89,11 @@ training:
     max_history_days:
       dev: 7                    # purge trials older than 7 days in dev
       prod: 30                  # keep 30 days of history in prod
+    # F-beta objective function configuration
+    objective:
+      metric: "f_beta"          # f_beta | average_precision | mcc
+      beta: 0.5                 # < 1 prioritizes precision, > 1 prioritizes recall
+      recall_penalty: "quadratic"  # quadratic | linear
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation

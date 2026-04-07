@@ -1,4 +1,8 @@
-.PHONY: setup up down ingest features select-features cluster train train-cluster aggregate portfolio backtest promote signals pipeline pipeline-loop cleanup test mlflow-report mlflow-report-prod
+.PHONY: setup up down ingest features select-features cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup test mlflow-report mlflow-report-prod pipeline pipeline-loop
+
+# =============================================================================
+# Infrastructure
+# =============================================================================
 
 setup:
 	uv venv
@@ -10,7 +14,10 @@ up:
 down:
 	docker compose down
 
-# --- Stage 0: Data ingestion ---
+# =============================================================================
+# Stage 0: Data Ingestion & Feature Engineering
+# =============================================================================
+
 ingest:
 	uv run python -m src.ingestion.fmp_loader
 
@@ -20,48 +27,68 @@ features:
 select-features:
 	uv run python -m src.features.selection
 
-# --- Stage 1: Clustering ---
+# =============================================================================
+# Stage 1: Clustering
+# =============================================================================
+
 cluster:
 	uv run python -m src.features.clustering
 
-# --- Stage 2: Per-cluster training ---
-train:
-	uv run python -m src.training.train
+# =============================================================================
+# Stage 2: Model Training
+# =============================================================================
 
-train-cluster:
-	uv run python -m src.training.train --cluster $(CLUSTER)
+# Option A: Global hyperparameter optimization (recommended)
+# Phase 1: Optimize once across all symbols/clusters
+optimize-global:
+	uv run python -m src.training.optimize --global
 
-# --- Stage 3: Aggregation ---
+# Phase 2: Train all clusters with shared hyperparameters
+train-clusters:
+	uv run python -m src.training.train --use-global-params
+
+# Convenience: Run both optimization and training
+train-global: optimize-global train-clusters
+
+# =============================================================================
+# Stage 3: Model Promotion
+# =============================================================================
+
+promote:
+	uv run python -m src.evaluation.promote
+
+# =============================================================================
+# Stage 4: Aggregation
+# =============================================================================
+
 aggregate:
 	uv run python -m src.aggregation.consolidate
 
-# --- Stage 4: Portfolio optimization ---
+# =============================================================================
+# Stage 5: Portfolio Optimization
+# =============================================================================
+
 portfolio:
 	uv run python -m src.portfolio.optimizer
 
-# --- Stage 5: Backtesting ---
+# =============================================================================
+# Stage 6: Backtesting
+# =============================================================================
+
 backtest:
 	uv run python -m src.evaluation.backtest
 
-# --- Promotion & signals ---
-promote:
-	uv run python -m src.evaluation.promote
+# =============================================================================
+# Stage 7: Signal Generation
+# =============================================================================
 
 signals:
 	uv run python -m src.strategy.runner
 
-cleanup:
-	uv run python -m src.evaluation.clean_runs
-	docker compose restart mlflow
+# =============================================================================
+# Full Pipeline
+# =============================================================================
 
-# --- MLflow summary (uses MLFLOW_TRACKING_URI from .env) ---
-mlflow-report:
-	uv run python scripts/mlflow_report.py
-
-mlflow-report-prod:
-	MLFLOW_TRACKING_URI=http://192.168.68.64:5000 uv run python scripts/mlflow_report.py
-
-# --- Full pipeline ---
 pipeline:
 	$(MAKE) ingest
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
@@ -71,9 +98,9 @@ pipeline:
 	else \
 		echo "No new data and clusters exist, skipping features/selection/clustering."; \
 	fi
-	$(MAKE) train promote aggregate portfolio backtest
+	$(MAKE) train-global promote aggregate portfolio backtest
 
-# --- Pipeline loop (infinite, Ctrl+C to stop) ---
+# Pipeline loop (infinite, Ctrl+C to stop)
 pipeline-loop:
 	@i=1; while true; do \
 		echo ""; \
@@ -85,6 +112,19 @@ pipeline-loop:
 		i=$$((i + 1)); \
 	done
 
-# --- Tests ---
+# =============================================================================
+# Utilities
+# =============================================================================
+
+cleanup:
+    uv run python -m src.evaluation.clean_runs
+    docker compose restart mlflow
+
 test:
 	uv run pytest tests/ -v
+
+mlflow-report:
+	uv run python scripts/mlflow_report.py
+
+mlflow-report-prod:
+	MLFLOW_TRACKING_URI=http://192.168.68.64:5000 uv run python scripts/mlflow_report.py

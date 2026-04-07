@@ -40,8 +40,14 @@ REPORT_METRICS: dict[str, str] = {
     "test_recall_up": "max",
 }
 
-# MLflow's stock experiment and Stage-1 runs; not per-cluster training.
-_EXCLUDED_EXPERIMENTS = frozenset({"Default", "clustering"})
+# Non per-cluster-training experiments (noise for this report).
+_EXCLUDED_EXPERIMENTS = frozenset({
+    "Default",
+    "clustering",
+    "aggregation",
+    "backtesting",
+    "portfolio-optimization",
+})
 
 
 def _experiment_display_name(name: str) -> str:
@@ -54,6 +60,7 @@ class LatestRunInfo:
     run_id: str
     status: str
     start_time_iso: str | None
+    start_time_ms: int | None
 
 
 @dataclass
@@ -94,6 +101,7 @@ def _summarize_experiment(
                 run_id=r.info.run_id,
                 status=r.info.status,
                 start_time_iso=_ms_to_iso(r.info.start_time),
+                start_time_ms=r.info.start_time,
             )
         if r.info.status != "FINISHED":
             continue
@@ -155,12 +163,18 @@ def build_report(
         if e.name not in _EXCLUDED_EXPERIMENTS
         and (not name_contains or name_contains.lower() in e.name.lower())
     ]
-    filtered.sort(key=lambda e: e.name)
 
     summaries = [
         _summarize_experiment(client, e.experiment_id, e.name, max_runs)
         for e in filtered
     ]
+
+    def _last_run_ms(s: ExperimentSummary) -> int:
+        if s.latest_run is None or s.latest_run.start_time_ms is None:
+            return -1
+        return s.latest_run.start_time_ms
+
+    summaries.sort(key=_last_run_ms, reverse=True)
 
     return {
         "tracking_uri": tracking_uri,
@@ -236,7 +250,8 @@ def report_to_markdown(data: dict[str, Any]) -> str:
     lines.append("")
     lines.append(
         "Per experiment: **best** metric across all **FINISHED** runs "
-        "(min loss, max accuracy / precision / recall)."
+        "(min loss, max accuracy / precision / recall). "
+        "Rows ordered by **most recent run** (newest first); experiments with no runs last."
     )
     lines.append("")
     lines.append(

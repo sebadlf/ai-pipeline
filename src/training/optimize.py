@@ -4,15 +4,19 @@ Replaces brute-force repeated training with systematic search over
 architecture and training hyperparameters. Optimizes for precision
 of the UP class (minimize false positives) with a recall floor.
 
+Supports both per-cluster optimization and global optimization across all clusters.
+
 Usage:
-    Called from train.py via optimize_cluster().
+    Called from train.py via optimize_cluster() or optimize_global().
 """
 
 from __future__ import annotations
 
+import json
 import tempfile
 import traceback
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import lightning as L
@@ -84,45 +88,63 @@ def _compute_objective_value(
     model: LSTMForecaster,
     dm: TradingDataModule,
     min_recall: float,
+    beta: float = 0.5,
 ) -> float:
-    """Compute the optimization objective: precision_up with recall penalty.
+    """Compute F-beta score as optimization objective with quadratic recall penalty.
+
+    Uses the full precision-recall curve to find the optimal threshold that
+    maximizes F-beta, allowing better calibration than a fixed 0.5 threshold.
+    Beta < 1 prioritizes precision over recall (ideal for trading where
+    false positives are costly).
 
     Args:
         model: Trained model in eval mode.
         dm: DataModule with validation data.
         min_recall: Minimum recall threshold before penalizing.
+        beta: F-beta parameter. < 1 prioritizes precision, > 1 prioritizes recall.
 
     Returns:
-        Objective value to maximize (higher is better).
+        F-beta score to maximize (higher is better), with quadratic penalty
+        applied if recall is below min_recall.
     """
+    from sklearn.metrics import precision_recall_curve
+
     model.eval()
-    all_preds = []
+    all_probs = []
     all_targets = []
 
     with torch.no_grad():
         for batch in dm.val_dataloader():
             x, y = batch
             logits = model(x)
-            preds = logits.argmax(dim=-1)
-            all_preds.append(preds.cpu())
+            probs = torch.softmax(logits, dim=-1)[:, 1]  # Probability of UP class
+            all_probs.append(probs.cpu())
             all_targets.append(y.cpu())
 
-    preds = torch.cat(all_preds).numpy()
+    probs = torch.cat(all_probs).numpy()
     targets = torch.cat(all_targets).numpy()
 
-    up_preds = preds == 1
-    up_targets = targets == 1
-    tp = int((up_preds & up_targets).sum())
-    fp = int((up_preds & ~up_targets).sum())
-    fn = int((~up_preds & up_targets).sum())
+    # Compute precision-recall curve across all thresholds
+    precisions, recalls, _ = precision_recall_curve(targets, probs)
 
-    precision_up = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall_up = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    # Calculate F-beta for each point on the curve
+    # F_beta = (1 + beta^2) * (precision * recall) / (beta^2 * precision + recall)
+    beta_sq = beta ** 2
+    fbetas = (1 + beta_sq) * (precisions * recalls) / ((beta_sq * precisions) + recalls + 1e-10)
+    fbetas = np.nan_to_num(fbetas, nan=0.0)
 
-    # Penalize if recall is below minimum threshold
-    if recall_up < min_recall:
-        return precision_up * (recall_up / min_recall) if min_recall > 0 else 0.0
-    return precision_up
+    # Find maximum F-beta and corresponding recall
+    best_idx = np.argmax(fbetas)
+    best_fbeta = fbetas[best_idx]
+    best_recall = recalls[best_idx]
+
+    # Apply quadratic penalty if recall is below minimum threshold
+    # Quadratic penalty is more aggressive than linear for very low recall
+    if best_recall < min_recall:
+        penalty = (best_recall / min_recall) ** 2 if min_recall > 0 else 0.0
+        return float(best_fbeta * penalty)
+
+    return float(best_fbeta)
 
 
 def _create_trial_objective(
@@ -137,6 +159,11 @@ def _create_trial_objective(
     epochs_per_trial = optuna_cfg.get("epochs_per_trial", 30)
     patience_per_trial = optuna_cfg.get("patience_per_trial", 7)
     min_recall = optuna_cfg.get("min_recall_up", 0.10)
+
+    # F-beta objective configuration
+    obj_cfg = optuna_cfg.get("objective", {})
+    beta = obj_cfg.get("beta", 0.5)
+
     features_path = get_features_parquet_path(config)
 
     def objective(trial: optuna.Trial) -> float:
@@ -204,7 +231,7 @@ def _create_trial_objective(
             return 0.0
 
         # Compute objective on validation set
-        return _compute_objective_value(model, dm, min_recall)
+        return _compute_objective_value(model, dm, min_recall, beta)
 
     return objective
 
@@ -555,3 +582,223 @@ def _run_trade_eval(
         _evaluate_cluster_trades(model, config, cluster_id, split_dates, run_id, clusters_parquet)
     except Exception as e:
         print(f"  Trade evaluation failed: {e}")
+
+
+def _create_global_trial_objective(
+    config: dict,
+    split_dates: SplitDates,
+    cluster_cfg: ClusterConfig,
+) -> callable:
+    """Create the Optuna objective function closure for global optimization.
+
+    Unlike per-cluster optimization, this uses ALL symbols from ALL clusters
+    to find hyperparameters that work well across the entire universe.
+
+    Args:
+        config: Full config dict.
+        split_dates: Temporal split dates.
+        cluster_cfg: Cluster configuration.
+
+    Returns:
+        Objective function for Optuna.
+    """
+    optuna_cfg = config["training"].get("optuna", {})
+    epochs_per_trial = optuna_cfg.get("epochs_per_trial", 30)
+    patience_per_trial = optuna_cfg.get("patience_per_trial", 7)
+    min_recall = optuna_cfg.get("min_recall_up", 0.10)
+    obj_cfg = optuna_cfg.get("objective", {})
+    beta = obj_cfg.get("beta", 0.5)
+    features_path = get_features_parquet_path(config)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = suggest_hyperparams(trial)
+
+        # DataModule WITHOUT cluster_id filter - uses ALL symbols
+        dm = TradingDataModule(
+            parquet_path=features_path,
+            seq_len=params["sequence_length"],
+            batch_size=params["batch_size"],
+            split_dates=split_dates,
+            cluster_id=None,  # NO cluster filter - use all symbols
+            clusters_parquet=cluster_cfg.output_parquet,
+            noise_std=params["noise_std"],
+        )
+        dm.setup()
+
+        if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
+            return 0.0
+
+        # Model with trial architecture
+        model = LSTMForecaster(
+            input_size=dm.input_size,
+            hidden_size=params["hidden_size"],
+            num_layers=params["num_layers"],
+            num_classes=2,
+            dropout=params["dropout"],
+            learning_rate=params["learning_rate"],
+            weight_decay=params["weight_decay"],
+            label_smoothing=params["label_smoothing"],
+            class_weights=dm.class_weights,
+            num_attention_heads=params["num_attention_heads"],
+            focal_gamma=params["focal_gamma"],
+            feature_names=dm.feature_cols,
+        )
+
+        # Callbacks: early stopping + Optuna pruning
+        early_stop = EarlyStopping(
+            monitor="val_loss",
+            patience=patience_per_trial,
+            mode="min",
+        )
+        pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
+
+        trainer = L.Trainer(
+            max_epochs=epochs_per_trial,
+            accelerator="mps",
+            devices=1,
+            callbacks=[early_stop, pruning_callback],
+            log_every_n_steps=10,
+            gradient_clip_val=1.0,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            logger=False,
+        )
+
+        try:
+            trainer.fit(model, dm)
+        except optuna.exceptions.TrialPruned:
+            raise
+        except Exception as e:
+            print(f"    Trial {trial.number} failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0.0
+
+        # Compute objective on validation set (all symbols)
+        return _compute_objective_value(model, dm, min_recall, beta)
+
+    return objective
+
+
+def optimize_global(config: dict) -> dict[str, Any]:
+    """Run global Optuna optimization across ALL clusters, then save best hyperparameters.
+
+    This finds hyperparameters that work well across the entire stock universe,
+    which are then used for training per-cluster models.
+
+    Args:
+        config: Full config dict.
+
+    Returns:
+        Dictionary with best hyperparameters found.
+    """
+    split_dates = compute_split_dates(config)
+    cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
+    optuna_cfg = config["training"].get("optuna", {})
+    n_trials = optuna_cfg.get("n_trials_global", 50)  # More trials for global search
+    startup_trials = optuna_cfg.get("startup_trials", 5)
+    max_history_days = int(resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30))
+
+    print(f"\n{'='*60}")
+    print(f"GLOBAL OPTIMIZATION: All clusters, all symbols")
+    print(f"{'='*60}")
+    print("Temporal splits:")
+    print(split_dates.summary())
+    print(f"  Optuna — {n_trials} trials, {startup_trials} startup")
+
+    # Storage: PostgreSQL (persistent) or None (in-memory)
+    storage = _get_optuna_storage(optuna_cfg)
+    study_name = "global/hyperparameters"
+
+    if storage:
+        print(f"  Optuna storage: PostgreSQL (warm-starting enabled, max_history={max_history_days}d)")
+    else:
+        print("  Optuna storage: in-memory (no persistence)")
+
+    # Create or load existing study
+    study = optuna.create_study(
+        direction="maximize",
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=startup_trials,
+            n_warmup_steps=5,
+        ),
+    )
+
+    # Purge old trials if using persistent storage
+    prior_trials = len(study.trials)
+    if storage and prior_trials > 0:
+        kept = _purge_old_trials(study, max_history_days)
+        print(f"  Warm-starting with {kept} prior trials")
+
+    # Run optimization
+    objective_fn = _create_global_trial_objective(
+        config, split_dates, cluster_cfg,
+    )
+    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=True)
+
+    # Report best trial
+    best = study.best_trial
+    print(f"\n  Best trial #{best.number}: value={best.value:.4f}")
+    print(f"  Best params: {best.params}")
+
+    # Save best hyperparameters to file for later use
+    output_dir = Path("data")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_params_file = output_dir / "best_hyperparameters.json"
+
+    best_params = {
+        "study_name": study_name,
+        "trial_number": best.number,
+        "objective_value": best.value,
+        "params": best.params,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    with open(best_params_file, "w") as f:
+        json.dump(best_params, f, indent=2)
+
+    print(f"\n  Saved best hyperparameters to {best_params_file}")
+
+    return best.params
+
+
+def load_global_best_params() -> dict[str, Any] | None:
+    """Load the best global hyperparameters from file.
+
+    Returns:
+        Dictionary with best hyperparameters, or None if not found.
+    """
+    best_params_file = Path("data/best_hyperparameters.json")
+    if not best_params_file.exists():
+        return None
+
+    with open(best_params_file) as f:
+        data = json.load(f)
+
+    return data.get("params")
+
+
+def main() -> None:
+    """Entry point for optimization."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Hyperparameter optimization")
+    parser.add_argument("--config", default=None, help="Path to config YAML")
+    parser.add_argument("--global", dest="global_opt", action="store_true",
+                        help="Run global optimization across all clusters")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    if args.global_opt:
+        optimize_global(config)
+    else:
+        print("Usage: python -m src.training.optimize --global")
+        print("Run 'make optimize-global' for global hyperparameter search")
+
+
+if __name__ == "__main__":
+    main()
