@@ -132,6 +132,8 @@ class TradingDataModule(L.LightningDataModule):
         self.val_dates: np.ndarray | None = None
         self.val_forward_returns: np.ndarray | None = None
         self.val_valid_indices: np.ndarray | None = None
+        # Optimization support: filter to specific symbols during hyperparameter search
+        self._optimization_symbols: list[str] | None = None
 
     def setup(self, stage: str | None = None) -> None:
         """Load data, normalize, and create date-based temporal splits per symbol."""
@@ -140,6 +142,11 @@ class TradingDataModule(L.LightningDataModule):
 
         df = pl.read_parquet(self.parquet_path)
         df = df.sort(["symbol", "date"])
+
+        # Filter to optimization symbols if specified (for fast hyperparameter search)
+        if self._optimization_symbols is not None:
+            df = df.filter(pl.col("symbol").is_in(self._optimization_symbols))
+            print(f"  Filtered to {len(self._optimization_symbols)} optimization symbols")
 
         # Filter to cluster symbols if specified
         if self.cluster_id is not None:

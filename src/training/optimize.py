@@ -37,9 +37,64 @@ from src.config import (
     load_config,
     resolve_env_value,
 )
+from src.db import get_engine
 from src.keys import MLFLOW_TRACKING_URI, OPTUNA_STORAGE_URL
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
+
+
+def _get_top_symbols_by_market_cap(cluster_id: str, clusters_parquet: str, n: int = 3) -> list[str]:
+    """Get top N symbols by market cap for a cluster.
+
+    Queries key_metrics_quarterly for the most recent marketCap per symbol
+    and returns the top N symbols with highest market cap.
+
+    Args:
+        cluster_id: Cluster identifier.
+        clusters_parquet: Path to cluster assignments parquet.
+        n: Number of top symbols to return (default 3).
+
+    Returns:
+        List of symbol strings.
+    """
+    import polars as pl
+    from sqlalchemy import text
+
+    # Load cluster symbols
+    clusters_df = pl.read_parquet(clusters_parquet)
+    cluster_symbols = (
+        clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"]
+        .to_list()
+    )
+
+    if not cluster_symbols:
+        return []
+
+    # Query most recent marketCap for each symbol
+    engine = get_engine()
+    placeholders = ", ".join(f"'{s}'" for s in cluster_symbols)
+
+    query = f"""
+        SELECT DISTINCT ON (symbol) symbol,
+            (data->>'marketCap')::double precision as market_cap
+        FROM key_metrics_quarterly
+        WHERE symbol IN ({placeholders})
+        ORDER BY symbol, date DESC
+    """
+
+    try:
+        mc_df = pl.read_database(query, engine)
+        # Sort by market cap descending and take top N
+        top_symbols = (
+            mc_df.filter(pl.col("market_cap").is_not_null())
+            .sort("market_cap", descending=True)
+            .head(n)["symbol"]
+            .to_list()
+        )
+        return top_symbols if top_symbols else cluster_symbols[:n]
+    except Exception as e:
+        print(f"  Warning: Could not get market cap data: {e}")
+        return cluster_symbols[:n]
 
 _MLFLOW_TAG_MAX = 5000
 
@@ -316,11 +371,36 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         kept = _purge_old_trials(study, max_history_days)
         print(f"  Warm-starting with {kept} prior trials")
 
-    # Run optimization
+    # Run optimization with progress feedback
     objective_fn = _create_trial_objective(
         config, cluster_id, split_dates, cluster_cfg, buy_thresh,
     )
-    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=True)
+
+    # Progress callback for real-time feedback
+    def progress_callback(study: optuna.Study, trial: optuna.Trial):
+        if trial.number == 0:
+            print(f"\n{'='*60}")
+            print(f"Starting Optuna optimization for {cluster_id}...")
+            print(f"{'='*60}\n")
+
+        # Print every 5 trials and last trial
+        if trial.number % 5 == 0 or trial.number == n_trials - 1:
+            print(f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}")
+            if hasattr(trial, 'params') and trial.params:
+                print(f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
+                      f"hidden={trial.params.get('hidden_size', 0)}, "
+                      f"dropout={trial.params.get('dropout', 0):.2f}, "
+                      f"seq_len={trial.params.get('sequence_length', 0)}")
+            if trial.value is not None:
+                print(f"  Current value: {trial.value:.4f}")
+            print()
+
+    study.optimize(
+        objective_fn,
+        n_trials=n_trials,
+        show_progress_bar=True,
+        callbacks=[progress_callback]
+    )
 
     # Report best trial
     best = study.best_trial
@@ -591,8 +671,8 @@ def _create_global_trial_objective(
 ) -> callable:
     """Create the Optuna objective function closure for global optimization.
 
-    Unlike per-cluster optimization, this uses ALL symbols from ALL clusters
-    to find hyperparameters that work well across the entire universe.
+    Uses top 3 symbols by market cap per cluster for fast optimization,
+    with the same temporal range as final training.
 
     Args:
         config: Full config dict.
@@ -610,19 +690,33 @@ def _create_global_trial_objective(
     beta = obj_cfg.get("beta", 0.5)
     features_path = get_features_parquet_path(config)
 
+    # Pre-compute top symbols per cluster for fast trials
+    import polars as pl
+    clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
+    cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
+
+    top_symbols = []
+    for cid in cluster_ids:
+        symbols = _get_top_symbols_by_market_cap(cid, cluster_cfg.output_parquet, n=3)
+        top_symbols.extend(symbols)
+
+    print(f"  Optimization will use {len(top_symbols)} symbols (top 3 by market cap from {len(cluster_ids)} clusters)")
+
     def objective(trial: optuna.Trial) -> float:
         params = suggest_hyperparams(trial)
 
-        # DataModule WITHOUT cluster_id filter - uses ALL symbols
+        # DataModule with top symbols only
         dm = TradingDataModule(
             parquet_path=features_path,
             seq_len=params["sequence_length"],
             batch_size=params["batch_size"],
             split_dates=split_dates,
-            cluster_id=None,  # NO cluster filter - use all symbols
+            cluster_id=None,
             clusters_parquet=cluster_cfg.output_parquet,
             noise_std=params["noise_std"],
         )
+        # Set filtered symbols before setup
+        dm._optimization_symbols = top_symbols
         dm.setup()
 
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
@@ -674,7 +768,7 @@ def _create_global_trial_objective(
             traceback.print_exc()
             return 0.0
 
-        # Compute objective on validation set (all symbols)
+        # Compute objective on validation set (top symbols only)
         return _compute_objective_value(model, dm, min_recall, beta)
 
     return objective
@@ -733,11 +827,36 @@ def optimize_global(config: dict) -> dict[str, Any]:
         kept = _purge_old_trials(study, max_history_days)
         print(f"  Warm-starting with {kept} prior trials")
 
-    # Run optimization
+    # Run optimization with progress feedback
     objective_fn = _create_global_trial_objective(
         config, split_dates, cluster_cfg,
     )
-    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=True)
+
+    # Progress callback for real-time feedback
+    def progress_callback(study: optuna.Study, trial: optuna.Trial):
+        if trial.number == 0:
+            print(f"\n{'='*60}")
+            print("Starting Optuna optimization...")
+            print(f"{'='*60}\n")
+
+        # Print every 5 trials and last trial
+        if trial.number % 5 == 0 or trial.number == n_trials - 1:
+            print(f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}")
+            if hasattr(trial, 'params') and trial.params:
+                print(f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
+                      f"hidden={trial.params.get('hidden_size', 0)}, "
+                      f"dropout={trial.params.get('dropout', 0):.2f}, "
+                      f"seq_len={trial.params.get('sequence_length', 0)}")
+            if trial.value is not None:
+                print(f"  Current value: {trial.value:.4f}")
+            print()
+
+    study.optimize(
+        objective_fn,
+        n_trials=n_trials,
+        show_progress_bar=True,
+        callbacks=[progress_callback]
+    )
 
     # Report best trial
     best = study.best_trial
