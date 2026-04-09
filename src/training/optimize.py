@@ -43,58 +43,42 @@ from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
 
 
-def _get_top_symbols_by_market_cap(cluster_id: str, clusters_parquet: str, n: int = 3) -> list[str]:
-    """Get top N symbols by market cap for a cluster.
+def _get_random_symbols(
+    cluster_id: str, clusters_parquet: str, n: int = 1
+) -> list[str]:
+    """Get N random symbols from a cluster.
 
-    Queries key_metrics_quarterly for the most recent marketCap per symbol
-    and returns the top N symbols with highest market cap.
+    Randomly selects N symbols from the cluster for use in
+    hyperparameter optimization. This provides a representative
+    sample without biasing toward large-cap stocks.
 
     Args:
         cluster_id: Cluster identifier.
         clusters_parquet: Path to cluster assignments parquet.
-        n: Number of top symbols to return (default 3).
+        n: Number of random symbols to return (default 2).
 
     Returns:
         List of symbol strings.
     """
+    import random
     import polars as pl
-    from sqlalchemy import text
 
     # Load cluster symbols
     clusters_df = pl.read_parquet(clusters_parquet)
-    cluster_symbols = (
-        clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"]
-        .to_list()
-    )
+    cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id)[
+        "symbol"
+    ].to_list()
 
     if not cluster_symbols:
         return []
 
-    # Query most recent marketCap for each symbol
-    engine = get_engine()
-    placeholders = ", ".join(f"'{s}'" for s in cluster_symbols)
+    # Randomly select N symbols (or all if cluster has fewer than N)
+    if len(cluster_symbols) <= n:
+        return cluster_symbols
 
-    query = f"""
-        SELECT DISTINCT ON (symbol) symbol,
-            (data->>'marketCap')::double precision as market_cap
-        FROM key_metrics_quarterly
-        WHERE symbol IN ({placeholders})
-        ORDER BY symbol, date DESC
-    """
+    random.seed(42)  # For reproducibility
+    return random.sample(cluster_symbols, n)
 
-    try:
-        mc_df = pl.read_database(query, engine)
-        # Sort by market cap descending and take top N
-        top_symbols = (
-            mc_df.filter(pl.col("market_cap").is_not_null())
-            .sort("market_cap", descending=True)
-            .head(n)["symbol"]
-            .to_list()
-        )
-        return top_symbols if top_symbols else cluster_symbols[:n]
-    except Exception as e:
-        print(f"  Warning: Could not get market cap data: {e}")
-        return cluster_symbols[:n]
 
 _MLFLOW_TAG_MAX = 5000
 
@@ -134,7 +118,9 @@ def suggest_hyperparams(trial: optuna.Trial) -> dict[str, Any]:
         "hidden_size": trial.suggest_categorical("hidden_size", [64, 96, 128, 256]),
         "num_layers": trial.suggest_int("num_layers", 1, 4),
         "dropout": trial.suggest_float("dropout", 0.1, 0.5),
-        "num_attention_heads": trial.suggest_categorical("num_attention_heads", [0, 2, 4]),
+        "num_attention_heads": trial.suggest_categorical(
+            "num_attention_heads", [0, 2, 4]
+        ),
         "sequence_length": trial.suggest_categorical("sequence_length", [10, 20, 30]),
     }
 
@@ -184,8 +170,12 @@ def _compute_objective_value(
 
     # Calculate F-beta for each point on the curve
     # F_beta = (1 + beta^2) * (precision * recall) / (beta^2 * precision + recall)
-    beta_sq = beta ** 2
-    fbetas = (1 + beta_sq) * (precisions * recalls) / ((beta_sq * precisions) + recalls + 1e-10)
+    beta_sq = beta**2
+    fbetas = (
+        (1 + beta_sq)
+        * (precisions * recalls)
+        / ((beta_sq * precisions) + recalls + 1e-10)
+    )
     fbetas = np.nan_to_num(fbetas, nan=0.0)
 
     # Find maximum F-beta and corresponding recall
@@ -282,6 +272,7 @@ def _create_trial_objective(
         except Exception as e:
             print(f"    Trial {trial.number} failed: {e}")
             import traceback
+
             traceback.print_exc()
             return 0.0
 
@@ -314,8 +305,10 @@ def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
     purged = len(study.trials) - len(kept)
 
     if purged > 0:
-        print(f"  Optuna history: purged {purged} trials older than {max_history_days}d, "
-              f"kept {len(kept)} for warm-starting")
+        print(
+            f"  Optuna history: purged {purged} trials older than {max_history_days}d, "
+            f"kept {len(kept)} for warm-starting"
+        )
 
     return len(kept)
 
@@ -336,7 +329,9 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     optuna_cfg = config["training"].get("optuna", {})
     n_trials = optuna_cfg.get("n_trials", 30)
     startup_trials = optuna_cfg.get("startup_trials", 5)
-    max_history_days = int(resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30))
+    max_history_days = int(
+        resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
+    )
 
     print(f"\n{'='*60}")
     print(f"Optimizing cluster: {cluster_id}")
@@ -349,7 +344,9 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     # Storage: PostgreSQL (persistent) or None (in-memory)
     storage = _get_optuna_storage(optuna_cfg)
     if storage:
-        print(f"  Optuna storage: PostgreSQL (warm-starting enabled, max_history={max_history_days}d)")
+        print(
+            f"  Optuna storage: PostgreSQL (warm-starting enabled, max_history={max_history_days}d)"
+        )
     else:
         print("  Optuna storage: in-memory (no persistence)")
 
@@ -373,7 +370,11 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
 
     # Run optimization with progress feedback
     objective_fn = _create_trial_objective(
-        config, cluster_id, split_dates, cluster_cfg, buy_thresh,
+        config,
+        cluster_id,
+        split_dates,
+        cluster_cfg,
+        buy_thresh,
     )
 
     # Progress callback for real-time feedback
@@ -385,12 +386,16 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
 
         # Print every 5 trials and last trial
         if trial.number % 5 == 0 or trial.number == n_trials - 1:
-            print(f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}")
-            if hasattr(trial, 'params') and trial.params:
-                print(f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
-                      f"hidden={trial.params.get('hidden_size', 0)}, "
-                      f"dropout={trial.params.get('dropout', 0):.2f}, "
-                      f"seq_len={trial.params.get('sequence_length', 0)}")
+            print(
+                f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}"
+            )
+            if hasattr(trial, "params") and trial.params:
+                print(
+                    f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
+                    f"hidden={trial.params.get('hidden_size', 0)}, "
+                    f"dropout={trial.params.get('dropout', 0):.2f}, "
+                    f"seq_len={trial.params.get('sequence_length', 0)}"
+                )
             if trial.value is not None:
                 print(f"  Current value: {trial.value:.4f}")
             print()
@@ -399,7 +404,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         objective_fn,
         n_trials=n_trials,
         show_progress_bar=True,
-        callbacks=[progress_callback]
+        callbacks=[progress_callback],
     )
 
     # Report best trial
@@ -502,7 +507,9 @@ def train_final_model(
     )
 
     client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    print(f"  Training with {dm.input_size} features, seq_len={best_params['sequence_length']}")
+    print(
+        f"  Training with {dm.input_size} features, seq_len={best_params['sequence_length']}"
+    )
     try:
         trainer.fit(model, dm)
 
@@ -536,7 +543,9 @@ def train_final_model(
         _run_precision_eval(model, dm, config, client, run_id, buy_thresh)
 
         # Trade evaluation
-        _run_trade_eval(model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet)
+        _run_trade_eval(
+            model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet
+        )
     except Exception as e:
         _log_exception_to_mlflow_run(client, mlflow_logger, e)
         print(f"  ERROR: {e}")
@@ -551,6 +560,7 @@ def _log_confusion_matrix(
 ) -> None:
     """Compute and log confusion matrix + classification metrics to MLflow."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from sklearn.metrics import (
@@ -562,7 +572,10 @@ def _log_confusion_matrix(
     model.eval()
     class_names = ["NOT_UP", "UP"]
 
-    for split_name, dataloader in [("val", dm.val_dataloader()), ("test", dm.test_dataloader())]:
+    for split_name, dataloader in [
+        ("val", dm.val_dataloader()),
+        ("test", dm.test_dataloader()),
+    ]:
         all_preds = []
         all_targets = []
 
@@ -579,14 +592,19 @@ def _log_confusion_matrix(
 
         cm = confusion_matrix(all_targets_np, all_preds_np, labels=[0, 1])
         precision, recall, f1, _ = precision_recall_fscore_support(
-            all_targets_np, all_preds_np, labels=[0, 1], zero_division=0.0,
+            all_targets_np,
+            all_preds_np,
+            labels=[0, 1],
+            zero_division=0.0,
         )
         client.log_metric(run_id, f"{split_name}_precision_up", float(precision[1]))
         client.log_metric(run_id, f"{split_name}_recall_up", float(recall[1]))
         client.log_metric(run_id, f"{split_name}_f1_up", float(f1[1]))
 
-        print(f"  {split_name} — precision_up={precision[1]:.3f}, "
-              f"recall_up={recall[1]:.3f}, f1_up={f1[1]:.3f}")
+        print(
+            f"  {split_name} — precision_up={precision[1]:.3f}, "
+            f"recall_up={recall[1]:.3f}, f1_up={f1[1]:.3f}"
+        )
 
         fig, ax = plt.subplots(figsize=(5, 4))
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
@@ -642,8 +660,10 @@ def _run_precision_eval(
             buy_threshold=buy_thresh,
         )
         log_eval_to_mlflow(eval_result, client, run_id)
-        print(f"  Precision eval: stability_score={eval_result.stability_score:.4f}, "
-              f"auc_pr={eval_result.auc_pr:.4f}, stage={eval_result.elimination_stage}")
+        print(
+            f"  Precision eval: stability_score={eval_result.stability_score:.4f}, "
+            f"auc_pr={eval_result.auc_pr:.4f}, stage={eval_result.elimination_stage}"
+        )
     except Exception as e:
         print(f"  Precision evaluation failed: {e}")
 
@@ -659,7 +679,10 @@ def _run_trade_eval(
     """Run trade evaluation across train/val/test splits."""
     try:
         from src.training.train import _evaluate_cluster_trades
-        _evaluate_cluster_trades(model, config, cluster_id, split_dates, run_id, clusters_parquet)
+
+        _evaluate_cluster_trades(
+            model, config, cluster_id, split_dates, run_id, clusters_parquet
+        )
     except Exception as e:
         print(f"  Trade evaluation failed: {e}")
 
@@ -690,17 +713,20 @@ def _create_global_trial_objective(
     beta = obj_cfg.get("beta", 0.5)
     features_path = get_features_parquet_path(config)
 
-    # Pre-compute top symbols per cluster for fast trials
+    # Pre-compute random symbols per cluster for fast trials
     import polars as pl
+
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
 
-    top_symbols = []
+    selected_symbols = []
     for cid in cluster_ids:
-        symbols = _get_top_symbols_by_market_cap(cid, cluster_cfg.output_parquet, n=3)
-        top_symbols.extend(symbols)
+        symbols = _get_random_symbols(cid, cluster_cfg.output_parquet, n=2)
+        selected_symbols.extend(symbols)
 
-    print(f"  Optimization will use {len(top_symbols)} symbols (top 3 by market cap from {len(cluster_ids)} clusters)")
+    print(
+        f"  Optimization will use {len(selected_symbols)} symbols (2 random from each of {len(cluster_ids)} clusters)"
+    )
 
     def objective(trial: optuna.Trial) -> float:
         params = suggest_hyperparams(trial)
@@ -765,6 +791,7 @@ def _create_global_trial_objective(
         except Exception as e:
             print(f"    Trial {trial.number} failed: {e}")
             import traceback
+
             traceback.print_exc()
             return 0.0
 
@@ -791,7 +818,9 @@ def optimize_global(config: dict) -> dict[str, Any]:
     optuna_cfg = config["training"].get("optuna", {})
     n_trials = optuna_cfg.get("n_trials_global", 50)  # More trials for global search
     startup_trials = optuna_cfg.get("startup_trials", 5)
-    max_history_days = int(resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30))
+    max_history_days = int(
+        resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
+    )
 
     print(f"\n{'='*60}")
     print(f"GLOBAL OPTIMIZATION: All clusters, all symbols")
@@ -805,7 +834,9 @@ def optimize_global(config: dict) -> dict[str, Any]:
     study_name = "global/hyperparameters"
 
     if storage:
-        print(f"  Optuna storage: PostgreSQL (warm-starting enabled, max_history={max_history_days}d)")
+        print(
+            f"  Optuna storage: PostgreSQL (warm-starting enabled, max_history={max_history_days}d)"
+        )
     else:
         print("  Optuna storage: in-memory (no persistence)")
 
@@ -829,7 +860,9 @@ def optimize_global(config: dict) -> dict[str, Any]:
 
     # Run optimization with progress feedback
     objective_fn = _create_global_trial_objective(
-        config, split_dates, cluster_cfg,
+        config,
+        split_dates,
+        cluster_cfg,
     )
 
     # Progress callback for real-time feedback
@@ -841,12 +874,16 @@ def optimize_global(config: dict) -> dict[str, Any]:
 
         # Print every 5 trials and last trial
         if trial.number % 5 == 0 or trial.number == n_trials - 1:
-            print(f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}")
-            if hasattr(trial, 'params') and trial.params:
-                print(f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
-                      f"hidden={trial.params.get('hidden_size', 0)}, "
-                      f"dropout={trial.params.get('dropout', 0):.2f}, "
-                      f"seq_len={trial.params.get('sequence_length', 0)}")
+            print(
+                f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}"
+            )
+            if hasattr(trial, "params") and trial.params:
+                print(
+                    f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
+                    f"hidden={trial.params.get('hidden_size', 0)}, "
+                    f"dropout={trial.params.get('dropout', 0):.2f}, "
+                    f"seq_len={trial.params.get('sequence_length', 0)}"
+                )
             if trial.value is not None:
                 print(f"  Current value: {trial.value:.4f}")
             print()
@@ -855,7 +892,7 @@ def optimize_global(config: dict) -> dict[str, Any]:
         objective_fn,
         n_trials=n_trials,
         show_progress_bar=True,
-        callbacks=[progress_callback]
+        callbacks=[progress_callback],
     )
 
     # Report best trial
@@ -906,8 +943,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Hyperparameter optimization")
     parser.add_argument("--config", default=None, help="Path to config YAML")
-    parser.add_argument("--global", dest="global_opt", action="store_true",
-                        help="Run global optimization across all clusters")
+    parser.add_argument(
+        "--global",
+        dest="global_opt",
+        action="store_true",
+        help="Run global optimization across all clusters",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)

@@ -146,3 +146,9 @@ mlflow-report:
 
 mlflow-report-prod:
 	MLFLOW_TRACKING_URI=http://192.168.68.64:5000 uv run python scripts/mlflow_report.py
+
+mlflow-runs-report:
+	uv run python scripts/mlflow_runs_report.py
+
+mlflow-runs-report-prod:
+	MLFLOW_TRACKING_URI=http://192.168.68.64:5000 uv run python scripts/mlflow_runs_report.py
