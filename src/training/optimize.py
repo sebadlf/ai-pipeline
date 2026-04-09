@@ -377,34 +377,11 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         buy_thresh,
     )
 
-    # Progress callback for real-time feedback
-    def progress_callback(study: optuna.Study, trial: optuna.Trial):
-        if trial.number == 0:
-            print(f"\n{'='*60}")
-            print(f"Starting Optuna optimization for {cluster_id}...")
-            print(f"{'='*60}\n")
-
-        # Print every 5 trials and last trial
-        if trial.number % 5 == 0 or trial.number == n_trials - 1:
-            print(
-                f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}"
-            )
-            if hasattr(trial, "params") and trial.params:
-                print(
-                    f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
-                    f"hidden={trial.params.get('hidden_size', 0)}, "
-                    f"dropout={trial.params.get('dropout', 0):.2f}, "
-                    f"seq_len={trial.params.get('sequence_length', 0)}"
-                )
-            if trial.value is not None:
-                print(f"  Current value: {trial.value:.4f}")
-            print()
-
     study.optimize(
         objective_fn,
         n_trials=n_trials,
+        n_jobs=1,
         show_progress_bar=True,
-        callbacks=[progress_callback],
     )
 
     # Report best trial
@@ -865,34 +842,11 @@ def optimize_global(config: dict) -> dict[str, Any]:
         cluster_cfg,
     )
 
-    # Progress callback for real-time feedback
-    def progress_callback(study: optuna.Study, trial: optuna.Trial):
-        if trial.number == 0:
-            print(f"\n{'='*60}")
-            print("Starting Optuna optimization...")
-            print(f"{'='*60}\n")
-
-        # Print every 5 trials and last trial
-        if trial.number % 5 == 0 or trial.number == n_trials - 1:
-            print(
-                f"Trial {trial.number + 1}/{n_trials} | Best F-beta: {study.best_value:.4f}"
-            )
-            if hasattr(trial, "params") and trial.params:
-                print(
-                    f"  Current params: lr={trial.params.get('learning_rate', 0):.6f}, "
-                    f"hidden={trial.params.get('hidden_size', 0)}, "
-                    f"dropout={trial.params.get('dropout', 0):.2f}, "
-                    f"seq_len={trial.params.get('sequence_length', 0)}"
-                )
-            if trial.value is not None:
-                print(f"  Current value: {trial.value:.4f}")
-            print()
-
     study.optimize(
         objective_fn,
         n_trials=n_trials,
+        n_jobs=1,
         show_progress_bar=True,
-        callbacks=[progress_callback],
     )
 
     # Report best trial
