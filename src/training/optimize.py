@@ -742,7 +742,7 @@ def _create_global_trial_objective(
             noise_std=params["noise_std"],
         )
         # Set filtered symbols before setup
-        dm._optimization_symbols = top_symbols
+        dm._optimization_symbols = selected_symbols
         dm.setup()
 
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
