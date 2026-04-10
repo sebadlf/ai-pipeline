@@ -89,7 +89,7 @@ training:
       prod: 30                  # full search per cluster
     n_trials_global:
       dev: 10                   # minimal global search
-      prod: 50                  # full global search
+      prod: 10                  # balanced with per-cluster training time
     min_recall_up: 0.15         # minimum recall before penalizing objective
     epochs_per_trial:
       dev: 5                    # minimal epochs per trial
@@ -100,6 +100,9 @@ training:
     startup_trials:
       dev: 2                    # fewer warmup trials
       prod: 5                   # standard warmup
+    n_symbols_per_cluster:
+      dev: 2                    # minimal for pipeline validation
+      prod: 3                   # ~33 symbols total, good representativity/speed balance
     persist: true               # always persist studies in PostgreSQL for warm-starting
     max_history_days:
       dev: 7                    # purge trials older than 7 days in dev

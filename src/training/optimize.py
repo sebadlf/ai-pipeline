@@ -52,18 +52,20 @@ logging.getLogger("lightning.pytorch.trainer.connectors.callback_connector").set
 
 
 def _get_random_symbols(
-    cluster_id: str, clusters_parquet: str, n: int = 1
+    cluster_id: str, clusters_parquet: str, n: int = 1, seed: int | None = None
 ) -> list[str]:
     """Get N random symbols from a cluster.
 
     Randomly selects N symbols from the cluster for use in
-    hyperparameter optimization. This provides a representative
-    sample without biasing toward large-cap stocks.
+    hyperparameter optimization. Uses a local RNG instance to avoid
+    affecting global random state.
 
     Args:
         cluster_id: Cluster identifier.
         clusters_parquet: Path to cluster assignments parquet.
-        n: Number of random symbols to return (default 2).
+        n: Number of random symbols to return.
+        seed: RNG seed. Different seeds produce different subsets,
+              enabling symbol rotation across Optuna trials.
 
     Returns:
         List of symbol strings.
@@ -71,7 +73,6 @@ def _get_random_symbols(
     import random
     import polars as pl
 
-    # Load cluster symbols
     clusters_df = pl.read_parquet(clusters_parquet)
     cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id)[
         "symbol"
@@ -80,12 +81,11 @@ def _get_random_symbols(
     if not cluster_symbols:
         return []
 
-    # Randomly select N symbols (or all if cluster has fewer than N)
     if len(cluster_symbols) <= n:
         return cluster_symbols
 
-    random.seed(42)  # For reproducibility
-    return random.sample(cluster_symbols, n)
+    rng = random.Random(seed)
+    return rng.sample(cluster_symbols, n)
 
 
 _MLFLOW_TAG_MAX = 5000
@@ -750,26 +750,34 @@ def _create_global_trial_objective(
     obj_cfg = optuna_cfg.get("objective", {})
     beta = obj_cfg.get("beta", 0.5)
     features_path = get_features_parquet_path(config)
+    n_symbols_per_cluster = int(resolve_env_value(
+        optuna_cfg.get("n_symbols_per_cluster", 3), default=3
+    ))
 
-    # Pre-compute random symbols per cluster for fast trials
     import polars as pl
 
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
 
-    selected_symbols = []
-    for cid in cluster_ids:
-        symbols = _get_random_symbols(cid, cluster_cfg.output_parquet, n=2)
-        selected_symbols.extend(symbols)
-
     print(
-        f"  Optimization will use {len(selected_symbols)} symbols (2 random from each of {len(cluster_ids)} clusters)"
+        f"  Each trial will sample {n_symbols_per_cluster} symbols per cluster "
+        f"(~{n_symbols_per_cluster * len(cluster_ids)} total from {len(cluster_ids)} clusters)"
     )
 
     def objective(trial: optuna.Trial) -> float:
+        # Each trial gets a different symbol subset via trial.number as seed
+        selected_symbols = []
+        for cid in cluster_ids:
+            symbols = _get_random_symbols(
+                cid, cluster_cfg.output_parquet,
+                n=n_symbols_per_cluster,
+                seed=trial.number,
+            )
+            selected_symbols.extend(symbols)
+        trial.set_user_attr("optimization_symbols", selected_symbols)
+
         params = suggest_hyperparams(trial, config)
 
-        # DataModule with top symbols only
         dm = TradingDataModule(
             parquet_path=features_path,
             seq_len=params["sequence_length"],
@@ -779,7 +787,6 @@ def _create_global_trial_objective(
             clusters_parquet=cluster_cfg.output_parquet,
             noise_std=params["noise_std"],
         )
-        # Set filtered symbols before setup
         dm._optimization_symbols = selected_symbols
         dm.setup()
 
