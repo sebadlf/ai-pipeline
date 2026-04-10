@@ -93,14 +93,14 @@ def generate_signals(
     # Resolve features and normalization per cluster (cached)
     cluster_feature_cols: dict[str, list[str]] = {}
     cluster_norm: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    FeatureMismatch_clusters = []
+    feature_mismatch_clusters = []
     for cid, model in models.items():
         try:
             fcols = resolve_feature_cols(model, df, config)
         except ValueError as e:
             if "features not in DataFrame" in str(e) or "Feature mismatch" in str(e):
                 print(f"  Feature mismatch for {cid}: skipping this cluster. Retrain model after feature selection changes.")
-                FeatureMismatch_clusters.append(cid)
+                feature_mismatch_clusters.append(cid)
                 continue
             raise
         cluster_feature_cols[cid] = fcols
@@ -117,8 +117,8 @@ def generate_signals(
         std[std == 0] = 1.0
         cluster_norm[cid] = (mean, std)
 
-    if FeatureMismatch_clusters:
-        print(f"\n  WARNING: {len(FeatureMismatch_clusters)} clusters skipped due to feature mismatch: {', '.join(FeatureMismatch_clusters)}")
+    if feature_mismatch_clusters:
+        print(f"\n  WARNING: {len(feature_mismatch_clusters)} clusters skipped due to feature mismatch: {', '.join(feature_mismatch_clusters)}")
         print("  Recommendation: Retrain models after feature selection changes.\n")
 
     # Generate predictions per symbol

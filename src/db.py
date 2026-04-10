@@ -20,6 +20,22 @@ from sqlalchemy.engine import Engine
 
 from src.config import get_db_url
 
+# ---------------------------------------------------------------------------
+# SQL parameterization helpers
+# ---------------------------------------------------------------------------
+
+def in_params(prefix: str, values: list) -> tuple[str, dict]:
+    """Generate numbered params for IN clauses with SQLAlchemy text().
+
+    Example:
+        >>> in_params("s", ["AAPL", "MSFT"])
+        (":s0, :s1", {"s0": "AAPL", "s1": "MSFT"})
+    """
+    params = {f"{prefix}{i}": v for i, v in enumerate(values)}
+    placeholders = ", ".join(f":{k}" for k in params)
+    return placeholders, params
+
+
 metadata = MetaData()
 
 ohlcv_daily = Table(
@@ -185,6 +201,17 @@ def get_engine() -> Engine:
     return _engine
 
 
+def dispose_engine() -> None:
+    """Dispose the singleton engine and reset it.
+
+    Call this at the end of worker processes to cleanly release DB connections.
+    """
+    global _engine
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None
+
+
 def init_db(engine: Engine) -> None:
     """Create tables, enable TimescaleDB, and migrate schemas."""
     with engine.connect() as conn:
@@ -200,7 +227,7 @@ def _migrate_treasury_columns(engine: Engine) -> None:
     """Add new treasury tenor columns to existing table if missing."""
     new_cols = [
         "month1", "month2", "month3", "month6",
-        "year1", "year3", "year5", "year7", "year20",
+        "year1", "year2", "year3", "year5", "year7", "year10", "year20",
     ]
     with engine.begin() as conn:
         for col in new_cols:

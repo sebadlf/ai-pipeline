@@ -37,10 +37,17 @@ from src.config import (
     load_config,
     resolve_env_value,
 )
+import warnings
+
 from src.db import get_engine
 from src.keys import MLFLOW_TRACKING_URI, OPTUNA_STORAGE_URL
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
+
+# Suppress noisy Lightning warnings
+warnings.filterwarnings("ignore", message=".*num_workers.*bottleneck.*")
+warnings.filterwarnings("ignore", message=".*litlogger.*")
+warnings.filterwarnings("ignore", message=".*litmodels.*")
 
 
 def _get_random_symbols(
@@ -101,27 +108,44 @@ def _log_exception_to_mlflow_run(
     client.set_tag(run_id, "error_traceback", tb[:_MLFLOW_TAG_MAX])
 
 
-def suggest_hyperparams(trial: optuna.Trial) -> dict[str, Any]:
-    """Define the Optuna search space.
+def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
+    """Define the Optuna search space from config.
+
+    Reads ranges from config["training"]["optuna"]["search_space"].
+    Each key maps to either:
+      - a list (categorical): trial.suggest_categorical
+      - a dict with {low, high} (range): trial.suggest_float or suggest_int
+        - optional "log": true for log-uniform sampling
 
     Returns a dict with all suggested hyperparameters for this trial.
     """
+    ss = config.get("training", {}).get("optuna", {}).get("search_space", {})
+
+    def _suggest(name: str, fallback):
+        spec = ss.get(name, fallback)
+        if isinstance(spec, list):
+            return trial.suggest_categorical(name, spec)
+        if isinstance(spec, dict):
+            low, high = spec["low"], spec["high"]
+            if isinstance(low, int) and isinstance(high, int) and not spec.get("log", False):
+                return trial.suggest_int(name, low, high)
+            return trial.suggest_float(name, float(low), float(high), log=spec.get("log", False))
+        return spec
+
     return {
         # Training hyperparams
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
-        "batch_size": trial.suggest_categorical("batch_size", [64, 128, 256]),
-        "weight_decay": trial.suggest_float("weight_decay", 1e-4, 0.1, log=True),
-        "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.15),
-        "focal_gamma": trial.suggest_float("focal_gamma", 0.0, 5.0),
-        "noise_std": trial.suggest_float("noise_std", 0.0, 0.05),
+        "learning_rate": _suggest("learning_rate", {"low": 1e-4, "high": 1e-2, "log": True}),
+        "batch_size": _suggest("batch_size", [64, 128, 256]),
+        "weight_decay": _suggest("weight_decay", {"low": 1e-4, "high": 0.1, "log": True}),
+        "label_smoothing": _suggest("label_smoothing", {"low": 0.0, "high": 0.15}),
+        "focal_gamma": _suggest("focal_gamma", {"low": 0.0, "high": 5.0}),
+        "noise_std": _suggest("noise_std", {"low": 0.0, "high": 0.05}),
         # Architecture
-        "hidden_size": trial.suggest_categorical("hidden_size", [64, 96, 128, 256]),
-        "num_layers": trial.suggest_int("num_layers", 1, 4),
-        "dropout": trial.suggest_float("dropout", 0.1, 0.5),
-        "num_attention_heads": trial.suggest_categorical(
-            "num_attention_heads", [0, 2, 4]
-        ),
-        "sequence_length": trial.suggest_categorical("sequence_length", [10, 20, 30]),
+        "hidden_size": _suggest("hidden_size", [64, 96, 128, 256]),
+        "num_layers": _suggest("num_layers", {"low": 1, "high": 4}),
+        "dropout": _suggest("dropout", {"low": 0.1, "high": 0.5}),
+        "num_attention_heads": _suggest("num_attention_heads", [0, 2, 4]),
+        "sequence_length": _suggest("sequence_length", [10, 20, 30]),
     }
 
 
@@ -201,8 +225,8 @@ def _create_trial_objective(
 ) -> callable:
     """Create the Optuna objective function closure for a cluster."""
     optuna_cfg = config["training"].get("optuna", {})
-    epochs_per_trial = optuna_cfg.get("epochs_per_trial", 30)
-    patience_per_trial = optuna_cfg.get("patience_per_trial", 7)
+    epochs_per_trial = int(resolve_env_value(optuna_cfg.get("epochs_per_trial", 30), default=30))
+    patience_per_trial = int(resolve_env_value(optuna_cfg.get("patience_per_trial", 7), default=7))
     min_recall = optuna_cfg.get("min_recall_up", 0.10)
 
     # F-beta objective configuration
@@ -212,7 +236,7 @@ def _create_trial_objective(
     features_path = get_features_parquet_path(config)
 
     def objective(trial: optuna.Trial) -> float:
-        params = suggest_hyperparams(trial)
+        params = suggest_hyperparams(trial, config)
 
         # DataModule with trial hyperparams
         dm = TradingDataModule(
@@ -253,10 +277,13 @@ def _create_trial_objective(
         )
         pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
 
+        precision = config.get("training", {}).get("precision", "32")
+
         trainer = L.Trainer(
             max_epochs=epochs_per_trial,
             accelerator="mps",
             devices=1,
+            precision=precision,
             callbacks=[early_stop, pruning_callback],
             log_every_n_steps=10,
             gradient_clip_val=1.0,
@@ -275,9 +302,16 @@ def _create_trial_objective(
 
             traceback.print_exc()
             return 0.0
+        finally:
+            # Clean up MPS memory between trials to prevent fragmentation
+            del trainer
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
         # Compute objective on validation set
-        return _compute_objective_value(model, dm, min_recall, beta)
+        result = _compute_objective_value(model, dm, min_recall, beta)
+        del model, dm
+        return result
 
     return objective
 
@@ -327,8 +361,8 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     buy_thresh = get_cluster_buy_threshold(config, cluster_id)
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     optuna_cfg = config["training"].get("optuna", {})
-    n_trials = optuna_cfg.get("n_trials", 30)
-    startup_trials = optuna_cfg.get("startup_trials", 5)
+    n_trials = int(resolve_env_value(optuna_cfg.get("n_trials", 30), default=30))
+    startup_trials = int(resolve_env_value(optuna_cfg.get("startup_trials", 5), default=5))
     max_history_days = int(
         resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
     )
@@ -473,10 +507,12 @@ def train_final_model(
         filename=f"{cluster_id}-best-{{epoch}}-{{val_precision_up:.4f}}",
     )
 
+    precision = config.get("training", {}).get("precision", "32")
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="mps",
         devices=1,
+        precision=precision,
         logger=mlflow_logger,
         callbacks=[early_stop, checkpoint, RichProgressBar()],
         log_every_n_steps=10,
@@ -683,8 +719,8 @@ def _create_global_trial_objective(
         Objective function for Optuna.
     """
     optuna_cfg = config["training"].get("optuna", {})
-    epochs_per_trial = optuna_cfg.get("epochs_per_trial", 30)
-    patience_per_trial = optuna_cfg.get("patience_per_trial", 7)
+    epochs_per_trial = int(resolve_env_value(optuna_cfg.get("epochs_per_trial", 30), default=30))
+    patience_per_trial = int(resolve_env_value(optuna_cfg.get("patience_per_trial", 7), default=7))
     min_recall = optuna_cfg.get("min_recall_up", 0.10)
     obj_cfg = optuna_cfg.get("objective", {})
     beta = obj_cfg.get("beta", 0.5)
@@ -706,7 +742,7 @@ def _create_global_trial_objective(
     )
 
     def objective(trial: optuna.Trial) -> float:
-        params = suggest_hyperparams(trial)
+        params = suggest_hyperparams(trial, config)
 
         # DataModule with top symbols only
         dm = TradingDataModule(
@@ -749,10 +785,12 @@ def _create_global_trial_objective(
         )
         pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
 
+        precision = config.get("training", {}).get("precision", "32")
         trainer = L.Trainer(
             max_epochs=epochs_per_trial,
             accelerator="mps",
             devices=1,
+            precision=precision,
             callbacks=[early_stop, pruning_callback],
             log_every_n_steps=10,
             gradient_clip_val=1.0,
@@ -771,9 +809,16 @@ def _create_global_trial_objective(
 
             traceback.print_exc()
             return 0.0
+        finally:
+            # Clean up MPS memory between trials to prevent fragmentation
+            del trainer
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
         # Compute objective on validation set (top symbols only)
-        return _compute_objective_value(model, dm, min_recall, beta)
+        result = _compute_objective_value(model, dm, min_recall, beta)
+        del model, dm
+        return result
 
     return objective
 
@@ -793,8 +838,8 @@ def optimize_global(config: dict) -> dict[str, Any]:
     split_dates = compute_split_dates(config)
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     optuna_cfg = config["training"].get("optuna", {})
-    n_trials = optuna_cfg.get("n_trials_global", 50)  # More trials for global search
-    startup_trials = optuna_cfg.get("startup_trials", 5)
+    n_trials = int(resolve_env_value(optuna_cfg.get("n_trials_global", 50), default=50))
+    startup_trials = int(resolve_env_value(optuna_cfg.get("startup_trials", 5), default=5))
     max_history_days = int(
         resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
     )

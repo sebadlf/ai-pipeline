@@ -20,7 +20,7 @@ import polars as pl
 from sqlalchemy import text
 
 from src.config import compute_split_dates, load_config
-from src.db import get_engine
+from src.db import get_engine, in_params
 from src.evaluation.regime import detect_regimes
 from src.keys import MLFLOW_TRACKING_URI
 from src.portfolio.metrics import compute_all_metrics
@@ -277,25 +277,29 @@ def load_test_prices(symbols: list[str], start_date: dt.date, end_date: dt.date)
         DataFrame with columns [date, symbol, close].
     """
     engine = get_engine()
-    placeholders = ", ".join(f"'{s}'" for s in symbols)
-    query = f"""
+    ph, params = in_params("s", symbols)
+    params["start_date"] = start_date
+    params["end_date"] = end_date
+    query = text(f"""
         SELECT date, symbol, close FROM ohlcv_daily
-        WHERE symbol IN ({placeholders})
-          AND date >= '{start_date}' AND date <= '{end_date}'
+        WHERE symbol IN ({ph})
+          AND date >= :start_date AND date <= :end_date
         ORDER BY date, symbol
-    """
-    return pl.read_database(query, engine)
+    """).bindparams(**params)
+    with engine.connect() as conn:
+        return pl.read_database(query, conn)
 
 
 def load_benchmark_returns(benchmark: str, start_date: dt.date, end_date: dt.date) -> np.ndarray:
     """Load benchmark daily returns for the backtest period."""
     engine = get_engine()
-    query = f"""
+    query = text("""
         SELECT date, close FROM ohlcv_daily
-        WHERE symbol = '{benchmark}' AND date >= '{start_date}' AND date <= '{end_date}'
+        WHERE symbol = :benchmark AND date >= :start_date AND date <= :end_date
         ORDER BY date
-    """
-    df = pl.read_database(query, engine)
+    """).bindparams(benchmark=benchmark, start_date=start_date, end_date=end_date)
+    with engine.connect() as conn:
+        df = pl.read_database(query, conn)
     if df.is_empty():
         return np.array([0.0])
     return df.sort("date").with_columns(
@@ -371,12 +375,12 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
             regime_prices = prices.filter(pl.col("date").is_in(regime_dates))
 
             # Filter benchmark returns to regime days
-            bench_df = pl.DataFrame({"date": regime_dates}).sort("date")
-            all_bench = pl.read_database(
-                f"SELECT date, close FROM ohlcv_daily WHERE symbol = '{benchmark}' "
-                f"AND date >= '{split_dates.test_start}' ORDER BY date",
-                get_engine(),
-            )
+            bench_query = text(
+                "SELECT date, close FROM ohlcv_daily WHERE symbol = :benchmark "
+                "AND date >= :test_start ORDER BY date"
+            ).bindparams(benchmark=benchmark, test_start=split_dates.test_start)
+            with get_engine().connect() as bench_conn:
+                all_bench = pl.read_database(bench_query, bench_conn)
             regime_bench = all_bench.filter(pl.col("date").is_in(regime_dates)).sort("date")
             if len(regime_bench) > 1:
                 regime_bench_returns = regime_bench.with_columns(

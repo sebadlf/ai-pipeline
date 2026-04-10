@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 
 import lightning as L
@@ -10,6 +11,9 @@ import numpy as np
 import polars as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+logger = logging.getLogger(__name__)
+
 
 def _get_num_workers() -> int:
     """Get number of DataLoader workers.
@@ -106,6 +110,7 @@ class TradingDataModule(L.LightningDataModule):
         from src.config import SplitDates
 
         if split_dates is None:
+            logger.warning("split_dates not provided, using hardcoded defaults — this should only happen in testing")
             split_dates = SplitDates(
                 start_date=dt.date(2016, 4, 1),
                 train_end=dt.date(2022, 10, 1),
@@ -226,7 +231,6 @@ class TradingDataModule(L.LightningDataModule):
             f"  Split sizes — train: {len(train_y):,} | "
             f"val: {len(val_y):,} | test: {len(test_y):,}"
         )
-        print(sd.summary())
 
         # Binary classification: NOT_UP=0, UP=1
         num_classes = 2

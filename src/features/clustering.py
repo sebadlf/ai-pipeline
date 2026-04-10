@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import datetime as dt
 from pathlib import Path
 
@@ -28,8 +29,10 @@ from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
 
 from src.config import ClusterConfig, compute_split_dates, load_config
-from src.db import get_engine, init_db
+from src.db import get_engine, in_params, init_db
 from src.keys import MLFLOW_TRACKING_URI
+
+logger = logging.getLogger(__name__)
 
 _KM_FIELDS = [
     "returnOnEquity", "earningsYield", "freeCashFlowYield", "evToEBITDA",
@@ -59,49 +62,51 @@ def _load_fundamentals_for_clustering(
 
     Returns dict of {symbol: {feature_name: value}}.
     """
-    placeholders = ", ".join(f"'{s}'" for s in symbols)
+    ph, params = in_params("s", symbols)
+    params["train_end"] = train_end
 
     km_extracts = ", ".join(
         f"(data->>'{f}')::double precision AS {f}" for f in _KM_FIELDS
     )
-    km_query = f"""
+    km_query = text(f"""
         SELECT DISTINCT ON (symbol) symbol, {km_extracts}
         FROM key_metrics_quarterly
-        WHERE symbol IN ({placeholders}) AND date <= '{train_end}'
+        WHERE symbol IN ({ph}) AND date <= :train_end
         ORDER BY symbol, date DESC
-    """
+    """).bindparams(**params)
 
     fr_extracts = ", ".join(
         f"(data->>'{f}')::double precision AS {f}" for f in _FR_FIELDS
     )
-    fr_query = f"""
+    fr_query = text(f"""
         SELECT DISTINCT ON (symbol) symbol, {fr_extracts}
         FROM financial_ratios_quarterly
-        WHERE symbol IN ({placeholders}) AND date <= '{train_end}'
+        WHERE symbol IN ({ph}) AND date <= :train_end
         ORDER BY symbol, date DESC
-    """
+    """).bindparams(**params)
 
     result: dict[str, dict[str, float]] = {}
 
-    try:
-        km_df = pl.read_database(km_query, engine)
-        for row in km_df.iter_rows(named=True):
-            sym = row["symbol"]
-            result.setdefault(sym, {})
-            for f in _KM_FIELDS:
-                result[sym][f"km_{f}"] = row.get(f)
-    except Exception:
-        pass
+    with engine.connect() as conn:
+        try:
+            km_df = pl.read_database(km_query, conn)
+            for row in km_df.iter_rows(named=True):
+                sym = row["symbol"]
+                result.setdefault(sym, {})
+                for f in _KM_FIELDS:
+                    result[sym][f"km_{f}"] = row.get(f)
+        except Exception as e:
+            logger.warning("Failed to load key_metrics for clustering: %s", e)
 
-    try:
-        fr_df = pl.read_database(fr_query, engine)
-        for row in fr_df.iter_rows(named=True):
-            sym = row["symbol"]
-            result.setdefault(sym, {})
-            for f in _FR_FIELDS:
-                result[sym][f"fr_{f}"] = row.get(f)
-    except Exception:
-        pass
+        try:
+            fr_df = pl.read_database(fr_query, conn)
+            for row in fr_df.iter_rows(named=True):
+                sym = row["symbol"]
+                result.setdefault(sym, {})
+                for f in _FR_FIELDS:
+                    result[sym][f"fr_{f}"] = row.get(f)
+        except Exception as e:
+            logger.warning("Failed to load financial_ratios for clustering: %s", e)
 
     return result
 
@@ -111,23 +116,23 @@ def _load_macro_series(
     train_end: dt.date,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Load VIX and treasury spread series up to train_end for sensitivity computation."""
-    vix_query = f"""
-        SELECT date, close AS vix_close
-        FROM vix_daily WHERE date <= '{train_end}' ORDER BY date
-    """
-    treasury_query = f"""
-        SELECT date, year10 - year2 AS spread_10y_2y
-        FROM treasury_rates WHERE date <= '{train_end}' ORDER BY date
-    """
-    try:
-        vix_df = pl.read_database(vix_query, engine)
-    except Exception:
-        vix_df = pl.DataFrame(schema={"date": pl.Date, "vix_close": pl.Float64})
+    vix_query = text(
+        "SELECT date, close AS vix_close FROM vix_daily WHERE date <= :train_end ORDER BY date"
+    ).bindparams(train_end=train_end)
+    treasury_query = text(
+        "SELECT date, year10 - year2 AS spread_10y_2y FROM treasury_rates WHERE date <= :train_end ORDER BY date"
+    ).bindparams(train_end=train_end)
 
-    try:
-        treasury_df = pl.read_database(treasury_query, engine)
-    except Exception:
-        treasury_df = pl.DataFrame(schema={"date": pl.Date, "spread_10y_2y": pl.Float64})
+    with engine.connect() as conn:
+        try:
+            vix_df = pl.read_database(vix_query, conn)
+        except Exception:
+            vix_df = pl.DataFrame(schema={"date": pl.Date, "vix_close": pl.Float64})
+
+        try:
+            treasury_df = pl.read_database(treasury_query, conn)
+        except Exception:
+            treasury_df = pl.DataFrame(schema={"date": pl.Date, "spread_10y_2y": pl.Float64})
 
     return vix_df, treasury_df
 
@@ -137,15 +142,16 @@ def _load_sector_avg_returns(
     train_end: dt.date,
 ) -> dict[str, float]:
     """Load average sector daily return over last 252 days before train_end."""
-    query = f"""
+    query = text("""
         SELECT sector, AVG(average_change) AS avg_change
         FROM sector_performance_daily
-        WHERE date <= '{train_end}'
-          AND date >= '{train_end}'::date - INTERVAL '252 days'
+        WHERE date <= :train_end
+          AND date >= :train_end::date - INTERVAL '252 days'
         GROUP BY sector
-    """
+    """).bindparams(train_end=train_end)
     try:
-        df = pl.read_database(query, engine)
+        with engine.connect() as conn:
+            df = pl.read_database(query, conn)
         return {row["sector"]: row["avg_change"] for row in df.iter_rows(named=True)}
     except Exception:
         return {}
@@ -169,15 +175,17 @@ def compute_clustering_features(
         sectors_df: DataFrame with [symbol, sector] mapping.
         spy_symbol: Benchmark symbol for beta computation.
     """
-    placeholders = ", ".join(f"'{s}'" for s in symbols)
-    query = f"""
+    ph, params = in_params("s", symbols)
+    params["train_end"] = train_end
+    query = text(f"""
         SELECT symbol, date, close, volume
         FROM ohlcv_daily
-        WHERE symbol IN ({placeholders})
-          AND date <= '{train_end}'
+        WHERE symbol IN ({ph})
+          AND date <= :train_end
         ORDER BY symbol, date
-    """
-    df = pl.read_database(query, engine)
+    """).bindparams(**params)
+    with engine.connect() as conn:
+        df = pl.read_database(query, conn)
 
     if df.is_empty():
         return pl.DataFrame(schema={"symbol": pl.Utf8})

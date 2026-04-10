@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import sys
 from pathlib import Path
 
 import time
@@ -19,7 +18,7 @@ import httpx
 from sqlalchemy import text
 
 from src.config import load_config
-from src.db import get_engine, init_db
+from src.db import get_engine, in_params, init_db
 from src.keys import FMP_API_KEY
 
 FMP_BASE_URL = "https://financialmodelingprep.com/stable"
@@ -421,12 +420,13 @@ def check_adjclose_changed(
     probe_dates = [(today - dt.timedelta(days=d)).isoformat() for d in _PROBE_OFFSETS_DAYS]
 
     with engine.connect() as conn:
-        placeholders = ", ".join(f"'{d}'" for d in probe_dates)
+        ph, params = in_params("d", probe_dates)
+        params["symbol"] = symbol
         result = conn.execute(text(f"""
             SELECT date, adj_close FROM ohlcv_daily
-            WHERE symbol = :symbol AND date IN ({placeholders})
+            WHERE symbol = :symbol AND date IN ({ph})
             ORDER BY date
-        """), {"symbol": symbol})
+        """), params)
         db_rows = {str(row[0]): row[1] for row in result}
 
     if not db_rows or any(v is None for v in db_rows.values()):

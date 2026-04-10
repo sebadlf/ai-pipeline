@@ -14,6 +14,8 @@ Usage:
 
 from __future__ import annotations
 
+import logging
+
 import argparse
 from typing import Any
 
@@ -23,6 +25,8 @@ from mlflow.tracking import MlflowClient
 
 from src.config import ClusterConfig, PromotionEvalConfig, load_config
 from src.keys import MLFLOW_TRACKING_URI
+
+logger = logging.getLogger(__name__)
 
 MODEL_NAME_PREFIX = "trading-forecaster"
 
@@ -333,7 +337,7 @@ def promote_cluster_model(
     try:
         client.create_registered_model(model_name)
     except mlflow.exceptions.MlflowException:
-        pass
+        logger.debug("Model %s already registered", model_name)
 
     artifact_uri = f"runs:/{run_id}/{best_ckpt}"
     mv = client.create_model_version(

@@ -27,7 +27,69 @@ def load_config(path: str | None = None) -> dict:
     if path is None:
         path = str(PROJECT_ROOT / "configs" / "default.yaml")
     with open(path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    validate_config(config)
+    return config
+
+
+def validate_config(config: dict) -> None:
+    """Validate config values for correctness and coherence."""
+    errors: list[str] = []
+
+    # Target
+    target = config.get("target", {})
+    if target.get("horizon", 1) <= 0:
+        errors.append("target.horizon must be positive")
+    if target.get("buy_threshold", 0.025) <= 0:
+        errors.append("target.buy_threshold must be positive")
+
+    # Model
+    model = config.get("model", {})
+    if model.get("hidden_size", 1) <= 0:
+        errors.append("model.hidden_size must be positive")
+    if model.get("num_layers", 1) <= 0:
+        errors.append("model.num_layers must be positive")
+    dropout = model.get("dropout", 0.0)
+    if not (0.0 <= dropout < 1.0):
+        errors.append("model.dropout must be in [0, 1)")
+
+    # Training
+    train = config.get("training", {})
+    if train.get("purge_days", 1) <= 0:
+        errors.append("training.purge_days must be positive")
+
+    # Clustering
+    clustering = config.get("clustering", {})
+    min_k = clustering.get("min_clusters", 3)
+    max_k = clustering.get("max_clusters", 10)
+    if min_k > max_k:
+        errors.append(f"clustering.min_clusters ({min_k}) must be <= max_clusters ({max_k})")
+
+    # Regime
+    regime = config.get("regime", {})
+    if regime.get("sma_short", 50) >= regime.get("sma_long", 200):
+        errors.append("regime.sma_short must be < regime.sma_long")
+    if regime.get("bear_threshold", -0.10) >= 0:
+        errors.append("regime.bear_threshold must be negative")
+    if regime.get("bull_threshold", 0.10) <= 0:
+        errors.append("regime.bull_threshold must be positive")
+
+    # Portfolio constraints
+    constraints = config.get("portfolio", {}).get("constraints", {})
+    max_pos = constraints.get("max_single_position", 0.10)
+    if not (0.0 < max_pos <= 1.0):
+        errors.append("portfolio.constraints.max_single_position must be in (0, 1]")
+
+    # Feature selection
+    fs = config.get("feature_selection", {})
+    if fs.get("enabled", False):
+        if not (0.0 < fs.get("max_null_pct", 0.90) <= 1.0):
+            errors.append("feature_selection.max_null_pct must be in (0, 1]")
+        if not (0.0 < fs.get("max_correlation", 0.95) <= 1.0):
+            errors.append("feature_selection.max_correlation must be in (0, 1]")
+
+    if errors:
+        raise ValueError("Config validation failed:\n  " + "\n  ".join(errors))
 
 
 def resolve_env_value(value: int | float | dict, default: int | float = 0) -> int | float:

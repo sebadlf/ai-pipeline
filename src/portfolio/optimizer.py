@@ -28,7 +28,7 @@ from src.config import (
     compute_split_dates,
     load_config,
 )
-from src.db import get_engine
+from src.db import get_engine, in_params
 from src.keys import MLFLOW_TRACKING_URI
 from src.portfolio.metrics import (
     calmar_ratio,
@@ -64,14 +64,17 @@ def load_historical_returns(
         DataFrame with columns [date, symbol, daily_return].
     """
     engine = get_engine()
-    placeholders = ", ".join(f"'{s}'" for s in symbols)
-    query = f"""
+    ph, params = in_params("s", symbols)
+    params["start_date"] = start_date
+    params["end_date"] = end_date
+    query = text(f"""
         SELECT date, symbol, close FROM ohlcv_daily
-        WHERE symbol IN ({placeholders})
-          AND date >= '{start_date}' AND date <= '{end_date}'
+        WHERE symbol IN ({ph})
+          AND date >= :start_date AND date <= :end_date
         ORDER BY symbol, date
-    """
-    df = pl.read_database(query, engine)
+    """).bindparams(**params)
+    with engine.connect() as conn:
+        df = pl.read_database(query, conn)
 
     if df.is_empty():
         return pl.DataFrame(schema={"date": pl.Date, "symbol": pl.Utf8, "daily_return": pl.Float64})
@@ -99,13 +102,14 @@ def load_benchmark_returns(
         Array of daily returns.
     """
     engine = get_engine()
-    query = f"""
+    query = text("""
         SELECT date, close FROM ohlcv_daily
-        WHERE symbol = '{benchmark}'
-          AND date >= '{start_date}' AND date <= '{end_date}'
+        WHERE symbol = :benchmark
+          AND date >= :start_date AND date <= :end_date
         ORDER BY date
-    """
-    df = pl.read_database(query, engine)
+    """).bindparams(benchmark=benchmark, start_date=start_date, end_date=end_date)
+    with engine.connect() as conn:
+        df = pl.read_database(query, conn)
     if df.is_empty():
         return np.array([0.0])
 
@@ -119,26 +123,25 @@ def load_benchmark_returns(
 def _build_returns_matrix(
     returns_df: pl.DataFrame,
     symbols: list[str],
-) -> tuple[np.ndarray, list[str]]:
+) -> np.ndarray:
     """Build a (n_days, n_symbols) returns matrix from long-format DataFrame.
 
     Returns:
-        Tuple of (returns_matrix, dates_list).
+        Returns matrix as numpy array with shape (n_days, n_symbols).
     """
     pivot = returns_df.pivot(on="symbol", index="date", values="daily_return").sort("date")
 
     # Keep only requested symbols that exist in the data
     available = [s for s in symbols if s in pivot.columns]
     if not available:
-        return np.array([]).reshape(0, 0), []
+        return np.array([]).reshape(0, 0)
 
-    dates = pivot["date"].to_list()
     matrix = pivot.select(available).to_numpy()
 
     # Replace NaN with 0
     matrix = np.nan_to_num(matrix, nan=0.0)
 
-    return matrix, dates
+    return matrix
 
 
 def optimize_portfolio(
@@ -184,7 +187,7 @@ def optimize_portfolio(
         return pl.DataFrame(schema=empty_schema)
 
     # Build returns matrix for candidates
-    returns_matrix, _ = _build_returns_matrix(returns_df, symbols)
+    returns_matrix = _build_returns_matrix(returns_df, symbols)
 
     if returns_matrix.size == 0 or returns_matrix.shape[0] < 10:
         # Not enough data — equal weight fallback
@@ -344,7 +347,7 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
             if returns_df.height > 0:
                 syms = allocation["symbol"].to_list()
                 wts = allocation["weight"].to_numpy()
-                ret_matrix, _ = _build_returns_matrix(returns_df, syms)
+                ret_matrix = _build_returns_matrix(returns_df, syms)
                 if ret_matrix.size > 0 and ret_matrix.shape[1] == len(wts):
                     port_ret = ret_matrix @ wts
                     equity = np.cumprod(1 + port_ret) * 100000

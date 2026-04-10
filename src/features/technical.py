@@ -8,12 +8,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import warnings
 
 import polars as pl
 
+from sqlalchemy import text
+
 from src.config import load_config
-from src.db import get_engine
+from src.db import get_engine, in_params
 
 
 def load_ohlcv(symbols: list[str] | None = None) -> pl.DataFrame:
@@ -22,13 +25,14 @@ def load_ohlcv(symbols: list[str] | None = None) -> pl.DataFrame:
     Args:
         symbols: Optional list of symbols to filter. None = all.
     """
-    query = "SELECT * FROM ohlcv_daily"
     if symbols:
-        placeholders = ", ".join(f"'{s}'" for s in symbols)
-        query += f" WHERE symbol IN ({placeholders})"
-    query += " ORDER BY symbol, date"
+        ph, params = in_params("s", symbols)
+        query = text(f"SELECT * FROM ohlcv_daily WHERE symbol IN ({ph}) ORDER BY symbol, date").bindparams(**params)
+    else:
+        query = text("SELECT * FROM ohlcv_daily ORDER BY symbol, date")
 
-    return pl.read_database(query, get_engine())
+    with get_engine().connect() as conn:
+        return pl.read_database(query, conn)
 
 
 def add_sma(df: pl.DataFrame, window: int) -> pl.DataFrame:
@@ -399,7 +403,6 @@ def add_mean_reversion_zscore(df: pl.DataFrame, window: int = 20) -> pl.DataFram
 
 def add_cyclical_time(df: pl.DataFrame) -> pl.DataFrame:
     """Add sin/cos encoding of day-of-week and month-of-year."""
-    import math
 
     return df.with_columns(
         pl.col("date").dt.weekday().alias("_dow"),

@@ -13,7 +13,6 @@ import argparse
 import datetime as dt
 import glob
 import os
-import re
 from pathlib import Path
 
 import mlflow
@@ -127,15 +126,16 @@ def validate_champion_features(
         raise
 
 
-def run_inference_for_cluster(
+def _run_inference_core(
     cluster_id: str,
     model: LSTMForecaster,
     features_df: pl.DataFrame,
     clusters_df: pl.DataFrame,
     config: dict,
     split_dates,
+    date_filter_end=None,
 ) -> list[dict]:
-    """Run inference for all symbols in a cluster.
+    """Core inference logic shared by run_inference_for_cluster and run_inference_for_period.
 
     Args:
         cluster_id: Cluster identifier.
@@ -143,7 +143,9 @@ def run_inference_for_cluster(
         features_df: Full features DataFrame.
         clusters_df: Cluster assignments.
         config: Full config dict.
-        split_dates: SplitDates instance.
+        split_dates: SplitDates instance (used for normalization).
+        date_filter_end: If set, filter each symbol's data to <= this date before
+            taking the last seq_len rows. None means use all available data (most recent).
 
     Returns:
         List of prediction dicts.
@@ -174,12 +176,13 @@ def run_inference_for_cluster(
     predictions = []
     for symbol in cluster_symbols:
         sym_df = features_df.filter(pl.col("symbol") == symbol).sort("date")
+        if date_filter_end is not None:
+            sym_df = sym_df.filter(pl.col("date") <= date_filter_end)
         sym_df = sym_df.drop_nulls(subset=feature_cols)
 
         if len(sym_df) < seq_len:
             continue
 
-        # Use the most recent seq_len rows for prediction
         recent = sym_df.tail(seq_len)
         features = recent.select(feature_cols).to_numpy()
         np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
@@ -197,6 +200,18 @@ def run_inference_for_cluster(
         })
 
     return predictions
+
+
+def run_inference_for_cluster(
+    cluster_id: str,
+    model: LSTMForecaster,
+    features_df: pl.DataFrame,
+    clusters_df: pl.DataFrame,
+    config: dict,
+    split_dates,
+) -> list[dict]:
+    """Run inference for all symbols in a cluster using the most recent data."""
+    return _run_inference_core(cluster_id, model, features_df, clusters_df, config, split_dates)
 
 
 def run_inference_for_period(
@@ -211,73 +226,13 @@ def run_inference_for_period(
 ) -> list[dict]:
     """Run inference for a specific date period using the last window before period_end.
 
-    Same logic as run_inference_for_cluster but filters data to a specific
-    period, using the last seq_len rows before period_end for each symbol.
+    Same logic as run_inference_for_cluster but filters data up to period_end.
     Always normalizes with training-period statistics.
-
-    Args:
-        cluster_id: Cluster identifier.
-        model: Loaded model.
-        features_df: Full features DataFrame.
-        clusters_df: Cluster assignments.
-        config: Full config dict.
-        split_dates: SplitDates instance (used for normalization).
-        period_start: Start date of the evaluation period.
-        period_end: End date of the evaluation period.
-
-    Returns:
-        List of prediction dicts.
     """
-    model_cfg = config["model"]
-    seq_len = model_cfg["sequence_length"]
-
-    cluster_symbols = (
-        clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
+    return _run_inference_core(
+        cluster_id, model, features_df, clusters_df, config, split_dates,
+        date_filter_end=period_end,
     )
-    feature_cols = resolve_feature_cols(model, features_df, config)
-
-    # Normalize with training-period statistics (always)
-    train_df = features_df.filter(
-        (pl.col("date") < split_dates.train_end)
-        & pl.col("symbol").is_in(cluster_symbols)
-    ).drop_nulls(subset=feature_cols)
-
-    if train_df.is_empty():
-        return []
-
-    train_matrix = train_df.select(feature_cols).to_numpy()
-    np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    train_mean = train_matrix.mean(axis=0)
-    train_std = train_matrix.std(axis=0)
-    train_std[train_std == 0] = 1.0
-
-    predictions = []
-    for symbol in cluster_symbols:
-        sym_df = features_df.filter(pl.col("symbol") == symbol).sort("date")
-        # Use data up to period_end for building the window
-        sym_df = sym_df.filter(pl.col("date") <= period_end)
-        sym_df = sym_df.drop_nulls(subset=feature_cols)
-
-        if len(sym_df) < seq_len:
-            continue
-
-        recent = sym_df.tail(seq_len)
-        features = recent.select(feature_cols).to_numpy()
-        np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        norm_features = (features - train_mean) / train_std
-
-        x = torch.tensor(norm_features, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            probs = model.predict_proba(x).squeeze(0).numpy()
-
-        prob_up = float(probs[1])
-        predictions.append({
-            "symbol": symbol,
-            "cluster_id": cluster_id,
-            "prob_up": prob_up,
-        })
-
-    return predictions
 
 
 def aggregate_predictions(config: dict) -> pl.DataFrame:
@@ -356,9 +311,10 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
 
     # Summary
     if not result_df.is_empty():
-        n_actionable = result_df.filter(pl.col("prob_up") >= 0.70).height
+        actionable_threshold = config.get("training", {}).get("actionable_threshold", 0.70)
+        n_actionable = result_df.filter(pl.col("prob_up") >= actionable_threshold).height
         mean_prob = result_df["prob_up"].mean()
-        print(f"  Actionable (prob_up >= 70%): {n_actionable} stocks")
+        print(f"  Actionable (prob_up >= {actionable_threshold:.0%}): {n_actionable} stocks")
         print(f"  Mean prob_up: {mean_prob:.2%}")
 
     return result_df
@@ -424,7 +380,8 @@ def main() -> None:
     mlflow.set_experiment("aggregation")
     with mlflow.start_run(run_name="prediction-aggregation"):
         mlflow.log_metric("total_predictions", len(result_df))
-        n_actionable = result_df.filter(pl.col("prob_up") >= 0.70).height
+        actionable_threshold = config.get("training", {}).get("actionable_threshold", 0.70)
+        n_actionable = result_df.filter(pl.col("prob_up") >= actionable_threshold).height
         mlflow.log_metric("n_actionable", n_actionable)
         mlflow.log_metric("mean_prob_up", float(result_df["prob_up"].mean()))
         output_path = config.get("aggregation", {}).get("output_parquet", "data/predictions.parquet")

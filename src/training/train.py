@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import tempfile
 
 import mlflow
@@ -26,6 +27,7 @@ from src.config import (
     get_cluster_buy_threshold,
     get_features_parquet_path,
     load_config,
+    resolve_env_value,
 )
 from src.keys import MLFLOW_TRACKING_URI
 
@@ -40,19 +42,23 @@ def _load_entry_exit_prices(
     Returns DataFrame with columns [symbol, date_entry, price_entry, date_exit, price_exit].
     """
     import datetime as dt
-    from src.db import get_engine
+    from sqlalchemy import text
+    from src.db import get_engine, in_params
 
     engine = get_engine()
-    placeholders = ", ".join(f"'{s}'" for s in symbols)
+    ph, params = in_params("s", symbols)
     buffer_days = int(horizon * 2.5)
     end_buffer = entry_date + dt.timedelta(days=buffer_days)
-    query = f"""
+    params["entry_date"] = entry_date
+    params["end_buffer"] = end_buffer
+    query = text(f"""
         SELECT date, symbol, close FROM ohlcv_daily
-        WHERE symbol IN ({placeholders})
-          AND date >= '{entry_date}' AND date <= '{end_buffer}'
+        WHERE symbol IN ({ph})
+          AND date >= :entry_date AND date <= :end_buffer
         ORDER BY symbol, date
-    """
-    prices = pl.read_database(query, engine)
+    """).bindparams(**params)
+    with engine.connect() as conn:
+        prices = pl.read_database(query, conn)
     if prices.is_empty():
         return pl.DataFrame(schema={
             "symbol": pl.Utf8, "date_entry": pl.Date, "price_entry": pl.Float64,
@@ -155,7 +161,7 @@ def _run_split_eval(
     horizon = config.get("target", {}).get("horizon", 21)
     buy_threshold = config.get("target", {}).get("buy_threshold", 0.025)
 
-    min_prob_up = 0.70
+    min_prob_up = config.get("training", {}).get("actionable_threshold", 0.70)
     n_actionable = sum(1 for p in preds if p["prob_up"] >= min_prob_up)
     n_total = len(preds)
     mean_prob = sum(p["prob_up"] for p in preds) / n_total if n_total else 0
@@ -309,8 +315,31 @@ def train_single_cluster(config: dict, cluster_id: str, global_params: dict | No
         optimize_cluster(config, cluster_id)
 
 
+def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
+    """Train a single cluster in a separate process.
+
+    Each worker gets its own MPS context and DB connection via spawn.
+
+    Returns:
+        Tuple of (cluster_id, success, error_message).
+    """
+    config, cluster_id, global_params = args
+    try:
+        train_single_cluster(config, cluster_id, global_params)
+        return (cluster_id, True, "")
+    except Exception as e:
+        import traceback
+        return (cluster_id, False, traceback.format_exc())
+    finally:
+        from src.db import dispose_engine
+        dispose_engine()
+
+
 def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
-    """Train one model per cluster.
+    """Train one model per cluster, optionally in parallel.
+
+    Uses multiprocessing with spawn context for parallel training when
+    max_workers > 1. Each worker gets its own MPS GPU context.
 
     Args:
         config: Full config dict.
@@ -321,20 +350,43 @@ def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
 
-    mode = " (using global hyperparameters)" if global_params else " (with per-cluster optimization)"
-    print(f"Found {len(cluster_ids)} clusters to train{mode}")
+    max_workers = int(resolve_env_value(
+        config.get("training", {}).get("max_workers", 1), default=1
+    ))
 
-    failed = []
-    for i, cluster_id in enumerate(cluster_ids, 1):
-        n_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id).height
-        print(f"\n[{i}/{len(cluster_ids)}] Cluster {cluster_id} ({n_symbols} symbols)")
-        try:
-            train_single_cluster(config, cluster_id, global_params)
-        except Exception as e:
-            print(f"  ERROR training {cluster_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            failed.append(cluster_id)
+    mode = " (using global hyperparameters)" if global_params else " (with per-cluster optimization)"
+    parallel_info = f", {max_workers} workers" if max_workers > 1 else ""
+    print(f"Found {len(cluster_ids)} clusters to train{mode}{parallel_info}")
+
+    if max_workers <= 1:
+        # Sequential fallback
+        failed = []
+        for i, cluster_id in enumerate(cluster_ids, 1):
+            n_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id).height
+            print(f"\n[{i}/{len(cluster_ids)}] Cluster {cluster_id} ({n_symbols} symbols)")
+            try:
+                train_single_cluster(config, cluster_id, global_params)
+            except Exception as e:
+                print(f"  ERROR training {cluster_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                failed.append(cluster_id)
+    else:
+        # Parallel training with spawn (required for MPS safety)
+        ctx = mp.get_context("spawn")
+        worker_args = [(config, cid, global_params) for cid in cluster_ids]
+
+        print(f"Starting parallel training with {max_workers} workers...")
+        failed = []
+        with ctx.Pool(processes=max_workers) as pool:
+            for cluster_id, success, error_msg in pool.imap_unordered(
+                _train_cluster_worker, worker_args
+            ):
+                if success:
+                    print(f"  ✓ {cluster_id} completed successfully")
+                else:
+                    print(f"  ✗ {cluster_id} FAILED:\n{error_msg}")
+                    failed.append(cluster_id)
 
     print(f"\nTraining complete: {len(cluster_ids) - len(failed)}/{len(cluster_ids)} clusters succeeded.")
     if failed:
