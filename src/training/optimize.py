@@ -37,6 +37,7 @@ from src.config import (
     load_config,
     resolve_env_value,
 )
+import logging
 import warnings
 
 from src.db import get_engine
@@ -44,10 +45,10 @@ from src.keys import MLFLOW_TRACKING_URI, OPTUNA_STORAGE_URL
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
 
-# Suppress noisy Lightning warnings
+# Suppress noisy Lightning warnings and tips
 warnings.filterwarnings("ignore", message=".*num_workers.*bottleneck.*")
-warnings.filterwarnings("ignore", message=".*litlogger.*")
-warnings.filterwarnings("ignore", message=".*litmodels.*")
+logging.getLogger("lightning.pytorch.trainer.connectors.logger_connector").setLevel(logging.WARNING)
+logging.getLogger("lightning.pytorch.trainer.connectors.callback_connector").setLevel(logging.WARNING)
 
 
 def _get_random_symbols(
@@ -140,12 +141,20 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
         "label_smoothing": _suggest("label_smoothing", {"low": 0.0, "high": 0.15}),
         "focal_gamma": _suggest("focal_gamma", {"low": 0.0, "high": 5.0}),
         "noise_std": _suggest("noise_std", {"low": 0.0, "high": 0.05}),
+        "optimizer_name": _suggest("optimizer_name", ["adamw", "radam", "sgd", "lion"]),
+        "scheduler_factor": _suggest("scheduler_factor", {"low": 0.2, "high": 0.8}),
+        "scheduler_patience": _suggest("scheduler_patience", {"low": 3, "high": 10}),
         # Architecture
         "hidden_size": _suggest("hidden_size", [64, 96, 128, 256]),
         "num_layers": _suggest("num_layers", {"low": 1, "high": 4}),
         "dropout": _suggest("dropout", {"low": 0.1, "high": 0.5}),
         "num_attention_heads": _suggest("num_attention_heads", [0, 2, 4]),
         "sequence_length": _suggest("sequence_length", [10, 20, 30]),
+        "bidirectional": _suggest("bidirectional", [True, False]),
+        "head_hidden_ratio": _suggest("head_hidden_ratio", {"low": 0.25, "high": 1.0}),
+        "activation": _suggest("activation", ["gelu", "silu", "mish"]),
+        "input_dropout": _suggest("input_dropout", {"low": 0.0, "high": 0.3}),
+        "gradient_clip_val": _suggest("gradient_clip_val", {"low": 0.5, "high": 5.0}),
     }
 
 
@@ -267,6 +276,13 @@ def _create_trial_objective(
             num_attention_heads=params["num_attention_heads"],
             focal_gamma=params["focal_gamma"],
             feature_names=dm.feature_cols,
+            optimizer_name=params["optimizer_name"],
+            scheduler_factor=params["scheduler_factor"],
+            scheduler_patience=params["scheduler_patience"],
+            bidirectional=params["bidirectional"],
+            head_hidden_ratio=params["head_hidden_ratio"],
+            activation=params["activation"],
+            input_dropout=params["input_dropout"],
         )
 
         # Callbacks: early stopping + Optuna pruning
@@ -278,6 +294,7 @@ def _create_trial_objective(
         pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
 
         precision = config.get("training", {}).get("precision", "32")
+        gradient_clip_val = params.get("gradient_clip_val", 1.0)
 
         trainer = L.Trainer(
             max_epochs=epochs_per_trial,
@@ -286,7 +303,7 @@ def _create_trial_objective(
             precision=precision,
             callbacks=[early_stop, pruning_callback],
             log_every_n_steps=10,
-            gradient_clip_val=1.0,
+            gradient_clip_val=gradient_clip_val,
             enable_progress_bar=False,
             enable_model_summary=False,
             logger=False,
@@ -478,6 +495,13 @@ def train_final_model(
         num_attention_heads=best_params["num_attention_heads"],
         focal_gamma=best_params["focal_gamma"],
         feature_names=dm.feature_cols,
+        optimizer_name=best_params.get("optimizer_name", "adamw"),
+        scheduler_factor=best_params.get("scheduler_factor", 0.5),
+        scheduler_patience=best_params.get("scheduler_patience", 5),
+        bidirectional=best_params.get("bidirectional", False),
+        head_hidden_ratio=best_params.get("head_hidden_ratio", 0.5),
+        activation=best_params.get("activation", "gelu"),
+        input_dropout=best_params.get("input_dropout", 0.0),
     )
 
     # MLflow logger
@@ -508,6 +532,7 @@ def train_final_model(
     )
 
     precision = config.get("training", {}).get("precision", "32")
+    gradient_clip_val = best_params.get("gradient_clip_val", 1.0)
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="mps",
@@ -516,7 +541,7 @@ def train_final_model(
         logger=mlflow_logger,
         callbacks=[early_stop, checkpoint, RichProgressBar()],
         log_every_n_steps=10,
-        gradient_clip_val=1.0,
+        gradient_clip_val=gradient_clip_val,
     )
 
     client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
@@ -775,6 +800,13 @@ def _create_global_trial_objective(
             num_attention_heads=params["num_attention_heads"],
             focal_gamma=params["focal_gamma"],
             feature_names=dm.feature_cols,
+            optimizer_name=params["optimizer_name"],
+            scheduler_factor=params["scheduler_factor"],
+            scheduler_patience=params["scheduler_patience"],
+            bidirectional=params["bidirectional"],
+            head_hidden_ratio=params["head_hidden_ratio"],
+            activation=params["activation"],
+            input_dropout=params["input_dropout"],
         )
 
         # Callbacks: early stopping + Optuna pruning
@@ -786,6 +818,7 @@ def _create_global_trial_objective(
         pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
 
         precision = config.get("training", {}).get("precision", "32")
+        gradient_clip_val = params.get("gradient_clip_val", 1.0)
         trainer = L.Trainer(
             max_epochs=epochs_per_trial,
             accelerator="mps",
@@ -793,7 +826,7 @@ def _create_global_trial_objective(
             precision=precision,
             callbacks=[early_stop, pruning_callback],
             log_every_n_steps=10,
-            gradient_clip_val=1.0,
+            gradient_clip_val=gradient_clip_val,
             enable_progress_bar=False,
             enable_model_summary=False,
             logger=False,

@@ -18,6 +18,7 @@ dependencies = [
     "scipy>=1.14",
     "optuna>=3.6",
     "optuna-integration>=3.6",
+    "lion-pytorch>=0.2.4",
 ]
 
 [project.optional-dependencies]

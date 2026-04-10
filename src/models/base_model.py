@@ -7,6 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Activation registry
+_ACTIVATIONS: dict[str, type[nn.Module]] = {
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
+    "mish": nn.Mish,
+}
+
 
 class FocalLoss(nn.Module):
     """Focal Loss for handling class imbalance.
@@ -44,20 +51,28 @@ class FocalLoss(nn.Module):
 class LSTMForecaster(L.LightningModule):
     """LSTM with self-attention for binary classification (UP/NOT_UP).
 
-    Architecture: LayerNorm → LSTM → MultiHeadAttention → Residual → MLP Head.
+    Architecture: InputDropout → LayerNorm → LSTM → MultiHeadAttention → Residual → MLP Head.
 
     Args:
         input_size: Number of input features per timestep.
         hidden_size: LSTM hidden dimension.
         num_layers: Number of stacked LSTM layers.
         num_classes: Number of output classes (2: NOT_UP=0, UP=1).
-        dropout: Dropout rate between LSTM layers.
+        dropout: Dropout rate between LSTM layers and in MLP head.
         learning_rate: Optimizer learning rate.
         weight_decay: L2 regularization strength.
         label_smoothing: Smoothing factor to prevent overconfident predictions.
         class_weights: Optional per-class weights for loss function.
         num_attention_heads: Number of attention heads (0 to disable attention).
         focal_gamma: Focal loss gamma (0 to use standard CrossEntropy).
+        feature_names: Feature names stored in checkpoint for inference reproducibility.
+        optimizer_name: Optimizer type ("adamw", "radam", "sgd").
+        scheduler_factor: ReduceLROnPlateau factor.
+        scheduler_patience: ReduceLROnPlateau patience (epochs).
+        bidirectional: Whether to use bidirectional LSTM.
+        head_hidden_ratio: MLP head hidden layer size as fraction of hidden_size.
+        activation: Activation function in MLP head ("gelu", "silu", "mish").
+        input_dropout: Dropout applied to input features before LayerNorm.
     """
 
     def __init__(
@@ -74,12 +89,21 @@ class LSTMForecaster(L.LightningModule):
         num_attention_heads: int = 4,
         focal_gamma: float = 2.0,
         feature_names: list[str] | None = None,
+        optimizer_name: str = "adamw",
+        scheduler_factor: float = 0.5,
+        scheduler_patience: int = 5,
+        bidirectional: bool = False,
+        head_hidden_ratio: float = 0.5,
+        activation: str = "gelu",
+        input_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
         self.learning_rate = learning_rate
         self.num_classes = num_classes
 
+        # Input regularization
+        self.input_drop = nn.Dropout(input_dropout) if input_dropout > 0 else nn.Identity()
         self.input_norm = nn.LayerNorm(input_size)
 
         self.lstm = nn.LSTM(
@@ -88,28 +112,35 @@ class LSTMForecaster(L.LightningModule):
             num_layers=num_layers,
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True,
+            bidirectional=bidirectional,
         )
 
-        # Projection for residual connection (input_size -> hidden_size)
-        self.residual_proj = nn.Linear(input_size, hidden_size)
+        # Effective hidden size doubles when bidirectional
+        effective_hidden = hidden_size * 2 if bidirectional else hidden_size
+
+        # Projection for residual connection (input_size -> effective_hidden)
+        self.residual_proj = nn.Linear(input_size, effective_hidden)
 
         # Multi-head self-attention over LSTM output sequence
         self.use_attention = num_attention_heads > 0
         if self.use_attention:
             self.attention = nn.MultiheadAttention(
-                embed_dim=hidden_size,
+                embed_dim=effective_hidden,
                 num_heads=num_attention_heads,
                 dropout=dropout,
                 batch_first=True,
             )
-            self.attn_norm = nn.LayerNorm(hidden_size)
+            self.attn_norm = nn.LayerNorm(effective_hidden)
 
+        # MLP classification head
+        head_hidden = max(1, int(effective_hidden * head_hidden_ratio))
+        act_cls = _ACTIVATIONS.get(activation, nn.GELU)
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
+            nn.LayerNorm(effective_hidden),
+            nn.Linear(effective_hidden, head_hidden),
+            act_cls(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, num_classes),
+            nn.Linear(head_hidden, num_classes),
         )
 
         # Loss: Focal Loss with class weights (handles imbalance)
@@ -133,10 +164,11 @@ class LSTMForecaster(L.LightningModule):
         Returns:
             Logits of shape (batch, num_classes).
         """
-        x_normed = self.input_norm(x)
+        x_normed = self.input_drop(x)
+        x_normed = self.input_norm(x_normed)
         lstm_out, _ = self.lstm(x_normed)
 
-        # Residual connection: project input to hidden_size and add to LSTM output
+        # Residual connection: project input to effective_hidden and add to LSTM output
         residual = self.residual_proj(x_normed)
         lstm_out = lstm_out + residual
 
@@ -201,13 +233,32 @@ class LSTMForecaster(L.LightningModule):
         return self._step(batch, "test")
 
     def configure_optimizers(self) -> dict:
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.hparams.get("weight_decay", 0.0),
-        )
+        optimizer_name = self.hparams.get("optimizer_name", "adamw")
+        weight_decay = self.hparams.get("weight_decay", 0.0)
+
+        if optimizer_name == "radam":
+            optimizer = torch.optim.RAdam(
+                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+            )
+        elif optimizer_name == "sgd":
+            optimizer = torch.optim.SGD(
+                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+                momentum=0.9, nesterov=True,
+            )
+        elif optimizer_name == "lion":
+            from lion_pytorch import Lion
+            optimizer = Lion(
+                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+            )
+        else:  # adamw (default)
+            optimizer = torch.optim.AdamW(
+                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+            )
+
+        factor = self.hparams.get("scheduler_factor", 0.5)
+        patience = self.hparams.get("scheduler_patience", 5)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6,
+            optimizer, mode="min", factor=factor, patience=patience, min_lr=1e-6,
         )
         return {
             "optimizer": optimizer,

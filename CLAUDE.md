@@ -306,17 +306,25 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 
 | Parameter | Type | Range/Values |
 |---|---|---|
-| hidden_size | categorical | [64, 96, 128, 256] |
-| num_layers | int | 1-4 |
-| dropout | float | 0.1-0.5 |
-| num_attention_heads | categorical | [0, 2, 4] |
-| sequence_length | categorical | [10, 20, 30] |
 | learning_rate | float (log) | 1e-4 to 1e-2 |
 | batch_size | categorical | [64, 128, 256] |
 | weight_decay | float (log) | 1e-4 to 0.1 |
 | label_smoothing | float | 0.0-0.15 |
 | focal_gamma | float | 0.0-5.0 |
 | noise_std | float | 0.0-0.05 |
+| optimizer_name | categorical | [adamw, radam, sgd, lion] |
+| scheduler_factor | float | 0.2-0.8 |
+| scheduler_patience | int | 3-10 |
+| gradient_clip_val | float | 0.5-5.0 |
+| hidden_size | categorical | [64, 96, 128, 256] |
+| num_layers | int | 1-4 |
+| dropout | float | 0.1-0.5 |
+| num_attention_heads | categorical | [0, 2, 4] |
+| sequence_length | categorical | [10, 20, 30] |
+| bidirectional | categorical | [true, false] |
+| head_hidden_ratio | float | 0.25-1.0 |
+| activation | categorical | [gelu, silu, mish] |
+| input_dropout | float | 0.0-0.3 |
 
 ## Model promotion (cascading elimination)
 

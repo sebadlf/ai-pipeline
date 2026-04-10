@@ -335,6 +335,43 @@ def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
         dispose_engine()
 
 
+def _sort_clusters_by_run_count(cluster_ids: list[str], config: dict) -> list[str]:
+    """Sort clusters by number of existing MLflow runs (fewest first).
+
+    This ensures that when training is interrupted and restarted,
+    under-trained clusters get priority.
+    """
+    try:
+        client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+        prefix = config.get("training", {}).get("cluster_experiment_prefix", "cluster")
+        run_counts: dict[str, int] = {}
+        for cid in cluster_ids:
+            experiment_name = f"{prefix}/{cid}"
+            experiment = client.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                run_counts[cid] = 0
+            else:
+                runs = client.search_runs(
+                    experiment_ids=[experiment.experiment_id],
+                    max_results=1,
+                    output_format="list",
+                )
+                # Use search_runs count as approximation; for exact count we'd
+                # need to paginate, but this is sufficient for ordering.
+                runs_all = client.search_runs(
+                    experiment_ids=[experiment.experiment_id],
+                    output_format="list",
+                )
+                run_counts[cid] = len(runs_all)
+        sorted_ids = sorted(cluster_ids, key=lambda cid: run_counts.get(cid, 0))
+        counts_str = ", ".join(f"{cid}={run_counts.get(cid, 0)}" for cid in sorted_ids)
+        print(f"  Cluster training order (by run count): {counts_str}")
+        return sorted_ids
+    except Exception:
+        # If MLflow is unavailable, fall back to alphabetical order
+        return cluster_ids
+
+
 def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
     """Train one model per cluster, optionally in parallel.
 
@@ -349,6 +386,10 @@ def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
+
+    # Order clusters by fewest MLflow runs first so interrupted pipelines
+    # don't always retrain the same clusters.
+    cluster_ids = _sort_clusters_by_run_count(cluster_ids, config)
 
     max_workers = int(resolve_env_value(
         config.get("training", {}).get("max_workers", 1), default=1

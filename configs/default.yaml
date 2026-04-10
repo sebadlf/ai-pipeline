@@ -111,17 +111,27 @@ training:
       recall_penalty: "quadratic"  # quadratic | linear
     # Search space — Optuna explores these ranges (overrides model/training defaults)
     search_space:
+      # Training hyperparams
       learning_rate: { low: 1.0e-4, high: 1.0e-2, log: true }
       batch_size: [64, 128, 256]
       weight_decay: { low: 1.0e-4, high: 0.1, log: true }
       label_smoothing: { low: 0.0, high: 0.15 }
       focal_gamma: { low: 0.0, high: 5.0 }
       noise_std: { low: 0.0, high: 0.05 }
+      optimizer_name: ["adamw", "radam", "sgd", "lion"]
+      scheduler_factor: { low: 0.2, high: 0.8 }
+      scheduler_patience: { low: 3, high: 10 }
+      gradient_clip_val: { low: 0.5, high: 5.0 }
+      # Architecture
       hidden_size: [64, 96, 128, 256]
       num_layers: { low: 1, high: 4 }
       dropout: { low: 0.1, high: 0.5 }
       num_attention_heads: [0, 2, 4]
       sequence_length: [10, 20, 30]
+      bidirectional: [true, false]
+      head_hidden_ratio: { low: 0.25, high: 1.0 }
+      activation: ["gelu", "silu", "mish"]
+      input_dropout: { low: 0.0, high: 0.3 }
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation
