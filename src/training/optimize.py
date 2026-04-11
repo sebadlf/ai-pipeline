@@ -704,8 +704,9 @@ def train_final_model(
     )
     early_stop_loss = EarlyStopping(
         monitor="val_loss",
-        patience=max(patience // 2, 5),
+        patience=patience,
         mode="min",
+        min_delta=0.005,
     )
     checkpoint = ModelCheckpoint(
         dirpath="checkpoints",
