@@ -23,22 +23,44 @@ from mlflow.tracking import MlflowClient
 
 from src.keys import MLFLOW_TRACKING_URI
 
-# Metrics logged by LSTMForecaster (train/val/test) + classification heads on val/test.
-# Direction: "min" for loss, "max" for accuracy / precision / recall.
-# Dict order matches report columns: train → val → test;
-# train has only acc + loss; val/test add precision/recall UP.
+# Metrics logged by LSTMForecaster (train/val/test) + precision_eval + optimize.py.
+# Direction: "min" for loss, "max" for accuracy / precision / recall / stability.
 REPORT_METRICS: dict[str, str] = {
+    # Training
     "train_acc": "max",
     "train_loss": "min",
+    "train_precision_up": "max",
+    "train_recall_up": "max",
+    # Validation
     "val_acc": "max",
     "val_loss": "min",
     "val_precision_up": "max",
     "val_recall_up": "max",
+    "val_mean_prob_up": "max",
+    # Test
     "test_acc": "max",
     "test_loss": "min",
     "test_precision_up": "max",
     "test_recall_up": "max",
+    "test_f1_up": "max",
+    # Promotion / walk-forward stability
+    "val_stability_score": "max",
+    "val_auc_pr": "max",
+    "val_wf_precision_mean": "max",
+    "val_wf_precision_std": "min",
+    "val_fp_severity": "min",
+    # Training dynamics
+    "stopped_epoch": "min",
+    "dataset_train_samples": "max",
 }
+
+# Params to include in detailed per-run view.
+REPORT_PARAMS: tuple[str, ...] = (
+    "early_stop_trigger",
+    "val_elimination_stage",
+    "val_passed_all_filters",
+    "optuna_trial_number",
+)
 
 # Non per-cluster-training experiments (noise for this report).
 _EXCLUDED_EXPERIMENTS = frozenset({
@@ -71,6 +93,7 @@ class ExperimentSummary:
     status_counts: dict[str, int]
     best_metrics: dict[str, float]
     latest_run: LatestRunInfo | None
+    promotion_counts: dict[str, int] | None = None
 
 
 def _ms_to_iso(ms: int | None) -> str | None:
@@ -92,6 +115,7 @@ def _summarize_experiment(
     )
     status_counts: dict[str, int] = defaultdict(int)
     best_metrics: dict[str, float] = {}
+    promotion_counts: dict[str, int] = {"passed": 0, "failed": 0}
     latest: LatestRunInfo | None = None
 
     for r in runs:
@@ -105,6 +129,14 @@ def _summarize_experiment(
             )
         if r.info.status != "FINISHED":
             continue
+
+        # Count promotion results
+        passed_str = r.data.params.get("val_passed_all_filters")
+        if passed_str == "true":
+            promotion_counts["passed"] += 1
+        elif passed_str == "false":
+            promotion_counts["failed"] += 1
+
         for key, direction in REPORT_METRICS.items():
             v = r.data.metrics.get(key)
             if v is None:
@@ -124,6 +156,7 @@ def _summarize_experiment(
         status_counts=dict(status_counts),
         best_metrics=best_metrics,
         latest_run=latest,
+        promotion_counts=promotion_counts,
     )
 
 
@@ -169,12 +202,7 @@ def build_report(
         for e in filtered
     ]
 
-    def _last_run_ms(s: ExperimentSummary) -> int:
-        if s.latest_run is None or s.latest_run.start_time_ms is None:
-            return -1
-        return s.latest_run.start_time_ms
-
-    summaries.sort(key=_last_run_ms, reverse=True)
+    summaries.sort(key=lambda s: _experiment_display_name(s.name).lower())
 
     return {
         "tracking_uri": tracking_uri,
@@ -215,6 +243,7 @@ def report_to_markdown(data: dict[str, Any]) -> str:
         v = m.get(key)
         return f"{v:.4f}" if v is not None else "—"
 
+    # -- Table 1: Training metrics --
     exp_rows: list[list[str]] = []
     for e in data["experiments"]:
         sc = e["status_counts"]
@@ -231,27 +260,24 @@ def report_to_markdown(data: dict[str, Any]) -> str:
                 _experiment_display_name(e["name"]),
                 str(e["run_count"]),
                 status_str,
-                # train: acc, loss | val/test: acc, loss, p↑, r↑
-                _fmt(bm, "train_acc"),
-                _fmt(bm, "train_loss"),
                 _fmt(bm, "val_acc"),
                 _fmt(bm, "val_loss"),
                 _fmt(bm, "val_precision_up"),
                 _fmt(bm, "val_recall_up"),
                 _fmt(bm, "test_acc"),
-                _fmt(bm, "test_loss"),
                 _fmt(bm, "test_precision_up"),
                 _fmt(bm, "test_recall_up"),
+                _fmt(bm, "test_f1_up"),
                 latest,
             ]
         )
 
-    lines.append("## Experiments")
+    lines.append("## Experiments — Training Metrics")
     lines.append("")
     lines.append(
         "Per experiment: **best** metric across all **FINISHED** runs "
         "(min loss, max accuracy / precision / recall). "
-        "Rows ordered by **most recent run** (newest first); experiments with no runs last."
+        "Rows ordered alphabetically by experiment name."
     )
     lines.append("")
     lines.append(
@@ -261,24 +287,66 @@ def report_to_markdown(data: dict[str, Any]) -> str:
                 "experiment",
                 "runs",
                 "status",
-                "tr_acc",
-                "tr_loss",
                 "val_acc",
                 "val_loss",
                 "val_p↑",
                 "val_r↑",
                 "te_acc",
-                "te_loss",
                 "te_p↑",
                 "te_r↑",
+                "te_f1↑",
                 "latest run",
             ],
         )
     )
     lines.append("")
+
+    # -- Table 2: Promotion / stability metrics --
+    promo_rows: list[list[str]] = []
+    for e in data["experiments"]:
+        bm = e["best_metrics"]
+        pc = e.get("promotion_counts", {})
+        passed = pc.get("passed", 0)
+        failed = pc.get("failed", 0)
+        total_eval = passed + failed
+        promo_rate = f"{passed}/{total_eval}" if total_eval > 0 else "—"
+        promo_rows.append(
+            [
+                _experiment_display_name(e["name"]),
+                promo_rate,
+                _fmt(bm, "val_stability_score"),
+                _fmt(bm, "val_auc_pr"),
+                _fmt(bm, "val_wf_precision_mean"),
+                _fmt(bm, "val_wf_precision_std"),
+                _fmt(bm, "val_fp_severity"),
+                _fmt(bm, "stopped_epoch"),
+                _fmt(bm, "dataset_train_samples"),
+            ]
+        )
+
+    lines.append("## Experiments — Promotion & Diagnostics")
+    lines.append("")
     lines.append(
-        "_Column order: **train** (acc, loss) → **val** / **test** (acc, loss, "
-        "precision UP, recall UP as `p↑` / `r↑`)._"
+        _markdown_table(
+            promo_rows,
+            [
+                "experiment",
+                "promoted",
+                "stability",
+                "auc_pr",
+                "wf_p_mean",
+                "wf_p_std",
+                "fp_sev",
+                "min_epoch",
+                "train_n",
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(
+        "_promoted = passed/total evaluated. stability = best val_stability_score. "
+        "wf = walk-forward precision. fp_sev = false-positive severity (lower = better). "
+        "min_epoch = earliest stopped_epoch._"
     )
     lines.append("")
 

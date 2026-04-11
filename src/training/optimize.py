@@ -245,27 +245,31 @@ def _compute_objective_value(
     model: LSTMForecaster,
     dm: TradingDataModule,
     min_recall: float,
+    metric: str = "precision_at_threshold",
+    threshold: float = 0.60,
     beta: float = 0.5,
 ) -> float:
-    """Compute F-beta score as optimization objective with quadratic recall penalty.
+    """Compute optimization objective with quadratic recall penalty.
 
-    Uses the full precision-recall curve to find the optimal threshold that
-    maximizes F-beta, allowing better calibration than a fixed 0.5 threshold.
-    Beta < 1 prioritizes precision over recall (ideal for trading where
-    false positives are costly).
+    Supports two modes:
+    - "precision_at_threshold": Precision of UP predictions at a fixed probability
+      threshold. Aligns Optuna search with deployment threshold, ensuring the model
+      learns to produce well-separated probabilities.
+    - "f_beta": F-beta score at the optimal point on the precision-recall curve.
+      Beta < 1 prioritizes precision over recall.
 
     Args:
         model: Trained model in eval mode.
         dm: DataModule with validation data.
-        min_recall: Minimum recall threshold before penalizing.
-        beta: F-beta parameter. < 1 prioritizes precision, > 1 prioritizes recall.
+        min_recall: Minimum recall before applying quadratic penalty.
+        metric: Objective type ("precision_at_threshold" or "f_beta").
+        threshold: Probability threshold for precision_at_threshold mode.
+        beta: F-beta parameter (only used when metric="f_beta").
 
     Returns:
-        F-beta score to maximize (higher is better), with quadratic penalty
+        Score to maximize (higher is better), with quadratic penalty
         applied if recall is below min_recall.
     """
-    from sklearn.metrics import precision_recall_curve
-
     model.eval()
     all_probs = []
     all_targets = []
@@ -274,18 +278,33 @@ def _compute_objective_value(
         for batch in dm.val_dataloader():
             x, y = batch
             logits = model(x)
-            probs = torch.softmax(logits, dim=-1)[:, 1]  # Probability of UP class
+            probs = torch.softmax(logits, dim=-1)[:, 1]
             all_probs.append(probs.cpu())
             all_targets.append(y.cpu())
 
     probs = torch.cat(all_probs).numpy()
     targets = torch.cat(all_targets).numpy()
 
-    # Compute precision-recall curve across all thresholds
-    precisions, recalls, _ = precision_recall_curve(targets, probs)
+    if metric == "precision_at_threshold":
+        predicted_up = probs >= threshold
+        n_predicted = int(predicted_up.sum())
+        if n_predicted == 0:
+            return 0.0
 
-    # Calculate F-beta for each point on the curve
-    # F_beta = (1 + beta^2) * (precision * recall) / (beta^2 * precision + recall)
+        tp = int((predicted_up & (targets == 1)).sum())
+        n_positive = int(targets.sum())
+        precision = tp / n_predicted
+        recall = tp / n_positive if n_positive > 0 else 0.0
+
+        if recall < min_recall:
+            penalty = (recall / min_recall) ** 2 if min_recall > 0 else 0.0
+            return float(precision * penalty)
+        return float(precision)
+
+    # f_beta mode (legacy)
+    from sklearn.metrics import precision_recall_curve
+
+    precisions, recalls, _ = precision_recall_curve(targets, probs)
     beta_sq = beta**2
     fbetas = (
         (1 + beta_sq)
@@ -294,13 +313,10 @@ def _compute_objective_value(
     )
     fbetas = np.nan_to_num(fbetas, nan=0.0)
 
-    # Find maximum F-beta and corresponding recall
     best_idx = np.argmax(fbetas)
     best_fbeta = fbetas[best_idx]
     best_recall = recalls[best_idx]
 
-    # Apply quadratic penalty if recall is below minimum threshold
-    # Quadratic penalty is more aggressive than linear for very low recall
     if best_recall < min_recall:
         penalty = (best_recall / min_recall) ** 2 if min_recall > 0 else 0.0
         return float(best_fbeta * penalty)
@@ -323,8 +339,10 @@ def _create_trial_objective(
     n_folds = optuna_cfg.get("cv_folds", 3)
     purge_days = config["training"].get("purge_days", 21)
 
-    # F-beta objective configuration
+    # Objective configuration
     obj_cfg = optuna_cfg.get("objective", {})
+    obj_metric = obj_cfg.get("metric", "precision_at_threshold")
+    obj_threshold = obj_cfg.get("threshold", 0.60)
     beta = obj_cfg.get("beta", 0.5)
 
     features_path = get_normalized_parquet_path(config)
@@ -350,6 +368,8 @@ def _create_trial_objective(
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
             return 0.0
 
+        # FocalLoss already handles class imbalance — skip class_weights to avoid double correction
+        cw = None if params["focal_gamma"] > 0 else dm.class_weights
         model = LSTMForecaster(
             input_size=dm.input_size,
             hidden_size=params["hidden_size"],
@@ -359,7 +379,7 @@ def _create_trial_objective(
             learning_rate=params["learning_rate"],
             weight_decay=params["weight_decay"],
             label_smoothing=params["label_smoothing"],
-            class_weights=dm.class_weights,
+            class_weights=cw,
             num_attention_heads=params["num_attention_heads"],
             focal_gamma=params["focal_gamma"],
             feature_names=dm.feature_cols,
@@ -407,7 +427,10 @@ def _create_trial_objective(
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
 
-        score = _compute_objective_value(model, dm, min_recall, beta)
+        score = _compute_objective_value(
+            model, dm, min_recall,
+            metric=obj_metric, threshold=obj_threshold, beta=beta,
+        )
         del model, dm
         return score
 
@@ -490,6 +513,42 @@ def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
         )
 
     return len(recent)
+
+
+def _tag_champion(run_ids: list[str], cluster_id: str) -> None:
+    """Tag the best ensemble run as 'champion' based on val_stability_score.
+
+    Compares all ensemble runs for a cluster and sets the 'champion' tag
+    on the one with the highest val_stability_score (or val_precision_up
+    as fallback). Non-champion runs are tagged as 'ensemble'.
+    """
+    if not run_ids:
+        return
+
+    client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    best_run_id = None
+    best_score = -float("inf")
+
+    for rid in run_ids:
+        run = client.get_run(rid)
+        # Prefer stability_score, fallback to precision_up
+        score = run.data.metrics.get("val_stability_score")
+        if score is None:
+            score = run.data.metrics.get("val_precision_up", 0.0)
+        if score is not None and score > best_score:
+            best_score = score
+            best_run_id = rid
+
+    for rid in run_ids:
+        if rid == best_run_id:
+            client.set_tag(rid, "champion", "true")
+            client.set_tag(rid, "role", "champion")
+        else:
+            client.set_tag(rid, "champion", "false")
+            client.set_tag(rid, "role", "ensemble")
+
+    if best_run_id:
+        print(f"\n  Champion for {cluster_id}: run {best_run_id[:8]} (score={best_score:.4f})")
 
 
 def optimize_cluster(config: dict, cluster_id: str) -> None:
@@ -599,6 +658,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
 
     # Train final models for ensemble
     fixed = optuna_cfg.get("fixed_params", {})
+    ensemble_run_ids: list[str] = []
     for rank, trial in enumerate(top_trials, 1):
         # Merge trial's tuned params with fixed params for full config
         full_params = {**trial.params}
@@ -618,7 +678,12 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         full_params["_optuna_trial_value"] = trial.value
 
         print(f"\n  Training ensemble model {rank}/{len(top_trials)} (trial #{trial.number})...")
-        train_final_model(config, cluster_id, full_params, split_dates, ensemble_rank=rank)
+        run_id = train_final_model(config, cluster_id, full_params, split_dates, ensemble_rank=rank)
+        if run_id:
+            ensemble_run_ids.append(run_id)
+
+    # Tag the best ensemble member as "champion" based on val_stability_score
+    _tag_champion(ensemble_run_ids, cluster_id)
 
 
 def train_final_model(
@@ -627,7 +692,7 @@ def train_final_model(
     best_params: dict[str, Any],
     split_dates: SplitDates,
     ensemble_rank: int = 1,
-) -> None:
+) -> str | None:
     """Train the final model with optimal hyperparameters and log to MLflow.
 
     Args:
@@ -636,6 +701,9 @@ def train_final_model(
         best_params: Best hyperparameters from Optuna.
         split_dates: Temporal split dates.
         ensemble_rank: Rank in ensemble (1=best, 2=second, 3=third).
+
+    Returns:
+        MLflow run_id of the completed run, or None if training was skipped.
     """
     train_cfg = config["training"]
     buy_thresh = get_cluster_buy_threshold(config, cluster_id)
@@ -658,9 +726,10 @@ def train_final_model(
 
     if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
         print(f"  SKIPPING {cluster_id}: insufficient data")
-        return
+        return None
 
-    # Model
+    # FocalLoss already handles class imbalance — skip class_weights to avoid double correction
+    cw = None if best_params["focal_gamma"] > 0 else dm.class_weights
     model = LSTMForecaster(
         input_size=dm.input_size,
         hidden_size=best_params["hidden_size"],
@@ -670,7 +739,7 @@ def train_final_model(
         learning_rate=best_params["learning_rate"],
         weight_decay=best_params["weight_decay"],
         label_smoothing=best_params["label_smoothing"],
-        class_weights=dm.class_weights,
+        class_weights=cw,
         num_attention_heads=best_params["num_attention_heads"],
         focal_gamma=best_params["focal_gamma"],
         feature_names=dm.feature_cols,
@@ -810,6 +879,8 @@ def train_final_model(
         _run_trade_eval(
             model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet
         )
+
+        return run_id
     except Exception as e:
         _log_exception_to_mlflow_run(client, mlflow_logger, e)
         print(f"  ERROR: {e}")
@@ -986,6 +1057,8 @@ def _create_global_trial_objective(
     patience_per_trial = int(resolve_env_value(optuna_cfg.get("patience_per_trial", 7), default=7))
     min_recall = optuna_cfg.get("min_recall_up", 0.10)
     obj_cfg = optuna_cfg.get("objective", {})
+    obj_metric = obj_cfg.get("metric", "precision_at_threshold")
+    obj_threshold = obj_cfg.get("threshold", 0.60)
     beta = obj_cfg.get("beta", 0.5)
     features_path = get_normalized_parquet_path(config)
     n_symbols_per_cluster = int(resolve_env_value(
@@ -1032,7 +1105,8 @@ def _create_global_trial_objective(
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
             return 0.0
 
-        # Model with trial architecture
+        # FocalLoss already handles class imbalance — skip class_weights to avoid double correction
+        cw = None if params["focal_gamma"] > 0 else dm.class_weights
         model = LSTMForecaster(
             input_size=dm.input_size,
             hidden_size=params["hidden_size"],
@@ -1042,7 +1116,7 @@ def _create_global_trial_objective(
             learning_rate=params["learning_rate"],
             weight_decay=params["weight_decay"],
             label_smoothing=params["label_smoothing"],
-            class_weights=dm.class_weights,
+            class_weights=cw,
             num_attention_heads=params["num_attention_heads"],
             focal_gamma=params["focal_gamma"],
             feature_names=dm.feature_cols,
@@ -1095,7 +1169,10 @@ def _create_global_trial_objective(
                 torch.mps.empty_cache()
 
         # Compute objective on validation set (top symbols only)
-        result = _compute_objective_value(model, dm, min_recall, beta)
+        result = _compute_objective_value(
+            model, dm, min_recall,
+            metric=obj_metric, threshold=obj_threshold, beta=beta,
+        )
         del model, dm
         return result
 

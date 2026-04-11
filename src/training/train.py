@@ -151,7 +151,13 @@ def _run_split_eval(
     run_id: str,
     config: dict,
 ) -> None:
-    """Evaluate and log trade metrics for a single split period."""
+    """Evaluate and log trade metrics for a single split period.
+
+    Logs two artifacts per split:
+    - {prefix}_trades.csv: Full trade list with entry/exit dates, prices,
+      predicted probability, return, and result (WIN/LOSS/FLAT).
+    - {prefix}_summary.csv: Aggregate statistics (win rate, avg return, etc.).
+    """
     from src.evaluation.backtest import load_test_prices, run_portfolio_backtest
 
     if not preds:
@@ -170,6 +176,7 @@ def _run_split_eval(
     client.log_metric(run_id, f"{prefix}_trade_n_actionable", n_actionable)
     client.log_metric(run_id, f"{prefix}_trade_n_total", n_total)
 
+    # Build trade list for actionable predictions only
     actionable = [p for p in preds if p["prob_up"] >= min_prob_up]
 
     if actionable:
@@ -178,7 +185,11 @@ def _run_split_eval(
 
         trade_rows = []
         for p in actionable:
-            row = {"symbol": p["symbol"], "cluster_id": p["cluster_id"], "prob_up": p["prob_up"]}
+            row = {
+                "symbol": p["symbol"],
+                "cluster_id": p["cluster_id"],
+                "prob_up": round(p["prob_up"], 4),
+            }
             sym_price = price_data.filter(pl.col("symbol") == p["symbol"])
             if not sym_price.is_empty():
                 entry = float(sym_price["price_entry"][0])
@@ -193,22 +204,26 @@ def _run_split_eval(
             trade_rows.append(row)
 
         trades_df = pl.DataFrame(trade_rows)
+        if "prob_up" in trades_df.columns:
+            trades_df = trades_df.sort("prob_up", descending=True)
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
             trades_df.write_csv(f.name)
             client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_trades")
 
-        summary = _build_trade_summary(trades_df)
-        if summary:
-            for key, val in summary.items():
-                safe_val = float(val) if np.isfinite(float(val)) else 0.0
-                client.log_metric(run_id, f"{prefix}_ts_{key}", safe_val)
+        if "trade_return" in trades_df.columns:
+            summary = _build_trade_summary(trades_df)
+            if summary:
+                for key, val in summary.items():
+                    safe_val = float(val) if np.isfinite(float(val)) else 0.0
+                    client.log_metric(run_id, f"{prefix}_ts_{key}", safe_val)
 
-            summary_rows = [{"metric": k, "value": v} for k, v in summary.items()]
-            summary_df = pl.DataFrame(summary_rows)
-            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
-                summary_df.write_csv(f.name)
-                client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_summary")
+                summary_rows = [{"metric": k, "value": v} for k, v in summary.items()]
+                summary_df = pl.DataFrame(summary_rows)
+                with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+                    summary_df.write_csv(f.name)
+                    client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_summary")
 
+    # Backtest on actionable predictions
     if not actionable:
         print(f"    {prefix}: no actionable predictions, skipping backtest")
         for key in ["total_return", "sharpe", "sortino", "calmar",

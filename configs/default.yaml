@@ -118,11 +118,12 @@ training:
     max_history_days:
       dev: 7                    # purge trials older than 7 days in dev
       prod: 30                  # keep 30 days of history in prod
-    # F-beta objective function configuration
+    # Objective function configuration
     objective:
-      metric: "f_beta"          # f_beta | average_precision | mcc
-      beta: 0.5                 # < 1 prioritizes precision, > 1 prioritizes recall
-      recall_penalty: "quadratic"  # quadratic | linear
+      metric: "precision_at_threshold"  # precision_at_threshold | f_beta
+      threshold: 0.60                   # probability threshold for precision_at_threshold
+      beta: 0.5                         # F-beta param (only used when metric=f_beta)
+      recall_penalty: "quadratic"       # quadratic | linear
     # Search space — Optuna explores these ranges (~10 tunable params)
     # Intentionally reduced to mitigate overtuning on small per-cluster datasets
     search_space:
@@ -130,7 +131,7 @@ training:
       learning_rate: { low: 1.0e-4, high: 1.0e-2, log: true }
       batch_size: [64, 128, 256]
       weight_decay: { low: 1.0e-4, high: 0.1, log: true }
-      label_smoothing: { low: 0.0, high: 0.15 }
+      label_smoothing: { low: 0.0, high: 0.05 }
       focal_gamma: { low: 0.0, high: 5.0 }
       # Architecture
       hidden_size: [64, 96, 128, 256]
@@ -259,12 +260,12 @@ promotion:
     thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
     primary_threshold: 0.65               # threshold for stability score and recall filters
     min_recall: 0.10                      # minimum recall at primary_threshold
-    min_signals_per_window: 5             # minimum UP predictions per walk-forward window
+    min_signals_per_window: 3             # minimum UP predictions per walk-forward window
   walk_forward:
     window_size: 63                       # 3x target horizon (trading days)
     step_size: 21                         # = target horizon (trading days)
-    max_std_ratio: 0.15                   # max precision_std / precision_mean
-    stability_penalty: 1.5                # score = mean - penalty * std
+    max_std_ratio: 0.25                   # max precision_std / precision_mean
+    stability_penalty: 1.0                # score = mean - penalty * std
   ranking:
     tiebreak_margin: 0.01                 # within this margin, tiebreak by FP severity
   # Legacy fallback (used when evaluation section is absent)

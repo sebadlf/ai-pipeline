@@ -212,6 +212,11 @@ class LSTMForecaster(L.LightningModule):
             probs = torch.softmax(logits, dim=-1)
             self.log("val_mean_prob_up", probs[:, 1].mean(), prog_bar=True)
 
+            # Calibration diagnostics: probability distribution
+            self.log("val_prob_up_std", probs[:, 1].std())
+            self.log("val_pct_above_060", (probs[:, 1] > 0.60).float().mean())
+            self.log("val_pct_above_065", (probs[:, 1] > 0.65).float().mean())
+
             # Per-class accuracy
             for cls_idx, cls_name in enumerate(["not_up", "up"]):
                 mask = y == cls_idx
