@@ -195,11 +195,7 @@ class LSTMForecaster(L.LightningModule):
         self.log(f"{stage}_loss", loss, prog_bar=True)
         self.log(f"{stage}_acc", acc, prog_bar=True)
 
-        if stage == "val":
-            probs = torch.softmax(logits, dim=-1)
-            self.log("val_mean_prob_up", probs[:, 1].mean(), prog_bar=True)
-
-            # Precision and recall for UP class (class 1)
+        if stage in ("val", "train"):
             up_preds = preds == 1
             up_targets = y == 1
             tp = (up_preds & up_targets).float().sum()
@@ -209,8 +205,12 @@ class LSTMForecaster(L.LightningModule):
             denom_rec = tp + fn
             precision_up = tp / denom_prec if denom_prec > 0 else torch.zeros(1, device=x.device).squeeze()
             recall_up = tp / denom_rec if denom_rec > 0 else torch.zeros(1, device=x.device).squeeze()
-            self.log("val_precision_up", precision_up, prog_bar=True)
-            self.log("val_recall_up", recall_up, prog_bar=True)
+            self.log(f"{stage}_precision_up", precision_up, prog_bar=(stage == "val"))
+            self.log(f"{stage}_recall_up", recall_up, prog_bar=(stage == "val"))
+
+        if stage == "val":
+            probs = torch.softmax(logits, dim=-1)
+            self.log("val_mean_prob_up", probs[:, 1].mean(), prog_bar=True)
 
             # Per-class accuracy
             for cls_idx, cls_name in enumerate(["not_up", "up"]):

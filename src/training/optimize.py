@@ -24,7 +24,7 @@ import mlflow
 import numpy as np
 import optuna
 import torch
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import MLFlowLogger
 from optuna.integration import PyTorchLightningPruningCallback
 
@@ -165,6 +165,80 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
     }
 
     return {**tuned, **fixed_defaults}
+
+
+def _trial_matches_current_config(
+    trial: optuna.trial.FrozenTrial, config: dict
+) -> bool:
+    """Check if a trial's params are compatible with the current search space.
+
+    Rejects trials that were tuned under a different config (e.g., old trials
+    where activation/bidirectional/attention were tunable rather than fixed).
+    """
+    optuna_cfg = config.get("training", {}).get("optuna", {})
+    fixed = optuna_cfg.get("fixed_params", {})
+    search_space = optuna_cfg.get("search_space", {})
+    known_params = set(search_space.keys()) | set(fixed.keys())
+
+    for key, expected_value in fixed.items():
+        if key in trial.params and trial.params[key] != expected_value:
+            return False
+
+    for key in trial.params:
+        if key not in known_params:
+            return False
+
+    return True
+
+
+def _deduplicate_trials(
+    trials: list[optuna.trial.FrozenTrial],
+    top_k: int,
+    key_params: tuple[str, ...] = (
+        "hidden_size", "num_layers", "learning_rate", "dropout", "sequence_length",
+    ),
+) -> list[optuna.trial.FrozenTrial]:
+    """Select top-K trials with meaningfully different hyperparameters.
+
+    Considers two trials "duplicate" if their key architectural params match.
+    For continuous params, uses rounding to detect near-duplicates.
+    """
+    selected: list[optuna.trial.FrozenTrial] = []
+    seen_signatures: list[dict] = []
+
+    for trial in trials:  # already sorted by value descending
+        sig = {}
+        for p in key_params:
+            val = trial.params.get(p)
+            if isinstance(val, float):
+                sig[p] = round(val, 4) if val > 0.01 else round(val, 5)
+            else:
+                sig[p] = val
+
+        is_dup = any(
+            all(sig.get(p) == prev.get(p) for p in key_params)
+            for prev in seen_signatures
+        )
+
+        if not is_dup:
+            selected.append(trial)
+            seen_signatures.append(sig)
+
+        if len(selected) >= top_k:
+            break
+
+    if len(selected) < top_k:
+        print(
+            f"  WARNING: Only {len(selected)} unique configs found "
+            f"for ensemble (wanted {top_k})"
+        )
+        for trial in trials:
+            if trial not in selected:
+                selected.append(trial)
+            if len(selected) >= top_k:
+                break
+
+    return selected
 
 
 def _compute_objective_value(
@@ -393,27 +467,29 @@ def _convergence_callback(patience: int):
 
 
 def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
-    """Remove trials older than max_history_days from the study.
+    """Report on trial age distribution in the study.
 
-    Optuna doesn't expose a delete-trial API, so we re-enqueue the recent
-    trials into a fresh study. This only applies when using persistent storage.
+    Optuna doesn't expose a delete-trial API. Incompatible trials are
+    filtered at the point of use (top-K selection) via
+    _trial_matches_current_config() instead.
 
-    Returns the number of prior trials kept for warm-starting.
+    Returns the number of recent trials (within max_history_days).
     """
     if max_history_days <= 0:
         return len(study.trials)
 
     cutoff = datetime.now() - timedelta(days=max_history_days)
-    kept = [t for t in study.trials if t.datetime_start and t.datetime_start >= cutoff]
-    purged = len(study.trials) - len(kept)
+    recent = [t for t in study.trials if t.datetime_start and t.datetime_start >= cutoff]
+    old = len(study.trials) - len(recent)
 
-    if purged > 0:
+    if old > 0:
         print(
-            f"  Optuna history: purged {purged} trials older than {max_history_days}d, "
-            f"kept {len(kept)} for warm-starting"
+            f"  Optuna history: {len(recent)} recent trials, "
+            f"{old} older than {max_history_days}d "
+            f"(incompatible configs filtered at ensemble selection)"
         )
 
-    return len(kept)
+    return len(recent)
 
 
 def optimize_cluster(config: dict, cluster_id: str) -> None:
@@ -489,14 +565,31 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         callbacks=[_convergence_callback(conv_patience)],
     )
 
-    # Get top-K completed trials for ensemble
+    # Get top-K completed trials for ensemble, filtering incompatible configs
     ensemble_k = optuna_cfg.get("ensemble_top_k", 3)
-    completed = [
+    all_completed = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
     ]
+    completed = [
+        t for t in all_completed
+        if _trial_matches_current_config(t, config)
+    ]
+    filtered_count = len(all_completed) - len(completed)
+    if filtered_count > 0:
+        print(f"  Filtered {filtered_count} trials with incompatible param config")
+
     completed.sort(key=lambda t: t.value, reverse=True)
-    top_trials = completed[:ensemble_k]
+    top_trials = _deduplicate_trials(completed, ensemble_k)
+
+    # Optuna study summary for logging
+    optuna_meta = {
+        "optuna_total_trials": len(study.trials),
+        "optuna_completed_trials": len(all_completed),
+        "optuna_compatible_trials": len(completed),
+        "optuna_filtered_trials": filtered_count,
+        "optuna_unique_ensemble_configs": len(top_trials),
+    }
 
     print(f"\n  Top-{len(top_trials)} trials:")
     for rank, trial in enumerate(top_trials, 1):
@@ -505,11 +598,11 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         print(f"    Rank {rank}: trial #{trial.number}, value={trial.value:.4f}{folds_str}")
 
     # Train final models for ensemble
+    fixed = optuna_cfg.get("fixed_params", {})
     for rank, trial in enumerate(top_trials, 1):
         # Merge trial's tuned params with fixed params for full config
-        full_params = {**suggest_hyperparams.__defaults__[0] if False else {}, **trial.params}
-        # Re-add fixed params that aren't in trial.params
-        fixed = optuna_cfg.get("fixed_params", {})
+        full_params = {**trial.params}
+        # Fixed params ALWAYS override trial params (they're fixed, not tunable)
         for key, default in [
             ("optimizer_name", "adamw"), ("scheduler_factor", 0.5),
             ("scheduler_patience", 5), ("gradient_clip_val", 2.0),
@@ -517,8 +610,12 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
             ("head_hidden_ratio", 0.5), ("activation", "gelu"),
             ("noise_std", 0.02),
         ]:
-            if key not in full_params:
-                full_params[key] = fixed.get(key, default)
+            full_params[key] = fixed.get(key, default)
+
+        # Attach Optuna metadata and trial-specific info to params
+        full_params["_optuna_meta"] = optuna_meta
+        full_params["_optuna_trial_number"] = trial.number
+        full_params["_optuna_trial_value"] = trial.value
 
         print(f"\n  Training ensemble model {rank}/{len(top_trials)} (trial #{trial.number})...")
         train_final_model(config, cluster_id, full_params, split_dates, ensemble_rank=rank)
@@ -600,10 +697,15 @@ def train_final_model(
     max_epochs = int(resolve_env_value(train_cfg["max_epochs"], default=200))
     patience = int(resolve_env_value(train_cfg["early_stopping_patience"], default=15))
 
-    early_stop = EarlyStopping(
+    early_stop_precision = EarlyStopping(
         monitor="val_precision_up",
         patience=patience,
         mode="max",
+    )
+    early_stop_loss = EarlyStopping(
+        monitor="val_loss",
+        patience=max(patience // 2, 5),
+        mode="min",
     )
     checkpoint = ModelCheckpoint(
         dirpath="checkpoints",
@@ -621,7 +723,7 @@ def train_final_model(
         devices=1,
         precision=precision,
         logger=mlflow_logger,
-        callbacks=[early_stop, checkpoint, RichProgressBar()],
+        callbacks=[early_stop_precision, early_stop_loss, checkpoint],
         log_every_n_steps=10,
         gradient_clip_val=gradient_clip_val,
     )
@@ -646,6 +748,10 @@ def train_final_model(
         run_id = mlflow_logger.run_id
 
         # Log best hyperparams + cluster info
+        optuna_meta = best_params.pop("_optuna_meta", {})
+        optuna_trial_number = best_params.pop("_optuna_trial_number", None)
+        optuna_trial_value = best_params.pop("_optuna_trial_value", None)
+
         params_to_log = {
             "cluster_id": cluster_id,
             "buy_threshold": buy_thresh,
@@ -656,6 +762,42 @@ def train_final_model(
         }
         for key, value in params_to_log.items():
             client.log_param(run_id, key, value)
+
+        # Optuna study metadata
+        if optuna_trial_number is not None:
+            client.log_param(run_id, "optuna_trial_number", optuna_trial_number)
+        if optuna_trial_value is not None:
+            client.log_metric(run_id, "optuna_trial_value", float(optuna_trial_value))
+        for mk, mv in optuna_meta.items():
+            client.log_metric(run_id, mk, mv)
+
+        # Dataset metadata — sizes and class balance per split
+        client.log_metric(run_id, "dataset_train_samples", len(dm.train_ds))
+        client.log_metric(run_id, "dataset_val_samples", len(dm.val_ds))
+        client.log_metric(run_id, "dataset_test_samples", len(dm.test_ds))
+        client.log_metric(run_id, "dataset_n_features", dm.input_size)
+        if hasattr(dm, "class_weights") and dm.class_weights is not None:
+            client.log_metric(run_id, "dataset_class_weight_up", float(dm.class_weights[1]))
+
+        # Training dynamics — early stopping reason and overfitting indicators
+        stopped_epoch = trainer.current_epoch
+        client.log_metric(run_id, "stopped_epoch", stopped_epoch)
+        client.log_metric(run_id, "max_epochs_configured", max_epochs)
+
+        best_val_loss = checkpoint.best_model_score
+        if best_val_loss is not None:
+            client.log_metric(run_id, "best_val_precision_up", float(best_val_loss))
+
+        # Detect which early stopping triggered
+        for cb in trainer.callbacks:
+            if isinstance(cb, EarlyStopping) and cb.stopped_epoch > 0:
+                client.log_param(run_id, "early_stop_trigger", cb.monitor)
+                break
+        else:
+            if stopped_epoch >= max_epochs - 1:
+                client.log_param(run_id, "early_stop_trigger", "max_epochs")
+            else:
+                client.log_param(run_id, "early_stop_trigger", "none")
 
         # Confusion matrix + precision/recall/f1
         _log_confusion_matrix(model, dm, client, run_id)
@@ -785,6 +927,18 @@ def _run_precision_eval(
             f"  Precision eval: stability_score={eval_result.stability_score:.4f}, "
             f"auc_pr={eval_result.auc_pr:.4f}, stage={eval_result.elimination_stage}"
         )
+        if not eval_result.passed_all_filters:
+            wf_n = len(eval_result.wf_precision_per_window)
+            wf_mean = eval_result.wf_precision_mean
+            wf_std = eval_result.wf_precision_std
+            cv = wf_std / wf_mean if wf_mean > 0 else float("inf")
+            recall_primary = eval_result.recall_at_primary
+            print(
+                f"  PROMOTION FAILED ({eval_result.elimination_stage}): "
+                f"wf_windows={wf_n}, mean_prec={wf_mean:.4f}, std_prec={wf_std:.4f}, "
+                f"CV={cv:.4f} (max={eval_config.max_std_ratio}), "
+                f"recall@primary={recall_primary:.4f} (min={eval_config.min_recall})"
+            )
     except Exception as e:
         print(f"  Precision evaluation failed: {e}")
 

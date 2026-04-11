@@ -72,7 +72,7 @@ training:
     prod: 128
   max_epochs:
     dev: 10
-    prod: 200
+    prod: 100
   learning_rate: 0.0005
   weight_decay: 0.05
   label_smoothing: 0.05
