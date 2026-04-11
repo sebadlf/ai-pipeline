@@ -19,10 +19,10 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 - Output: `data/clusters.parquet`, `cluster_assignments` table
 
 ### Stage 2: Model Training
-- **Optuna optimization** (`optimize.py`): Global hyperparameter search across all symbols/clusters with F-beta objective, study persistence in PostgreSQL for warm-starting
-- **Per-cluster training** (`train.py`): Trains one LSTM model per cluster using shared optimized hyperparameters, with mini-backtests for evaluation
-- Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`)
-- Model output is `prob_up` -- the probability of UP. This is the sole signal used downstream
+- **Per-cluster Optuna optimization** (`optimize.py`): Each cluster gets its own Optuna study with 3-fold time-series CV, reduced search space (~10 params), and convergence-based early stopping
+- **Ensemble training** (`train.py`): Top-3 Optuna configs per cluster are trained as full models for ensemble inference
+- Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`) with 3 runs (one per ensemble member)
+- Model output is `prob_up` -- the probability of UP, averaged across ensemble. This is the sole signal used downstream
 
 ### Stage 3: Model Promotion
 - **Cascading elimination** (`promote.py` + `precision_eval.py`): Precision-focused evaluation with walk-forward stability, minimum recall filters, and FP severity tiebreaking
@@ -30,9 +30,9 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 - Registers best model per cluster as "champion" alias in MLflow Model Registry
 
 ### Stage 4: Prediction Aggregation
-- Loads champion model checkpoints from MLflow registry
-- Validates feature consistency between model and current data (falls back to feature manifest)
-- Runs inference using training-period normalization statistics
+- Loads ensemble model checkpoints (top-3) per cluster from MLflow registry
+- Validates feature consistency between models and current data
+- Runs inference with each ensemble member, averages `prob_up` per symbol
 - Output: `data/predictions.parquet`, `predictions` table
 
 ### Stage 5: Portfolio Optimization
@@ -228,9 +228,8 @@ make normalize          # Percentile clipping + Z-score normalization
 make cluster            # KMeans clustering of stocks
 
 # Stage 2: Training
-make optimize-global    # Optuna hyperparameter optimization (all symbols)
-make train-clusters     # Train all clusters with shared hyperparameters
-make train-global       # Convenience: optimize-global + train-clusters
+make train-clusters     # Per-cluster Optuna optimization + ensemble training
+make train-global       # Alias for train-clusters
 
 # Stage 3: Promotion
 make promote            # Register best per-cluster models as champions
@@ -282,8 +281,8 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 | `training.batch_size` | 256 | 128 |
 | `training.max_epochs` | 10 | 200 |
 | `training.early_stopping_patience` | 3 | 15 |
-| `training.optuna.n_trials_global` | 10 | 10 |
 | `training.optuna.epochs_per_trial` | 5 | 30 |
+| `training.optuna.convergence_patience` | 3 | 5 |
 | `training.optuna.max_history_days` | 7 days | 30 days |
 | Clustering mode | Sector-based (fast) | Global KMeans |
 | Pipeline default | Skips ingestion | Includes ingestion |
@@ -298,19 +297,21 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 - **Feature names**: Stored in checkpoint hparams for reproducible inference
 - **Precision**: Configurable via `training.precision` — `"32"` (default) or `"16-mixed"` (MPS mixed precision, reduces memory ~40%)
 
-**Note on model/training defaults in YAML**: The values in `model` and `training` sections (hidden_size, dropout, etc.) are **fallback defaults only**. In the standard pipeline flow (`make train-global`), Optuna optimizes all architecture and training hyperparameters — the YAML defaults are never used. They exist for manual single-cluster training without Optuna.
+**Note on model/training defaults in YAML**: The values in `model` and `training` sections (hidden_size, dropout, etc.) are **fallback defaults only**. In the standard pipeline flow (`make train-clusters`), Optuna optimizes ~10 tunable hyperparameters per cluster — the YAML defaults are never used. Fixed params (optimizer, activation, etc.) are read from `training.optuna.fixed_params`.
 
 ## Optuna optimization
 
-- **Global mode** (`optimize-global`): Searches hyperparameters across all symbols/clusters in a single study
-- **Objective**: F-beta score (beta=0.5, prioritizing precision over recall)
-- **Alternative objectives**: `average_precision`, `mcc` (configurable via `training.optuna.objective.metric`)
+- **Per-cluster mode**: Each cluster gets its own Optuna study (`cluster-v2/{cluster_id}`)
+- **Objective**: Mean F-beta score across 3 time-series CV folds (beta=0.5, prioritizing precision)
 - **Recall floor**: Minimum recall of 0.15 before penalizing objective (quadratic penalty)
-- **Trials**: 10 global trials (dev and prod), 30 per-cluster trials
-- **Symbol rotation**: Each trial samples a different subset of symbols (seeded by trial number) to reduce sampling bias
-- **Pruning**: Startup period of 5 trials without pruning, then aggressive early stopping (patience=7, max 30 epochs per trial)
-- **Persistence**: Studies stored in PostgreSQL for warm-starting across runs; old trials pruned based on `max_history_days`
-- **Search space** (configurable in `training.optuna.search_space`):
+- **Trials**: 5 (dev) / 15 (prod) per cluster, with convergence-based early stopping
+- **Convergence detection**: Study stops if no improvement in 3 (dev) / 5 (prod) consecutive completed trials
+- **CV folds**: 3 expanding-window folds with purge gaps to prevent data leakage
+- **Ensemble**: Top-3 trial configs are trained as full models for ensemble inference
+- **Pruning**: Startup period without pruning, then MedianPruner on last fold
+- **Persistence**: Studies stored in PostgreSQL for warm-starting; old trials pruned by `max_history_days`
+- **Overtuning mitigations**: Reduced search space (~10 params), time-series CV, convergence stop, ensemble top-3, holdout test, noise augmentation
+- **Tunable search space** (~10 params, configurable in `training.optuna.search_space`):
 
 | Parameter | Type | Range/Values |
 |---|---|---|
@@ -319,20 +320,13 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 | weight_decay | float (log) | 1e-4 to 0.1 |
 | label_smoothing | float | 0.0-0.15 |
 | focal_gamma | float | 0.0-5.0 |
-| noise_std | float | 0.0-0.05 |
-| optimizer_name | categorical | [adamw, radam, sgd, lion] |
-| scheduler_factor | float | 0.2-0.8 |
-| scheduler_patience | int | 3-10 |
-| gradient_clip_val | float | 0.5-5.0 |
 | hidden_size | categorical | [64, 96, 128, 256] |
 | num_layers | int | 1-4 |
 | dropout | float | 0.1-0.5 |
-| num_attention_heads | categorical | [0, 2, 4] |
 | sequence_length | categorical | [10, 20, 30] |
-| bidirectional | categorical | [true, false] |
-| head_hidden_ratio | float | 0.25-1.0 |
-| activation | categorical | [gelu, silu, mish] |
 | input_dropout | float | 0.0-0.3 |
+
+- **Fixed params** (not searched, in `training.optuna.fixed_params`): optimizer_name=adamw, scheduler_factor=0.5, scheduler_patience=5, gradient_clip_val=2.0, bidirectional=false, num_attention_heads=0, head_hidden_ratio=0.5, activation=gelu, noise_std=0.02
 
 ## Model promotion (cascading elimination)
 
@@ -412,9 +406,8 @@ make pipeline-prod
 make pipeline-loop
 
 # Individual stages
-make optimize-global       # Optuna hyperparameter search
-make train-clusters        # Train all clusters
-make train-global          # Optimize + train (convenience)
+make train-clusters        # Per-cluster Optuna + ensemble training
+make train-global          # Alias for train-clusters
 
 # Generate trading signals
 make signals
@@ -428,8 +421,8 @@ uv run python -m src.features.technical
 uv run python -m src.features.selection
 uv run python -m src.features.normalize
 uv run python -m src.features.clustering
-uv run python -m src.training.optimize --global
-uv run python -m src.training.train --use-global-params
+uv run python -m src.training.train
+uv run python -m src.training.train --cluster Technology_0
 uv run python -m src.evaluation.promote
 uv run python -m src.aggregation.consolidate
 uv run python -m src.portfolio.optimizer

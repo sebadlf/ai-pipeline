@@ -47,17 +47,13 @@ cluster:
 # Stage 2: Model Training
 # =============================================================================
 
-# Option A: Global hyperparameter optimization (recommended)
-# Phase 1: Optimize once across all symbols/clusters
-optimize-global:
-	uv run python -m src.training.optimize --global
-
-# Phase 2: Train all clusters with shared hyperparameters
+# Per-cluster Optuna optimization with overtuning mitigations
+# Each cluster gets its own hyperparameters via 3-fold CV + ensemble top-3
 train-clusters:
-	uv run python -m src.training.train --use-global-params
+	uv run python -m src.training.train
 
-# Convenience: Run both optimization and training
-train-global: optimize-global train-clusters
+# Alias for backward compatibility
+train-global: train-clusters
 
 # =============================================================================
 # Stage 3: Model Promotion
@@ -107,7 +103,7 @@ pipeline:
 	else \
 		echo "No new data and clusters exist, skipping features/selection/normalization/clustering."; \
 	fi
-	$(MAKE) train-global promote aggregate portfolio backtest
+	$(MAKE) train-clusters promote aggregate portfolio backtest
 
 # Pipeline for prod - includes ingestion
 pipeline-prod:
@@ -119,7 +115,7 @@ pipeline-prod:
 	else \
 		echo "No new data and clusters exist, skipping features/selection/normalization/clustering."; \
 	fi
-	$(MAKE) train-global promote aggregate portfolio backtest
+	$(MAKE) train-clusters promote aggregate portfolio backtest
 
 # Pipeline loop (infinite, Ctrl+C to stop) - uses dev pipeline (no ingestion)
 pipeline-loop:

@@ -359,8 +359,67 @@ def promote_cluster_model(
     client.set_model_version_tag(model_name, mv.version, "promotion_reason", reason)
 
     client.set_registered_model_alias(model_name, "champion", mv.version)
+    client.set_registered_model_alias(model_name, "champion-1", mv.version)
     print(f"    PROMOTED {model_name} v{mv.version} as champion ({reason})")
+
+    # Promote ensemble members (rank 2, 3, ...) from the same optimization cycle
+    _promote_ensemble_members(client, cluster_id, run_id, model_name, experiment, prefix)
+
     return True
+
+
+def _promote_ensemble_members(
+    client: MlflowClient,
+    cluster_id: str,
+    champion_run_id: str,
+    model_name: str,
+    experiment,
+    prefix: str,
+) -> None:
+    """Promote ensemble members (rank 2+) alongside the champion.
+
+    Finds runs with ensemble_rank > 1 that were created near the champion run,
+    and registers them with champion-2, champion-3 aliases.
+    """
+    # Find the champion run's start time to locate sibling ensemble runs
+    champion_run = client.get_run(champion_run_id)
+    champion_start = champion_run.info.start_time  # milliseconds
+
+    # Search for recent runs with ensemble_rank params
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string="",
+        order_by=["attribute.end_time DESC"],
+        max_results=20,
+    )
+
+    # Find sibling ensemble runs (same optimization cycle, within 2 hours)
+    time_window_ms = 2 * 60 * 60 * 1000  # 2 hours
+    for run in runs:
+        if run.info.run_id == champion_run_id:
+            continue
+        rank_str = run.data.params.get("ensemble_rank")
+        if not rank_str or rank_str == "1":
+            continue
+        # Check if this run is from the same optimization cycle
+        if abs(run.info.start_time - champion_start) > time_window_ms:
+            continue
+
+        rank = int(rank_str)
+        # Find checkpoint artifact
+        artifacts = client.list_artifacts(run.info.run_id, "checkpoints")
+        ckpt = next((a.path for a in artifacts if a.path.endswith(".ckpt")), None)
+        if not ckpt:
+            continue
+
+        artifact_uri = f"runs:/{run.info.run_id}/{ckpt}"
+        mv = client.create_model_version(
+            name=model_name, source=artifact_uri, run_id=run.info.run_id,
+        )
+        alias = f"champion-{rank}"
+        client.set_registered_model_alias(model_name, alias, mv.version)
+        client.set_model_version_tag(model_name, mv.version, "ensemble_rank", str(rank))
+        print(f"    PROMOTED {model_name} v{mv.version} as {alias}")
 
 
 def promote_all_clusters(config: dict) -> None:

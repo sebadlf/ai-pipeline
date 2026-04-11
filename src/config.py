@@ -166,6 +166,57 @@ def compute_split_dates(config: dict, reference_date: dt.date | None = None) -> 
     )
 
 
+def compute_cv_fold_splits(
+    split_dates: SplitDates,
+    n_folds: int = 3,
+    purge_days: int = 21,
+) -> list[SplitDates]:
+    """Compute expanding-window time-series CV fold boundaries.
+
+    Divides the training period [start_date, train_end] into n_folds segments.
+    Each fold uses an expanding training window and validates on the next segment.
+    The last fold matches the original split (train up to train_end, val = original val).
+
+    Args:
+        split_dates: Original SplitDates with full train/val/test boundaries.
+        n_folds: Number of CV folds (default 3).
+        purge_days: Gap between train and val in each fold to prevent label leakage.
+
+    Returns:
+        List of SplitDates, one per fold.
+    """
+    sd = split_dates
+    total_train_days = (sd.train_end - sd.start_date).days
+    segment_days = total_train_days // n_folds
+
+    folds = []
+    for i in range(n_folds):
+        if i < n_folds - 1:
+            # Intermediate folds: train up to T_i, validate on [T_i+purge, T_{i+1}]
+            fold_train_end = sd.start_date + dt.timedelta(days=(i + 1) * segment_days)
+            fold_val_start = fold_train_end + dt.timedelta(days=purge_days)
+            fold_val_end = sd.start_date + dt.timedelta(days=(i + 2) * segment_days)
+            # Ensure val_end doesn't exceed original train_end
+            if fold_val_end > sd.train_end:
+                fold_val_end = sd.train_end
+        else:
+            # Last fold: matches the original split exactly
+            fold_train_end = sd.train_end
+            fold_val_start = sd.val_start
+            fold_val_end = sd.val_end
+
+        folds.append(SplitDates(
+            start_date=sd.start_date,
+            train_end=fold_train_end,
+            val_start=fold_val_start,
+            val_end=fold_val_end,
+            test_start=sd.test_start,
+            today=sd.today,
+        ))
+
+    return folds
+
+
 # --- New config dataclasses for 5-stage pipeline ---
 
 

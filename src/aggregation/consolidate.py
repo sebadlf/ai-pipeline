@@ -23,7 +23,7 @@ from sqlalchemy import text
 
 from src.config import ClusterConfig, compute_split_dates, get_normalized_parquet_path, get_selected_feature_names, load_config
 from src.db import get_engine
-from src.evaluation.champion import download_champion_checkpoint
+from src.evaluation.champion import download_champion_checkpoint, download_ensemble_checkpoints
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
 
@@ -246,43 +246,69 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
     all_predictions = []
     skipped_clusters = []
     feature_mismatch_count = 0
+    ensemble_k = config.get("training", {}).get("optuna", {}).get("ensemble_top_k", 3)
 
     for cluster_id in cluster_ids:
-        # Load champion model from MLflow registry; fall back to local checkpoint
-        ckpt_path: str | None = None
-        model_run_id: str | None = None
+        # Load ensemble models from MLflow registry; fall back to single champion or local
+        ensemble_paths: list[tuple] = []
         try:
-            champion_path, model_run_id = download_champion_checkpoint(cluster_id)
-            ckpt_path = str(champion_path)
-            print(f"  Loading champion for {cluster_id} (run {model_run_id[:12]})")
+            ensemble_paths = download_ensemble_checkpoints(cluster_id, ensemble_k)
+            run_ids = [rid[:12] for _, rid in ensemble_paths]
+            print(f"  Loading ensemble for {cluster_id}: {len(ensemble_paths)} models (runs {', '.join(run_ids)})")
         except FileNotFoundError:
             ckpt_path = find_best_checkpoint(cluster_id, config)
             if ckpt_path is None:
                 print(f"  WARNING: No checkpoint found for {cluster_id}, skipping")
                 continue
             print(f"  Loading local fallback for {cluster_id} from {ckpt_path}")
+            ensemble_paths = [(ckpt_path, None)]
 
-        # Validate model features before loading
-        try:
-            model = LSTMForecaster.load_from_checkpoint(ckpt_path, map_location="cpu", weights_only=False)
-            feature_cols = resolve_feature_cols(model, features_df, config)
-            print(f"    ✓ Features validated: {len(feature_cols)} features")
-        except ValueError as e:
-            if "features not in DataFrame" in str(e) or "Feature mismatch" in str(e):
-                print(f"    ✗ Feature mismatch: {e}")
-                skipped_clusters.append((cluster_id, str(e)))
-                feature_mismatch_count += 1
-                continue
-            raise
+        # Load and validate all ensemble models
+        ensemble_models: list[tuple[LSTMForecaster, str | None]] = []
+        for ckpt_path, model_run_id in ensemble_paths:
+            try:
+                model = LSTMForecaster.load_from_checkpoint(
+                    str(ckpt_path), map_location="cpu", weights_only=False,
+                )
+                resolve_feature_cols(model, features_df, config)
+                model.eval()
+                ensemble_models.append((model, model_run_id))
+            except ValueError as e:
+                if "features not in DataFrame" in str(e) or "Feature mismatch" in str(e):
+                    print(f"    ✗ Feature mismatch for ensemble member: {e}")
+                    continue
+                raise
 
-        model.eval()
+        if not ensemble_models:
+            print(f"    ✗ All ensemble models failed feature validation for {cluster_id}")
+            skipped_clusters.append((cluster_id, "all ensemble models failed validation"))
+            feature_mismatch_count += 1
+            continue
 
-        preds = run_inference_for_cluster(
-            cluster_id, model, features_df, clusters_df, config, split_dates
-        )
-        for p in preds:
-            p["model_run_id"] = model_run_id
-        all_predictions.extend(preds)
+        print(f"    ✓ {len(ensemble_models)} ensemble models validated")
+
+        # Run inference with each model and average prob_up
+        all_model_preds: list[dict[str, float]] = []
+        primary_run_id = ensemble_models[0][1]
+        for model, _ in ensemble_models:
+            preds = run_inference_for_cluster(
+                cluster_id, model, features_df, clusters_df, config, split_dates,
+            )
+            all_model_preds.append({p["symbol"]: p["prob_up"] for p in preds})
+
+        # Average predictions across ensemble
+        all_symbols: set[str] = set()
+        for mp in all_model_preds:
+            all_symbols.update(mp.keys())
+
+        for symbol in all_symbols:
+            probs = [mp[symbol] for mp in all_model_preds if symbol in mp]
+            all_predictions.append({
+                "symbol": symbol,
+                "cluster_id": cluster_id,
+                "prob_up": sum(probs) / len(probs),
+                "model_run_id": primary_run_id,
+            })
 
     if feature_mismatch_count > 0:
         print(f"\n  WARNING: {feature_mismatch_count} clusters skipped due to feature mismatches.")

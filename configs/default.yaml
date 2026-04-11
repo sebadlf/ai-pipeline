@@ -92,7 +92,7 @@ training:
   optuna:
     n_trials:
       dev: 5                    # minimal trials for pipeline validation
-      prod: 30                  # full search per cluster
+      prod: 15                  # per-cluster search with overtuning mitigation
     n_trials_global:
       dev: 10                   # minimal global search
       prod: 10                  # balanced with per-cluster training time
@@ -109,6 +109,11 @@ training:
     n_symbols_per_cluster:
       dev: 2                    # minimal for pipeline validation
       prod: 3                   # ~33 symbols total, good representativity/speed balance
+    convergence_patience:
+      dev: 3                    # stop study if no improvement in N trials
+      prod: 5
+    cv_folds: 3                 # time-series CV folds per trial (overtuning mitigation)
+    ensemble_top_k: 3           # train top-K configs for ensemble inference
     persist: true               # always persist studies in PostgreSQL for warm-starting
     max_history_days:
       dev: 7                    # purge trials older than 7 days in dev
@@ -118,7 +123,8 @@ training:
       metric: "f_beta"          # f_beta | average_precision | mcc
       beta: 0.5                 # < 1 prioritizes precision, > 1 prioritizes recall
       recall_penalty: "quadratic"  # quadratic | linear
-    # Search space — Optuna explores these ranges (overrides model/training defaults)
+    # Search space — Optuna explores these ranges (~10 tunable params)
+    # Intentionally reduced to mitigate overtuning on small per-cluster datasets
     search_space:
       # Training hyperparams
       learning_rate: { low: 1.0e-4, high: 1.0e-2, log: true }
@@ -126,21 +132,24 @@ training:
       weight_decay: { low: 1.0e-4, high: 0.1, log: true }
       label_smoothing: { low: 0.0, high: 0.15 }
       focal_gamma: { low: 0.0, high: 5.0 }
-      noise_std: { low: 0.0, high: 0.05 }
-      optimizer_name: ["adamw", "radam", "sgd", "lion"]
-      scheduler_factor: { low: 0.2, high: 0.8 }
-      scheduler_patience: { low: 3, high: 10 }
-      gradient_clip_val: { low: 0.5, high: 5.0 }
       # Architecture
       hidden_size: [64, 96, 128, 256]
       num_layers: { low: 1, high: 4 }
       dropout: { low: 0.1, high: 0.5 }
-      num_attention_heads: [0, 2, 4]
       sequence_length: [10, 20, 30]
-      bidirectional: [true, false]
-      head_hidden_ratio: { low: 0.25, high: 1.0 }
-      activation: ["gelu", "silu", "mish"]
       input_dropout: { low: 0.0, high: 0.3 }
+    # Fixed params — sensible defaults not searched by Optuna
+    # Reduces search space dimensionality to prevent overtuning
+    fixed_params:
+      optimizer_name: "adamw"
+      scheduler_factor: 0.5
+      scheduler_patience: 5
+      gradient_clip_val: 2.0
+      bidirectional: false
+      num_attention_heads: 0
+      head_hidden_ratio: 0.5
+      activation: "gelu"
+      noise_std: 0.02
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation

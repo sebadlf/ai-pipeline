@@ -31,6 +31,7 @@ from optuna.integration import PyTorchLightningPruningCallback
 from src.config import (
     ClusterConfig,
     SplitDates,
+    compute_cv_fold_splits,
     compute_split_dates,
     get_cluster_buy_threshold,
     get_normalized_parquet_path,
@@ -112,15 +113,18 @@ def _log_exception_to_mlflow_run(
 def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
     """Define the Optuna search space from config.
 
-    Reads ranges from config["training"]["optuna"]["search_space"].
-    Each key maps to either:
-      - a list (categorical): trial.suggest_categorical
-      - a dict with {low, high} (range): trial.suggest_float or suggest_int
-        - optional "log": true for log-uniform sampling
+    Reads tunable ranges from config["training"]["optuna"]["search_space"]
+    and fixed defaults from config["training"]["optuna"]["fixed_params"].
 
-    Returns a dict with all suggested hyperparameters for this trial.
+    The search space is intentionally reduced (~10 params) to mitigate
+    overtuning on small per-cluster datasets. Fixed params use sensible
+    defaults that don't need per-cluster optimization.
+
+    Returns a dict with all hyperparameters (tuned + fixed) for this trial.
     """
-    ss = config.get("training", {}).get("optuna", {}).get("search_space", {})
+    optuna_cfg = config.get("training", {}).get("optuna", {})
+    ss = optuna_cfg.get("search_space", {})
+    fixed = optuna_cfg.get("fixed_params", {})
 
     def _suggest(name: str, fallback):
         spec = ss.get(name, fallback)
@@ -133,29 +137,34 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
             return trial.suggest_float(name, float(low), float(high), log=spec.get("log", False))
         return spec
 
-    return {
-        # Training hyperparams
+    # Tunable params (~10) — optimized per cluster
+    tuned = {
         "learning_rate": _suggest("learning_rate", {"low": 1e-4, "high": 1e-2, "log": True}),
         "batch_size": _suggest("batch_size", [64, 128, 256]),
         "weight_decay": _suggest("weight_decay", {"low": 1e-4, "high": 0.1, "log": True}),
         "label_smoothing": _suggest("label_smoothing", {"low": 0.0, "high": 0.15}),
         "focal_gamma": _suggest("focal_gamma", {"low": 0.0, "high": 5.0}),
-        "noise_std": _suggest("noise_std", {"low": 0.0, "high": 0.05}),
-        "optimizer_name": _suggest("optimizer_name", ["adamw", "radam", "sgd", "lion"]),
-        "scheduler_factor": _suggest("scheduler_factor", {"low": 0.2, "high": 0.8}),
-        "scheduler_patience": _suggest("scheduler_patience", {"low": 3, "high": 10}),
-        # Architecture
         "hidden_size": _suggest("hidden_size", [64, 96, 128, 256]),
         "num_layers": _suggest("num_layers", {"low": 1, "high": 4}),
         "dropout": _suggest("dropout", {"low": 0.1, "high": 0.5}),
-        "num_attention_heads": _suggest("num_attention_heads", [0, 2, 4]),
         "sequence_length": _suggest("sequence_length", [10, 20, 30]),
-        "bidirectional": _suggest("bidirectional", [True, False]),
-        "head_hidden_ratio": _suggest("head_hidden_ratio", {"low": 0.25, "high": 1.0}),
-        "activation": _suggest("activation", ["gelu", "silu", "mish"]),
         "input_dropout": _suggest("input_dropout", {"low": 0.0, "high": 0.3}),
-        "gradient_clip_val": _suggest("gradient_clip_val", {"low": 0.5, "high": 5.0}),
     }
+
+    # Fixed params (~9) — sensible defaults, not searched
+    fixed_defaults = {
+        "optimizer_name": fixed.get("optimizer_name", "adamw"),
+        "scheduler_factor": fixed.get("scheduler_factor", 0.5),
+        "scheduler_patience": fixed.get("scheduler_patience", 5),
+        "gradient_clip_val": fixed.get("gradient_clip_val", 2.0),
+        "bidirectional": fixed.get("bidirectional", False),
+        "num_attention_heads": fixed.get("num_attention_heads", 0),
+        "head_hidden_ratio": fixed.get("head_hidden_ratio", 0.5),
+        "activation": fixed.get("activation", "gelu"),
+        "noise_std": fixed.get("noise_std", 0.02),
+    }
+
+    return {**tuned, **fixed_defaults}
 
 
 def _compute_objective_value(
@@ -237,6 +246,8 @@ def _create_trial_objective(
     epochs_per_trial = int(resolve_env_value(optuna_cfg.get("epochs_per_trial", 30), default=30))
     patience_per_trial = int(resolve_env_value(optuna_cfg.get("patience_per_trial", 7), default=7))
     min_recall = optuna_cfg.get("min_recall_up", 0.10)
+    n_folds = optuna_cfg.get("cv_folds", 3)
+    purge_days = config["training"].get("purge_days", 21)
 
     # F-beta objective configuration
     obj_cfg = optuna_cfg.get("objective", {})
@@ -244,15 +255,18 @@ def _create_trial_objective(
 
     features_path = get_normalized_parquet_path(config)
 
-    def objective(trial: optuna.Trial) -> float:
-        params = suggest_hyperparams(trial, config)
+    # Pre-compute CV fold splits
+    fold_splits = compute_cv_fold_splits(split_dates, n_folds, purge_days)
 
-        # DataModule with trial hyperparams
+    def _train_fold(
+        params: dict, fold_sd: SplitDates, fold_idx: int, trial: optuna.Trial,
+    ) -> float:
+        """Train and evaluate a single CV fold. Returns F-beta score."""
         dm = TradingDataModule(
             parquet_path=features_path,
             seq_len=params["sequence_length"],
             batch_size=params["batch_size"],
-            split_dates=split_dates,
+            split_dates=fold_sd,
             cluster_id=cluster_id,
             clusters_parquet=cluster_cfg.output_parquet,
             noise_std=params["noise_std"],
@@ -262,7 +276,6 @@ def _create_trial_objective(
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
             return 0.0
 
-        # Model with trial architecture
         model = LSTMForecaster(
             input_size=dm.input_size,
             hidden_size=params["hidden_size"],
@@ -285,13 +298,13 @@ def _create_trial_objective(
             input_dropout=params["input_dropout"],
         )
 
-        # Callbacks: early stopping + Optuna pruning
         early_stop = EarlyStopping(
-            monitor="val_loss",
-            patience=patience_per_trial,
-            mode="min",
+            monitor="val_loss", patience=patience_per_trial, mode="min",
         )
-        pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
+        # Only add pruning callback on last fold to avoid premature pruning
+        callbacks = [early_stop]
+        if fold_idx == len(fold_splits) - 1:
+            callbacks.append(PyTorchLightningPruningCallback(trial, monitor="val_loss"))
 
         precision = config.get("training", {}).get("precision", "32")
         gradient_clip_val = params.get("gradient_clip_val", 1.0)
@@ -301,7 +314,7 @@ def _create_trial_objective(
             accelerator="mps",
             devices=1,
             precision=precision,
-            callbacks=[early_stop, pruning_callback],
+            callbacks=callbacks,
             log_every_n_steps=10,
             gradient_clip_val=gradient_clip_val,
             enable_progress_bar=False,
@@ -313,22 +326,36 @@ def _create_trial_objective(
             trainer.fit(model, dm)
         except optuna.exceptions.TrialPruned:
             raise
-        except Exception as e:
-            print(f"    Trial {trial.number} failed: {e}")
-            import traceback
-
-            traceback.print_exc()
+        except Exception:
             return 0.0
         finally:
-            # Clean up MPS memory between trials to prevent fragmentation
             del trainer
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
 
-        # Compute objective on validation set
-        result = _compute_objective_value(model, dm, min_recall, beta)
+        score = _compute_objective_value(model, dm, min_recall, beta)
         del model, dm
-        return result
+        return score
+
+    def objective(trial: optuna.Trial) -> float:
+        params = suggest_hyperparams(trial, config)
+
+        # Evaluate on each CV fold, report mean F-beta
+        fold_scores = []
+        for fold_idx, fold_sd in enumerate(fold_splits):
+            try:
+                score = _train_fold(params, fold_sd, fold_idx, trial)
+                fold_scores.append(score)
+            except optuna.exceptions.TrialPruned:
+                raise
+            except Exception as e:
+                print(f"    Trial {trial.number} fold {fold_idx+1} failed: {e}")
+                fold_scores.append(0.0)
+
+        mean_score = float(np.mean(fold_scores)) if fold_scores else 0.0
+        trial.set_user_attr("fold_scores", fold_scores)
+        print(f"    Trial {trial.number}: folds={[f'{s:.4f}' for s in fold_scores]}, mean={mean_score:.4f}")
+        return mean_score
 
     return objective
 
@@ -338,6 +365,31 @@ def _get_optuna_storage(optuna_cfg: dict) -> str | None:
     if not optuna_cfg.get("persist", False):
         return None
     return OPTUNA_STORAGE_URL
+
+
+def _convergence_callback(patience: int):
+    """Create an Optuna callback that stops the study when no improvement is found.
+
+    Args:
+        patience: Number of consecutive completed trials without improvement
+                  before stopping the study.
+
+    Returns:
+        Callback function for study.optimize().
+    """
+    def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if len(completed) < patience:
+            return
+        best_value = study.best_value
+        recent = completed[-patience:]
+        if all(t.value <= best_value for t in recent) and recent[-1].number != study.best_trial.number:
+            print(f"  Convergence: no improvement in {patience} trials, stopping study.")
+            study.stop()
+    return callback
 
 
 def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
@@ -378,8 +430,9 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     buy_thresh = get_cluster_buy_threshold(config, cluster_id)
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     optuna_cfg = config["training"].get("optuna", {})
-    n_trials = int(resolve_env_value(optuna_cfg.get("n_trials", 30), default=30))
+    n_trials = int(resolve_env_value(optuna_cfg.get("n_trials", 15), default=15))
     startup_trials = int(resolve_env_value(optuna_cfg.get("startup_trials", 5), default=5))
+    conv_patience = int(resolve_env_value(optuna_cfg.get("convergence_patience", 5), default=5))
     max_history_days = int(
         resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
     )
@@ -390,7 +443,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     print("Temporal splits:")
     print(split_dates.summary())
     print(f"  Threshold — UP: +{buy_thresh:.1%}")
-    print(f"  Optuna — {n_trials} trials, {startup_trials} startup")
+    print(f"  Optuna — {n_trials} trials, {startup_trials} startup, convergence patience {conv_patience}")
 
     # Storage: PostgreSQL (persistent) or None (in-memory)
     storage = _get_optuna_storage(optuna_cfg)
@@ -401,10 +454,10 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     else:
         print("  Optuna storage: in-memory (no persistence)")
 
-    # Create or load existing study
+    # Create or load existing study (v2 = per-cluster with CV + ensemble)
     study = optuna.create_study(
         direction="maximize",
-        study_name=f"cluster/{cluster_id}",
+        study_name=f"cluster-v2/{cluster_id}",
         storage=storage,
         load_if_exists=True,
         pruner=optuna.pruners.MedianPruner(
@@ -419,7 +472,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         kept = _purge_old_trials(study, max_history_days)
         print(f"  Warm-starting with {kept} prior trials")
 
-    # Run optimization with progress feedback
+    # Run optimization with progress feedback and convergence detection
     objective_fn = _create_trial_objective(
         config,
         cluster_id,
@@ -433,15 +486,42 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         n_trials=n_trials,
         n_jobs=1,
         show_progress_bar=True,
+        callbacks=[_convergence_callback(conv_patience)],
     )
 
-    # Report best trial
-    best = study.best_trial
-    print(f"\n  Best trial #{best.number}: value={best.value:.4f}")
-    print(f"  Best params: {best.params}")
+    # Get top-K completed trials for ensemble
+    ensemble_k = optuna_cfg.get("ensemble_top_k", 3)
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+    completed.sort(key=lambda t: t.value, reverse=True)
+    top_trials = completed[:ensemble_k]
 
-    # Train final model with best hyperparams
-    train_final_model(config, cluster_id, best.params, split_dates)
+    print(f"\n  Top-{len(top_trials)} trials:")
+    for rank, trial in enumerate(top_trials, 1):
+        fold_scores = trial.user_attrs.get("fold_scores", [])
+        folds_str = f" folds={[f'{s:.4f}' for s in fold_scores]}" if fold_scores else ""
+        print(f"    Rank {rank}: trial #{trial.number}, value={trial.value:.4f}{folds_str}")
+
+    # Train final models for ensemble
+    for rank, trial in enumerate(top_trials, 1):
+        # Merge trial's tuned params with fixed params for full config
+        full_params = {**suggest_hyperparams.__defaults__[0] if False else {}, **trial.params}
+        # Re-add fixed params that aren't in trial.params
+        fixed = optuna_cfg.get("fixed_params", {})
+        for key, default in [
+            ("optimizer_name", "adamw"), ("scheduler_factor", 0.5),
+            ("scheduler_patience", 5), ("gradient_clip_val", 2.0),
+            ("bidirectional", False), ("num_attention_heads", 0),
+            ("head_hidden_ratio", 0.5), ("activation", "gelu"),
+            ("noise_std", 0.02),
+        ]:
+            if key not in full_params:
+                full_params[key] = fixed.get(key, default)
+
+        print(f"\n  Training ensemble model {rank}/{len(top_trials)} (trial #{trial.number})...")
+        train_final_model(config, cluster_id, full_params, split_dates, ensemble_rank=rank)
 
 
 def train_final_model(
@@ -449,6 +529,7 @@ def train_final_model(
     cluster_id: str,
     best_params: dict[str, Any],
     split_dates: SplitDates,
+    ensemble_rank: int = 1,
 ) -> None:
     """Train the final model with optimal hyperparameters and log to MLflow.
 
@@ -457,6 +538,7 @@ def train_final_model(
         cluster_id: Cluster identifier.
         best_params: Best hyperparameters from Optuna.
         split_dates: Temporal split dates.
+        ensemble_rank: Rank in ensemble (1=best, 2=second, 3=third).
     """
     train_cfg = config["training"]
     buy_thresh = get_cluster_buy_threshold(config, cluster_id)
@@ -528,7 +610,7 @@ def train_final_model(
         monitor="val_precision_up",
         mode="max",
         save_top_k=1,
-        filename=f"{cluster_id}-best-{{epoch}}-{{val_precision_up:.4f}}",
+        filename=f"{cluster_id}-ensemble-{ensemble_rank}-best-{{epoch}}-{{val_precision_up:.4f}}",
     )
 
     precision = config.get("training", {}).get("precision", "32")
@@ -568,7 +650,8 @@ def train_final_model(
             "cluster_id": cluster_id,
             "buy_threshold": buy_thresh,
             "num_classes": 2,
-            "optuna_n_trials": config["training"].get("optuna", {}).get("n_trials", 30),
+            "ensemble_rank": ensemble_rank,
+            "optuna_n_trials": config["training"].get("optuna", {}).get("n_trials", 15),
             **{f"optuna_{k}": v for k, v in best_params.items()},
         }
         for key, value in params_to_log.items():

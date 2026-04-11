@@ -293,26 +293,18 @@ def _evaluate_cluster_trades(
         )
 
 
-def train_single_cluster(config: dict, cluster_id: str, global_params: dict | None = None) -> None:
-    """Train a model for a single cluster using Optuna optimization or global params.
+def train_single_cluster(config: dict, cluster_id: str) -> None:
+    """Train a model for a single cluster using per-cluster Optuna optimization.
+
+    Runs Optuna with time-series CV, then trains top-K ensemble models.
 
     Args:
         config: Full config dict.
         cluster_id: Cluster identifier (e.g. "Technology_0").
-        global_params: Optional pre-computed hyperparameters from global optimization.
-                      If provided, skips Optuna and trains directly with these params.
     """
-    from src.training.optimize import optimize_cluster, train_final_model
-    from src.config import compute_split_dates
+    from src.training.optimize import optimize_cluster
 
-    if global_params is not None:
-        # Use pre-computed global hyperparameters
-        print(f"Using global hyperparameters for {cluster_id}")
-        split_dates = compute_split_dates(config)
-        train_final_model(config, cluster_id, global_params, split_dates)
-    else:
-        # Run per-cluster optimization
-        optimize_cluster(config, cluster_id)
+    optimize_cluster(config, cluster_id)
 
 
 def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
@@ -323,9 +315,9 @@ def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
     Returns:
         Tuple of (cluster_id, success, error_message).
     """
-    config, cluster_id, global_params = args
+    config, cluster_id = args
     try:
-        train_single_cluster(config, cluster_id, global_params)
+        train_single_cluster(config, cluster_id)
         return (cluster_id, True, "")
     except Exception as e:
         import traceback
@@ -372,16 +364,14 @@ def _sort_clusters_by_run_count(cluster_ids: list[str], config: dict) -> list[st
         return cluster_ids
 
 
-def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
-    """Train one model per cluster, optionally in parallel.
+def train_all_clusters(config: dict) -> None:
+    """Train one model per cluster with per-cluster Optuna optimization.
 
     Uses multiprocessing with spawn context for parallel training when
     max_workers > 1. Each worker gets its own MPS GPU context.
 
     Args:
         config: Full config dict.
-        global_params: Optional pre-computed hyperparameters from global optimization.
-                      If provided, all clusters use these params.
     """
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
@@ -395,9 +385,8 @@ def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
         config.get("training", {}).get("max_workers", 1), default=1
     ))
 
-    mode = " (using global hyperparameters)" if global_params else " (with per-cluster optimization)"
     parallel_info = f", {max_workers} workers" if max_workers > 1 else ""
-    print(f"Found {len(cluster_ids)} clusters to train{mode}{parallel_info}")
+    print(f"Found {len(cluster_ids)} clusters to train (per-cluster optimization){parallel_info}")
 
     if max_workers <= 1:
         # Sequential fallback
@@ -406,7 +395,7 @@ def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
             n_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id).height
             print(f"\n[{i}/{len(cluster_ids)}] Cluster {cluster_id} ({n_symbols} symbols)")
             try:
-                train_single_cluster(config, cluster_id, global_params)
+                train_single_cluster(config, cluster_id)
             except Exception as e:
                 print(f"  ERROR training {cluster_id}: {e}")
                 import traceback
@@ -415,7 +404,7 @@ def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
     else:
         # Parallel training with spawn (required for MPS safety)
         ctx = mp.get_context("spawn")
-        worker_args = [(config, cid, global_params) for cid in cluster_ids]
+        worker_args = [(config, cid) for cid in cluster_ids]
 
         print(f"Starting parallel training with {max_workers} workers...")
         failed = []
@@ -435,30 +424,25 @@ def train_all_clusters(config: dict, global_params: dict | None = None) -> None:
 
 
 def main() -> None:
-    """Entry point for training."""
-    parser = argparse.ArgumentParser(description="Train trading model")
+    """Entry point for per-cluster training with Optuna optimization."""
+    parser = argparse.ArgumentParser(description="Train trading models per cluster")
     parser.add_argument("--config", default=None, help="Path to config YAML")
     parser.add_argument("--cluster", default=None, help="Train a single cluster ID")
-    parser.add_argument("--use-global-params", action="store_true",
-                        help="Use pre-computed global hyperparameters from optimize-global")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
-    # Load global hyperparameters if requested
-    global_params = None
-    if args.use_global_params:
-        from src.training.optimize import load_global_best_params
-        global_params = load_global_best_params()
-        if global_params is None:
-            print("ERROR: No global hyperparameters found. Run 'make optimize-global' first.")
-            return
-        print(f"Loaded global hyperparameters: {global_params}")
+    # Deprecation warning for old global params workflow
+    from pathlib import Path
+    if Path("data/best_hyperparameters.json").exists():
+        print("NOTE: data/best_hyperparameters.json found from old global optimization.")
+        print("  This file is no longer used. Per-cluster optimization is now the default.")
+        print("  You can safely delete it.\n")
 
     if args.cluster:
-        train_single_cluster(config, args.cluster, global_params)
+        train_single_cluster(config, args.cluster)
     else:
-        train_all_clusters(config, global_params)
+        train_all_clusters(config)
 
 
 if __name__ == "__main__":

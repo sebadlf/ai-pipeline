@@ -68,3 +68,61 @@ def download_champion_checkpoint(
         local_path = ckpts[0]
 
     return local_path, mv.run_id
+
+
+def download_ensemble_checkpoints(
+    cluster_id: str,
+    ensemble_k: int = 3,
+    tracking_uri: str = MLFLOW_TRACKING_URI,
+) -> list[tuple[Path, str]]:
+    """Download top-K ensemble checkpoints for a cluster from MLflow registry.
+
+    Tries aliases champion-1, champion-2, ..., champion-K. Falls back to
+    single "champion" alias for backward compatibility with pre-ensemble models.
+
+    Args:
+        cluster_id: Cluster identifier.
+        ensemble_k: Maximum ensemble members to download.
+        tracking_uri: MLflow tracking URI.
+
+    Returns:
+        List of (local_path, run_id) tuples. At least 1 entry if any champion exists.
+
+    Raises:
+        FileNotFoundError: If no champion model is registered for this cluster.
+    """
+    mlflow.set_tracking_uri(tracking_uri)
+    client = MlflowClient(tracking_uri=tracking_uri)
+    model_name = f"{MODEL_NAME_PREFIX}-{cluster_id}"
+
+    results = []
+    for rank in range(1, ensemble_k + 1):
+        alias = f"champion-{rank}"
+        try:
+            mv = client.get_model_version_by_alias(model_name, alias)
+            local_dir = mlflow.artifacts.download_artifacts(
+                artifact_uri=mv.source, tracking_uri=tracking_uri,
+            )
+            local_path = Path(local_dir)
+            if local_path.is_dir():
+                ckpts = list(local_path.glob("*.ckpt")) or list(local_path.rglob("*.ckpt"))
+                if not ckpts:
+                    continue
+                local_path = ckpts[0]
+            results.append((local_path, mv.run_id))
+        except mlflow.exceptions.MlflowException:
+            if rank == 1:
+                # Fallback: try plain "champion" alias (pre-ensemble models)
+                try:
+                    path, run_id = download_champion_checkpoint(cluster_id, tracking_uri)
+                    results.append((path, run_id))
+                except FileNotFoundError:
+                    pass
+            break  # stop if champion-N doesn't exist
+
+    if not results:
+        raise FileNotFoundError(
+            f"No champion model for {model_name}. Run `make promote` after training."
+        )
+
+    return results
