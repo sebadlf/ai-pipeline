@@ -19,6 +19,7 @@ import torch
 from src.aggregation.consolidate import resolve_feature_cols
 from src.config import ClusterConfig, compute_split_dates, load_config
 from src.evaluation.champion import download_champion_checkpoint
+from src.features.normalize import apply_normalization_to_array, load_normalization_stats
 from src.features.technical import build_features, fill_nulls, load_ohlcv
 from src.models.base_model import LSTMForecaster
 
@@ -90,9 +91,16 @@ def generate_signals(
         else:
             print(f"  WARNING: No model found for {cid}")
 
-    # Resolve features and normalization per cluster (cached)
+    # Load normalization stats (shared across all clusters)
+    try:
+        norm_stats = load_normalization_stats(config)
+        print(f"  Loaded normalization stats ({norm_stats['n_features']} features)")
+    except FileNotFoundError:
+        print("  WARNING: No normalization stats found. Run `make normalize` first.")
+        norm_stats = None
+
+    # Resolve feature columns per cluster
     cluster_feature_cols: dict[str, list[str]] = {}
-    cluster_norm: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     feature_mismatch_clusters = []
     for cid, model in models.items():
         try:
@@ -104,18 +112,6 @@ def generate_signals(
                 continue
             raise
         cluster_feature_cols[cid] = fcols
-        cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cid)["symbol"].to_list()
-        train_df = df.filter(
-            (pl.col("date") < train_end) & pl.col("symbol").is_in(cluster_symbols)
-        ).drop_nulls(subset=fcols)
-        if train_df.is_empty():
-            continue
-        train_matrix = train_df.select(fcols).to_numpy()
-        np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        mean = train_matrix.mean(axis=0)
-        std = train_matrix.std(axis=0)
-        std[std == 0] = 1.0
-        cluster_norm[cid] = (mean, std)
 
     if feature_mismatch_clusters:
         print(f"\n  WARNING: {len(feature_mismatch_clusters)} clusters skipped due to feature mismatch: {', '.join(feature_mismatch_clusters)}")
@@ -131,13 +127,12 @@ def generate_signals(
             continue
 
         cluster_id = sym_cluster["cluster_id"][0]
-        if cluster_id not in models or cluster_id not in cluster_norm:
+        if cluster_id not in models or cluster_id not in cluster_feature_cols:
             print(f"  {symbol}: no model for cluster {cluster_id}")
             continue
 
         model = models[cluster_id]
         feature_cols = cluster_feature_cols[cluster_id]
-        train_mean, train_std = cluster_norm[cluster_id]
         sym_df = df.filter(pl.col("symbol") == symbol).sort("date")
 
         if len(sym_df) < seq_len:
@@ -146,8 +141,10 @@ def generate_signals(
 
         recent = sym_df.tail(seq_len)
         features = recent.select(feature_cols).to_numpy()
-        np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        features = (features - train_mean) / train_std
+        if norm_stats is not None:
+            features = apply_normalization_to_array(features, feature_cols, norm_stats)
+        else:
+            np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
         x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():

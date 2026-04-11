@@ -10,6 +10,7 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 - **Ingestion** (`fmp_loader.py`): FMP API -> PostgreSQL (OHLCV, adj close, treasury 12 tenors, VIX, key metrics, financial ratios, sector performance, GICS sectors)
 - **Feature Engineering** (`technical.py`): Polars-based computation of technical indicators + macro + fundamentals + sector features -> `data/features.parquet`
 - **Feature Selection** (`selection.py`): Filters by null rate (>90%), variance (bottom 1%), correlation (>0.95), and mutual information -> `data/features_selected.parquet` + `data/selected_features.json` manifest
+- **Normalization** (`normalize.py`): Computes training-set statistics (mean, std, p01, p99), clips outliers to [p01, p99], applies Z-score normalization -> `data/features_normalized.parquet` + `data/normalization_stats.json`
 
 ### Stage 1: Stock Clustering
 - Global KMeans clustering (prod) or sector-based clustering (dev) using behavioral, fundamental, and macro-sensitivity features
@@ -77,6 +78,7 @@ Output: portfolio allocations with optimized weights (`data/portfolios.parquet`)
 - Data ingestion scripts: FMP API -> PostgreSQL
 - Feature engineering with Polars
 - Feature selection (null filter, variance filter, correlation filter, mutual information)
+- Feature normalization (percentile clipping + Z-score with persistent training-set statistics)
 - Stock clustering with scikit-learn (KMeans with PCA)
 - Optuna hyperparameter optimization (persisted to PostgreSQL)
 - Model training with PyTorch Lightning (`accelerator="mps"`)
@@ -136,6 +138,7 @@ ai-pipeline/
 │   ├── features/
 │   │   ├── technical.py           # Polars feature engineering (indicators + macro + fundamentals + sector)
 │   │   ├── selection.py           # Feature selection (null/variance/correlation/MI filters)
+│   │   ├── normalize.py           # Percentile clipping + Z-score normalization with persistent stats
 │   │   └── clustering.py          # Stage 1: KMeans clustering with PCA + auto-K
 │   ├── models/
 │   │   ├── base_model.py          # LSTMForecaster (binary UP/NOT_UP Lightning module) with FocalLoss
@@ -197,13 +200,14 @@ ai-pipeline/
 - Ingestion writes to Postgres via SQLAlchemy (OHLCV + adj close, treasury 12 tenors, VIX, key metrics, financial ratios, sector performance, GICS sectors)
 - Features reads from Postgres, transforms with Polars, outputs `data/features.parquet`. Uses adj_close for all price-derived indicators when available
 - Feature selection filters by null rate, variance, correlation, and mutual information; outputs `data/features_selected.parquet` and `data/selected_features.json` manifest
-- Training and aggregation read from `features_selected.parquet` when feature selection is enabled; runner filters to selected features at inference time
+- Normalization reads `features_selected.parquet`, computes training-set stats, clips outliers, applies Z-score, outputs `data/features_normalized.parquet` + `data/normalization_stats.json`
+- Training and aggregation read from `features_normalized.parquet`; runner uses `normalization_stats.json` for inference-time normalization
 - Clustering reads sectors from DB + features, assigns clusters with KMeans + PCA, outputs `data/clusters.parquet`
 - Optuna optimizes hyperparameters globally (persisted to PostgreSQL), then per-cluster training uses shared params
 - Aggregation loads champion models from MLflow registry, validates feature compatibility, runs inference with training-period normalization
 - Portfolio optimizer uses predictions + historical returns to construct 3 risk-profiled portfolios
 - Backtesting simulates portfolios across bull/bear/sideways regimes with risk management
-- Data is normalized using training-set statistics only (Z-score), applied to val/test/inference
+- Data is normalized in a dedicated step (`normalize.py`): outlier clipping to [p01, p99] + Z-score with training-set statistics. Stats saved to `data/normalization_stats.json`, normalized data to `data/features_normalized.parquet`. Used by training, aggregation, and inference
 - TimeSeriesDataset uses symbol-boundary-aware indexing -- windows never cross from one stock's data into another's
 
 ## Makefile targets
@@ -218,6 +222,7 @@ make ingest             # Shows message to use ingest-force (dev safety)
 make ingest-force       # FMP API -> PostgreSQL
 make features           # Generate feature parquet from DB
 make select-features    # Feature selection (null/variance/correlation/MI filters)
+make normalize          # Percentile clipping + Z-score normalization
 
 # Stage 1: Clustering
 make cluster            # KMeans clustering of stocks
@@ -275,18 +280,20 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 |---|---|---|
 | `ingestion.start_years_back` | 8 years | 20 years |
 | `training.batch_size` | 256 | 128 |
-| `training.max_epochs` | 20 | 200 |
-| `training.early_stopping_patience` | 7 | 15 |
+| `training.max_epochs` | 10 | 200 |
+| `training.early_stopping_patience` | 3 | 15 |
+| `training.optuna.n_trials_global` | 10 | 10 |
+| `training.optuna.epochs_per_trial` | 5 | 30 |
 | `training.optuna.max_history_days` | 7 days | 30 days |
 | Clustering mode | Sector-based (fast) | Global KMeans |
 | Pipeline default | Skips ingestion | Includes ingestion |
 
 ## Model details
 
-- **Architecture**: LSTM with LayerNorm, GELU activation, residual connection, optional MultiheadAttention
+- **Architecture**: LSTM with input dropout, configurable activation (GELU/SiLU/Mish), residual connection, optional MultiheadAttention, optional bidirectional
 - **Task**: Binary classification -- UP (>=+2.5%) vs NOT_UP in 21 trading days
 - **Threshold**: buy_threshold configurable per cluster in `configs/default.yaml` under `clustering.cluster_thresholds`
-- **Optimizer**: AdamW with ReduceLROnPlateau scheduler
+- **Optimizer**: Configurable (AdamW, RAdam, SGD, Lion) with ReduceLROnPlateau scheduler
 - **Early stopping**: Monitors `val_acc`, patience dev:7 / prod:15
 - **Feature names**: Stored in checkpoint hparams for reproducible inference
 - **Precision**: Configurable via `training.precision` — `"32"` (default) or `"16-mixed"` (MPS mixed precision, reduces memory ~40%)
@@ -299,7 +306,8 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 - **Objective**: F-beta score (beta=0.5, prioritizing precision over recall)
 - **Alternative objectives**: `average_precision`, `mcc` (configurable via `training.optuna.objective.metric`)
 - **Recall floor**: Minimum recall of 0.15 before penalizing objective (quadratic penalty)
-- **Trials**: 50 global trials, 30 per-cluster trials
+- **Trials**: 10 global trials (dev and prod), 30 per-cluster trials
+- **Symbol rotation**: Each trial samples a different subset of symbols (seeded by trial number) to reduce sampling bias
 - **Pruning**: Startup period of 5 trials without pruning, then aggressive early stopping (patience=7, max 30 epochs per trial)
 - **Persistence**: Studies stored in PostgreSQL for warm-starting across runs; old trials pruned based on `max_history_days`
 - **Search space** (configurable in `training.optuna.search_space`):
@@ -351,7 +359,8 @@ All price-derived indicators use `adj_close` when available, ensuring consistenc
 - **Sector performance**: Daily sector avg change, 5d/20d sector momentum, relative-to-sector performance
 - **Time encoding**: Cyclical sin/cos encoding of day-of-week and month-of-year
 - **Clustering features**: 7 behavioral + 2 macro-sensitivity + 1 sector-relative + 4 key metrics + 6 financial ratios = 20 features with PCA and auto-K selection
-- **Feature selection**: Post-engineering filter removing >90% null features, bottom 1% variance, highly correlated pairs (>0.95), and low mutual information (<0.01). Output consumed by training, aggregation, and inference when enabled
+- **Feature selection**: Post-engineering filter removing >90% null features, bottom 1% variance, highly correlated pairs (>0.95), and low mutual information (<0.01). Output consumed by normalization step
+- **Normalization**: Dedicated pre-training step computes training-set statistics (mean, std, p01, p99 percentiles), clips outliers to [p01, p99], applies Z-score. Stats persisted in `data/normalization_stats.json` for consistent training/inference normalization. Replaces inline Z-score in dataset.py and LayerNorm in model
 - **Null handling**: Fundamentals are forward-filled per symbol, remaining nulls are median-filled per symbol, only rows with null returns/target are dropped
 
 ## Portfolio metrics
@@ -417,6 +426,7 @@ open http://localhost:5000
 uv run python -m src.ingestion.fmp_loader
 uv run python -m src.features.technical
 uv run python -m src.features.selection
+uv run python -m src.features.normalize
 uv run python -m src.features.clustering
 uv run python -m src.training.optimize --global
 uv run python -m src.training.train --use-global-params

@@ -43,6 +43,12 @@ feature_selection:
   min_variance_pct: 0.01  # drop bottom 1% by variance
   min_mutual_info: 0.01   # drop features with MI < threshold vs target
 
+# Feature normalization (post-selection, pre-training)
+normalization:
+  clip_percentiles: [1, 99]    # percentile clipping bounds for outliers
+  output_stats: data/normalization_stats.json
+  output_parquet: data/features_normalized.parquet
+
 # Target — binary classification: will the stock rise >= threshold in horizon days?
 target:
   horizon: 21          # trading days ahead (~1 month)

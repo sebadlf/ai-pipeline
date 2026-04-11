@@ -255,17 +255,9 @@ class TradingDataModule(L.LightningDataModule):
             f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
         ))
 
-        # Replace Inf/NaN with 0 before normalization
+        # Safety net: replace any remaining Inf/NaN after normalization step
         for arr in (train_x, val_x, test_x):
             np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Normalize using training set statistics only
-        self._mean = train_x.mean(axis=0)
-        self._std = train_x.std(axis=0)
-        self._std[self._std == 0] = 1.0
-        train_x = (train_x - self._mean) / self._std
-        val_x = (val_x - self._mean) / self._std
-        test_x = (test_x - self._mean) / self._std
 
         self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std)
         self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64)

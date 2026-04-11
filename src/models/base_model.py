@@ -51,7 +51,7 @@ class FocalLoss(nn.Module):
 class LSTMForecaster(L.LightningModule):
     """LSTM with self-attention for binary classification (UP/NOT_UP).
 
-    Architecture: InputDropout → LayerNorm → LSTM → MultiHeadAttention → Residual → MLP Head.
+    Architecture: InputDropout → LSTM → MultiHeadAttention → Residual → MLP Head.
 
     Args:
         input_size: Number of input features per timestep.
@@ -102,9 +102,8 @@ class LSTMForecaster(L.LightningModule):
         self.learning_rate = learning_rate
         self.num_classes = num_classes
 
-        # Input regularization
+        # Input regularization (data arrives pre-normalized from normalize.py)
         self.input_drop = nn.Dropout(input_dropout) if input_dropout > 0 else nn.Identity()
-        self.input_norm = nn.LayerNorm(input_size)
 
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -165,7 +164,6 @@ class LSTMForecaster(L.LightningModule):
             Logits of shape (batch, num_classes).
         """
         x_normed = self.input_drop(x)
-        x_normed = self.input_norm(x_normed)
         lstm_out, _ = self.lstm(x_normed)
 
         # Residual connection: project input to effective_hidden and add to LSTM output

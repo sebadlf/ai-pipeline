@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest ingest-force features select-features cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
+.PHONY: setup up down ingest ingest-force features select-features normalize cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
 
 # =============================================================================
 # Infrastructure
@@ -32,6 +32,9 @@ features:
 
 select-features:
 	uv run python -m src.features.selection
+
+normalize:
+	uv run python -m src.features.normalize
 
 # =============================================================================
 # Stage 1: Clustering
@@ -99,10 +102,10 @@ signals:
 pipeline:
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
 		echo "Rebuilding features/clusters..."; \
-		$(MAKE) features select-features cluster; \
+		$(MAKE) features select-features normalize cluster; \
 		rm -f data/.new_data; \
 	else \
-		echo "No new data and clusters exist, skipping features/selection/clustering."; \
+		echo "No new data and clusters exist, skipping features/selection/normalization/clustering."; \
 	fi
 	$(MAKE) train-global promote aggregate portfolio backtest
 
@@ -111,10 +114,10 @@ pipeline-prod:
 	$(MAKE) ingest-force
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
 		echo "Rebuilding features/clusters..."; \
-		$(MAKE) features select-features cluster; \
+		$(MAKE) features select-features normalize cluster; \
 		rm -f data/.new_data; \
 	else \
-		echo "No new data and clusters exist, skipping features/selection/clustering."; \
+		echo "No new data and clusters exist, skipping features/selection/normalization/clustering."; \
 	fi
 	$(MAKE) train-global promote aggregate portfolio backtest
 

@@ -21,7 +21,7 @@ import polars as pl
 import torch
 from sqlalchemy import text
 
-from src.config import ClusterConfig, compute_split_dates, get_features_parquet_path, get_selected_feature_names, load_config
+from src.config import ClusterConfig, compute_split_dates, get_normalized_parquet_path, get_selected_feature_names, load_config
 from src.db import get_engine
 from src.evaluation.champion import download_champion_checkpoint
 from src.keys import MLFLOW_TRACKING_URI
@@ -140,10 +140,10 @@ def _run_inference_core(
     Args:
         cluster_id: Cluster identifier.
         model: Loaded model.
-        features_df: Full features DataFrame.
+        features_df: Full features DataFrame (pre-normalized).
         clusters_df: Cluster assignments.
         config: Full config dict.
-        split_dates: SplitDates instance (used for normalization).
+        split_dates: SplitDates instance.
         date_filter_end: If set, filter each symbol's data to <= this date before
             taking the last seq_len rows. None means use all available data (most recent).
 
@@ -158,21 +158,6 @@ def _run_inference_core(
     )
     feature_cols = resolve_feature_cols(model, features_df, config)
 
-    # Compute normalization from training period
-    train_df = features_df.filter(
-        (pl.col("date") < split_dates.train_end)
-        & pl.col("symbol").is_in(cluster_symbols)
-    ).drop_nulls(subset=feature_cols)
-
-    if train_df.is_empty():
-        return []
-
-    train_matrix = train_df.select(feature_cols).to_numpy()
-    np.nan_to_num(train_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    train_mean = train_matrix.mean(axis=0)
-    train_std = train_matrix.std(axis=0)
-    train_std[train_std == 0] = 1.0
-
     predictions = []
     for symbol in cluster_symbols:
         sym_df = features_df.filter(pl.col("symbol") == symbol).sort("date")
@@ -186,9 +171,8 @@ def _run_inference_core(
         recent = sym_df.tail(seq_len)
         features = recent.select(feature_cols).to_numpy()
         np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        norm_features = (features - train_mean) / train_std
 
-        x = torch.tensor(norm_features, dtype=torch.float32).unsqueeze(0)
+        x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             probs = model.predict_proba(x).squeeze(0).numpy()
 
@@ -250,7 +234,7 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
     clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
     cluster_ids = clusters_df["cluster_id"].unique().sort().to_list()
 
-    features_path = get_features_parquet_path(config)
+    features_path = get_normalized_parquet_path(config)
     print(f"  Features source: {features_path}")
     features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
 

@@ -33,7 +33,7 @@ from src.config import (
     SplitDates,
     compute_split_dates,
     get_cluster_buy_threshold,
-    get_features_parquet_path,
+    get_normalized_parquet_path,
     load_config,
     resolve_env_value,
 )
@@ -242,7 +242,7 @@ def _create_trial_objective(
     obj_cfg = optuna_cfg.get("objective", {})
     beta = obj_cfg.get("beta", 0.5)
 
-    features_path = get_features_parquet_path(config)
+    features_path = get_normalized_parquet_path(config)
 
     def objective(trial: optuna.Trial) -> float:
         params = suggest_hyperparams(trial, config)
@@ -461,7 +461,7 @@ def train_final_model(
     train_cfg = config["training"]
     buy_thresh = get_cluster_buy_threshold(config, cluster_id)
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
-    features_path = get_features_parquet_path(config)
+    features_path = get_normalized_parquet_path(config)
 
     print(f"\n  Training final model for {cluster_id} with best params...")
 
@@ -749,7 +749,7 @@ def _create_global_trial_objective(
     min_recall = optuna_cfg.get("min_recall_up", 0.10)
     obj_cfg = optuna_cfg.get("objective", {})
     beta = obj_cfg.get("beta", 0.5)
-    features_path = get_features_parquet_path(config)
+    features_path = get_normalized_parquet_path(config)
     n_symbols_per_cluster = int(resolve_env_value(
         optuna_cfg.get("n_symbols_per_cluster", 3), default=3
     ))
@@ -765,13 +765,14 @@ def _create_global_trial_objective(
     )
 
     def objective(trial: optuna.Trial) -> float:
-        # Each trial gets a different symbol subset via trial.number as seed
+        # Each trial gets a different symbol subset; combine trial.number
+        # with cluster_id so selections are independent across clusters
         selected_symbols = []
         for cid in cluster_ids:
             symbols = _get_random_symbols(
                 cid, cluster_cfg.output_parquet,
                 n=n_symbols_per_cluster,
-                seed=trial.number,
+                seed=hash((trial.number, cid)),
             )
             selected_symbols.extend(symbols)
         trial.set_user_attr("optimization_symbols", selected_symbols)

@@ -329,6 +329,27 @@ def get_selected_feature_names(config: dict) -> list[str] | None:
     return None
 
 
+def get_normalized_parquet_path(config: dict) -> str:
+    """Resolve the normalized features parquet path.
+
+    Returns features_normalized.parquet when normalization config exists.
+    Raises FileNotFoundError if normalization hasn't been run.
+    """
+    norm_cfg = config.get("normalization", {})
+    norm_path = norm_cfg.get("output_parquet", "data/features_normalized.parquet")
+    if Path(norm_path).exists():
+        return norm_path
+    raise FileNotFoundError(
+        f"{norm_path} not found. Run `make normalize` first."
+    )
+
+
+def get_normalization_stats_path(config: dict) -> str:
+    """Resolve the normalization statistics JSON path."""
+    norm_cfg = config.get("normalization", {})
+    return norm_cfg.get("output_stats", "data/normalization_stats.json")
+
+
 def get_cluster_buy_threshold(config: dict, cluster_id: str) -> float:
     """Resolve buy_threshold for a cluster, falling back to default.
 

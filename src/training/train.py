@@ -25,7 +25,7 @@ from src.config import (
     SplitDates,
     compute_split_dates,
     get_cluster_buy_threshold,
-    get_features_parquet_path,
+    get_normalized_parquet_path,
     load_config,
     resolve_env_value,
 )
@@ -263,7 +263,7 @@ def _evaluate_cluster_trades(
     """Run mini-backtests for a cluster across train/val/test splits."""
     from src.aggregation.consolidate import run_inference_for_period
 
-    features_path = get_features_parquet_path(config)
+    features_path = get_normalized_parquet_path(config)
     features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
 
     all_null_cols = [c for c in features_df.columns if features_df[c].null_count() == len(features_df)]
