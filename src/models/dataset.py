@@ -163,7 +163,8 @@ class TradingDataModule(L.LightningDataModule):
             df = df.filter(pl.col("symbol").is_in(cluster_symbols))
             if df.is_empty():
                 raise ValueError(f"No data found for cluster {self.cluster_id}")
-            print(f"  Filtered to cluster {self.cluster_id}: {len(cluster_symbols)} symbols")
+            tag = f"[{self.cluster_id}] " if self.cluster_id else ""
+            print(f"  {tag}Filtered to cluster {self.cluster_id}: {len(cluster_symbols)} symbols")
 
         sd = self.split_dates
         self.feature_cols = [c for c in df.columns if _is_feature_col(c)]
@@ -227,8 +228,9 @@ class TradingDataModule(L.LightningDataModule):
         self.val_valid_indices = val_vi
         test_vi = np.array(test_valid, dtype=np.int64)
 
+        tag = f"[{self.cluster_id}] " if self.cluster_id else ""
         print(
-            f"  Split sizes — train: {len(train_y):,} | "
+            f"  {tag}Split sizes — train: {len(train_y):,} | "
             f"val: {len(val_y):,} | test: {len(test_y):,}"
         )
 
@@ -238,20 +240,20 @@ class TradingDataModule(L.LightningDataModule):
 
         # Class balance report
         for name, y in [("train", train_y), ("val", val_y), ("test", test_y)]:
-            counts = {cls_name: int((y == cls_idx).sum()) for cls_idx, cls_name in class_names.items()}
+            counts_map = {cls_name: int((y == cls_idx).sum()) for cls_idx, cls_name in class_names.items()}
             total = len(y)
             parts = " | ".join(
                 f"{cls_name}: {count:,} ({count/total:.1%})"
-                for cls_name, count in counts.items()
+                for cls_name, count in counts_map.items()
             )
-            print(f"  {name} class balance — {parts}")
+            print(f"  {tag}{name} class balance — {parts}")
 
         # Compute inverse-frequency class weights from training set
         unique, counts = np.unique(train_y, return_counts=True)
         total = counts.sum()
         weight_map = {int(cls): total / (len(unique) * cnt) for cls, cnt in zip(unique, counts)}
         self.class_weights = [weight_map.get(i, 1.0) for i in range(num_classes)]
-        print(f"  class weights — " + " | ".join(
+        print(f"  {tag}class weights — " + " | ".join(
             f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
         ))
 

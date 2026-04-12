@@ -322,6 +322,34 @@ def train_single_cluster(config: dict, cluster_id: str) -> None:
     optimize_cluster(config, cluster_id)
 
 
+def _log_worker_error_to_mlflow(config: dict, cluster_id: str, error_tb: str) -> None:
+    """Tag the most recent RUNNING/FAILED MLflow run for a cluster with the error."""
+    try:
+        client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+        prefix = config.get("training", {}).get("cluster_experiment_prefix", "cluster")
+        experiment_name = f"{prefix}/{cluster_id}"
+        experiment = client.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            return
+        runs = client.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            max_results=1,
+            order_by=["start_time DESC"],
+        )
+        if not runs:
+            return
+        run_id = runs[0].info.run_id
+        # Extract last line as error message
+        lines = [l for l in error_tb.strip().splitlines() if l.strip()]
+        error_msg = lines[-1] if lines else "Unknown error"
+        error_type = error_msg.split(":")[0] if ":" in error_msg else "Error"
+        client.set_tag(run_id, "error_type", error_type[:250])
+        client.set_tag(run_id, "error_message", error_msg[:5000])
+        client.set_tag(run_id, "error_traceback", error_tb[:5000])
+    except Exception:
+        pass  # Best-effort — don't mask the original error
+
+
 def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
     """Train a single cluster in a separate process.
 
@@ -336,7 +364,9 @@ def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
         return (cluster_id, True, "")
     except Exception as e:
         import traceback
-        return (cluster_id, False, traceback.format_exc())
+        tb = traceback.format_exc()
+        _log_worker_error_to_mlflow(config, cluster_id, tb)
+        return (cluster_id, False, tb)
     finally:
         from src.db import dispose_engine
         dispose_engine()

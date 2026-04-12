@@ -48,8 +48,48 @@ from src.models.dataset import TradingDataModule
 
 # Suppress noisy Lightning warnings and tips
 warnings.filterwarnings("ignore", message=".*num_workers.*bottleneck.*")
+warnings.filterwarnings("ignore", message=".*`isinstance.*LeafSpec.*")
 logging.getLogger("lightning.pytorch.trainer.connectors.logger_connector").setLevel(logging.WARNING)
 logging.getLogger("lightning.pytorch.trainer.connectors.callback_connector").setLevel(logging.WARNING)
+logging.getLogger("lightning.pytorch.utilities").setLevel(logging.WARNING)
+
+# Suppress Lightning tips
+import os
+os.environ["LIGHTNING_DISABLE_TIPS"] = "1"
+
+
+class ClusterProgressCallback(L.Callback):
+    """Compact per-epoch logging with cluster prefix for parallel training visibility."""
+
+    def __init__(self, cluster_id: str, ensemble_rank: int = 1):
+        self.cluster_id = cluster_id
+        self.ensemble_rank = ensemble_rank
+        self.prefix = f"[{cluster_id} E{ensemble_rank}]"
+
+    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        epoch = trainer.current_epoch
+        metrics = trainer.callback_metrics
+        parts = [f"{self.prefix} epoch {epoch}/{trainer.max_epochs}"]
+
+        for key in ["train_loss", "train_acc", "val_loss", "val_acc",
+                     "val_precision_up", "val_recall_up", "val_mean_prob_up"]:
+            if key in metrics:
+                val = metrics[key].item() if hasattr(metrics[key], "item") else metrics[key]
+                short_key = key.replace("val_", "v_").replace("train_", "t_")
+                parts.append(f"{short_key}={val:.4f}")
+
+        lr = trainer.optimizers[0].param_groups[0]["lr"]
+        parts.append(f"lr={lr:.2e}")
+        print("  " + " | ".join(parts))
+
+    def on_train_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        epoch = trainer.current_epoch
+        metrics = trainer.callback_metrics
+        val_prec = metrics.get("val_precision_up")
+        val_acc = metrics.get("val_acc")
+        prec_str = f"{val_prec.item():.4f}" if val_prec is not None else "N/A"
+        acc_str = f"{val_acc.item():.4f}" if val_acc is not None else "N/A"
+        print(f"  {self.prefix} DONE at epoch {epoch} — val_precision_up={prec_str}, val_acc={acc_str}")
 
 
 def _get_random_symbols(
@@ -108,6 +148,47 @@ def _log_exception_to_mlflow_run(
     client.set_tag(run_id, "error_type", type(exc).__name__)
     client.set_tag(run_id, "error_message", str(exc)[:_MLFLOW_TAG_MAX])
     client.set_tag(run_id, "error_traceback", tb[:_MLFLOW_TAG_MAX])
+
+
+def _log_error_to_cluster_experiment(
+    config: dict, cluster_id: str, exc: BaseException,
+) -> None:
+    """Create a FAILED MLflow run with error details when no run exists yet.
+
+    This covers errors during Optuna optimization (before ensemble training
+    creates its own MLflow runs), so the failure is visible in the MLflow UI.
+    """
+    try:
+        prefix = config.get("training", {}).get("cluster_experiment_prefix", "cluster")
+        experiment_name = f"{prefix}/{cluster_id}"
+        client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+
+        # Check if the latest run already has error tags (set by train_final_model)
+        experiment = client.get_experiment_by_name(experiment_name)
+        if experiment:
+            runs = client.search_runs(
+                experiment_ids=[experiment.experiment_id],
+                max_results=1,
+                order_by=["start_time DESC"],
+            )
+            if runs and runs[0].data.tags.get("error_type"):
+                return  # Already tagged by train_final_model
+
+        # Create a short-lived run to record the error
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(experiment_name)
+        with mlflow.start_run(run_name=f"{cluster_id}-error") as run:
+            tb = traceback.format_exc()
+            mlflow.set_tag("error_type", type(exc).__name__)
+            mlflow.set_tag("error_message", str(exc)[:_MLFLOW_TAG_MAX])
+            mlflow.set_tag("error_traceback", tb[:_MLFLOW_TAG_MAX])
+            mlflow.set_tag("error_phase", "optuna_optimization")
+            mlflow.log_param("cluster_id", cluster_id)
+            mlflow.set_tag("mlflow.runName", f"{cluster_id}-error")
+            # Mark as failed
+            client.set_terminated(run.info.run_id, status="FAILED")
+    except Exception:
+        pass  # Best-effort — don't mask the original error
 
 
 def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
@@ -616,13 +697,18 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         buy_thresh,
     )
 
-    study.optimize(
-        objective_fn,
-        n_trials=n_trials,
-        n_jobs=1,
-        show_progress_bar=True,
-        callbacks=[_convergence_callback(conv_patience)],
-    )
+    try:
+        study.optimize(
+            objective_fn,
+            n_trials=n_trials,
+            n_jobs=1,
+            show_progress_bar=True,
+            callbacks=[_convergence_callback(conv_patience)],
+        )
+    except Exception as e:
+        print(f"  ERROR during Optuna optimization for {cluster_id}: {e}")
+        _log_error_to_cluster_experiment(config, cluster_id, e)
+        raise
 
     # Get top-K completed trials for ensemble, filtering incompatible configs
     ensemble_k = optuna_cfg.get("ensemble_top_k", 3)
@@ -640,6 +726,12 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
 
     completed.sort(key=lambda t: t.value, reverse=True)
     top_trials = _deduplicate_trials(completed, ensemble_k)
+
+    if not top_trials:
+        msg = f"No completed compatible trials for {cluster_id}"
+        print(f"  ERROR: {msg}")
+        _log_error_to_cluster_experiment(config, cluster_id, RuntimeError(msg))
+        raise RuntimeError(msg)
 
     # Optuna study summary for logging
     optuna_meta = {
@@ -787,15 +879,18 @@ def train_final_model(
 
     precision = config.get("training", {}).get("precision", "32")
     gradient_clip_val = best_params.get("gradient_clip_val", 1.0)
+    progress_cb = ClusterProgressCallback(cluster_id, ensemble_rank)
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator="mps",
         devices=1,
         precision=precision,
         logger=mlflow_logger,
-        callbacks=[early_stop_precision, early_stop_loss, checkpoint],
+        callbacks=[early_stop_precision, early_stop_loss, checkpoint, progress_cb],
         log_every_n_steps=10,
         gradient_clip_val=gradient_clip_val,
+        enable_progress_bar=False,
+        enable_model_summary=False,
     )
 
     client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
