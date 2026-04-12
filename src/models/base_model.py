@@ -261,9 +261,9 @@ class LSTMForecaster(L.LightningModule):
         factor = self.hparams.get("scheduler_factor", 0.5)
         patience = self.hparams.get("scheduler_patience", 5)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=factor, patience=patience, min_lr=1e-6,
+            optimizer, mode="max", factor=factor, patience=patience, min_lr=1e-6,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss", "interval": "epoch"},
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_precision_up", "interval": "epoch"},
         }

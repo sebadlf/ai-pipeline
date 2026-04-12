@@ -474,12 +474,13 @@ def _create_trial_objective(
         )
 
         early_stop = EarlyStopping(
-            monitor="val_loss", patience=patience_per_trial, mode="min",
+            monitor="val_precision_up", patience=patience_per_trial, mode="max",
+            min_delta=0.0,
         )
         # Only add pruning callback on last fold to avoid premature pruning
         callbacks = [early_stop]
         if fold_idx == len(fold_splits) - 1:
-            callbacks.append(PyTorchLightningPruningCallback(trial, monitor="val_loss"))
+            callbacks.append(PyTorchLightningPruningCallback(trial, monitor="val_precision_up"))
 
         precision = config.get("training", {}).get("precision", "32")
         gradient_clip_val = params.get("gradient_clip_val", 1.0)
@@ -854,7 +855,8 @@ def train_final_model(
         save_dir="checkpoints",
     )
 
-    # Callbacks — full training with proper patience
+    # Callbacks — early stopping on precision only (val_loss diverges early
+    # due to FocalLoss + model confidence, but precision keeps improving)
     max_epochs = int(resolve_env_value(train_cfg["max_epochs"], default=200))
     patience = int(resolve_env_value(train_cfg["early_stopping_patience"], default=15))
 
@@ -862,12 +864,7 @@ def train_final_model(
         monitor="val_precision_up",
         patience=patience,
         mode="max",
-    )
-    early_stop_loss = EarlyStopping(
-        monitor="val_loss",
-        patience=patience,
-        mode="min",
-        min_delta=0.005,
+        min_delta=0.0,
     )
     checkpoint = ModelCheckpoint(
         dirpath="checkpoints",
@@ -886,7 +883,7 @@ def train_final_model(
         devices=1,
         precision=precision,
         logger=mlflow_logger,
-        callbacks=[early_stop_precision, early_stop_loss, checkpoint, progress_cb],
+        callbacks=[early_stop_precision, checkpoint, progress_cb],
         log_every_n_steps=10,
         gradient_clip_val=gradient_clip_val,
         enable_progress_bar=False,
@@ -1226,11 +1223,12 @@ def _create_global_trial_objective(
 
         # Callbacks: early stopping + Optuna pruning
         early_stop = EarlyStopping(
-            monitor="val_loss",
+            monitor="val_precision_up",
             patience=patience_per_trial,
-            mode="min",
+            mode="max",
+            min_delta=0.0,
         )
-        pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_loss")
+        pruning_callback = PyTorchLightningPruningCallback(trial, monitor="val_precision_up")
 
         precision = config.get("training", {}).get("precision", "32")
         gradient_clip_val = params.get("gradient_clip_val", 1.0)
