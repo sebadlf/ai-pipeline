@@ -41,7 +41,7 @@ feature_selection:
   max_null_pct: 0.90      # drop features with >90% nulls
   max_correlation: 0.95   # drop one of each pair with |corr| > 0.95
   min_variance_pct: 0.01  # drop bottom 1% by variance
-  min_mutual_info: 0.01   # drop features with MI < threshold vs target
+  min_mutual_info: 0.001  # drop features with MI < threshold vs target (lowered to retain technical indicators)
 
 # Feature normalization (post-selection, pre-training)
 normalization:
