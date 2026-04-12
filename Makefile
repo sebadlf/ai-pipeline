@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest ingest-force features select-features normalize cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
+.PHONY: setup up down ingest ingest-force features select-features normalize cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup cleanup-keep-features cleanup-dry-run test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
 
 # =============================================================================
 # Infrastructure
@@ -136,6 +136,13 @@ pipeline-loop:
 cleanup:
 	uv run python -m src.evaluation.clean_runs
 	docker compose restart mlflow
+
+cleanup-keep-features:
+	uv run python -m src.evaluation.clean_runs --keep-features
+	docker compose restart mlflow
+
+cleanup-dry-run:
+	uv run python -m src.evaluation.clean_runs --dry-run
 
 test:
 	uv run pytest tests/ -v
