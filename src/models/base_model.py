@@ -166,17 +166,19 @@ class LSTMForecaster(L.LightningModule):
         x_normed = self.input_drop(x)
         lstm_out, _ = self.lstm(x_normed)
 
-        # Residual connection: project input to effective_hidden and add to LSTM output
-        residual = self.residual_proj(x_normed)
-        lstm_out = lstm_out + residual
-
         if self.use_attention:
-            # Self-attention over temporal dimension
+            # Self-attention over temporal dimension (before residual)
             attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
             lstm_out = self.attn_norm(lstm_out + attn_out)
 
         # Use last timestep for classification
         last_hidden = lstm_out[:, -1, :]
+
+        # Residual connection: project last input timestep only to avoid
+        # bypassing the LSTM with a full-sequence linear shortcut
+        residual = self.residual_proj(x_normed[:, -1, :])
+        last_hidden = last_hidden + residual
+
         return self.head(last_hidden)
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:

@@ -82,6 +82,7 @@ def run_portfolio_backtest(
     take_profit = risk_cfg.get("position_take_profit", 0.50)
     max_dd_limit = risk_cfg.get("max_drawdown_limit", 0.25)
     cooldown_days = risk_cfg.get("cooldown_days", 2)
+    rebalance_days = config.get("rebalance_frequency_days", 21)  # days between rebalancing to target weights
 
     if allocations.is_empty() or prices.is_empty():
         return BacktestResult(final_value=initial_capital)
@@ -102,11 +103,55 @@ def run_portfolio_backtest(
     peak_equity = initial_capital
     circuit_breaker = False
     cooldown_until: dt.date | None = None
+    days_since_rebalance = 0
 
     # Open positions on day 1 based on allocations
     first_day = dates[0] if dates else None
 
     for day in dates:
+        # Periodic rebalancing to target weights
+        if (
+            rebalance_days > 0
+            and day != first_day
+            and days_since_rebalance >= rebalance_days
+            and not circuit_breaker
+            and positions
+        ):
+            # Close all positions
+            for sym, pos in list(positions.items()):
+                price_row = prices.filter(
+                    (pl.col("date") == day) & (pl.col("symbol") == sym)
+                )
+                if not price_row.is_empty():
+                    proceeds = _close_position(pos, price_row["close"][0], commission_pct, slippage_pct)
+                    trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
+                    cash += proceeds
+            positions.clear()
+
+            # Re-open with target weights using current equity
+            current_equity = cash
+            for symbol, weight in alloc_map.items():
+                price_row = prices.filter(
+                    (pl.col("date") == day) & (pl.col("symbol") == symbol)
+                )
+                if price_row.is_empty() or weight <= 0:
+                    continue
+                price = price_row["close"][0]
+                if price <= 0:
+                    continue
+                capital_for_pos = current_equity * weight
+                entry_price = price * (1 + slippage_pct)
+                shares = (capital_for_pos * (1 - commission_pct)) / entry_price
+                positions[symbol] = Position(
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    entry_date=day,
+                    shares=shares,
+                    cost_basis=capital_for_pos,
+                )
+                cash -= capital_for_pos
+            days_since_rebalance = 0
+
         # Open initial positions on first day
         if day == first_day and not circuit_breaker:
             for symbol, weight in alloc_map.items():
@@ -173,6 +218,7 @@ def run_portfolio_backtest(
                 portfolio_value += pos.shares * current_price
 
         equity_curve.append(portfolio_value)
+        days_since_rebalance += 1
 
         if len(equity_curve) >= 2:
             daily_ret = (equity_curve[-1] - equity_curve[-2]) / equity_curve[-2]
@@ -389,10 +435,17 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
             else:
                 regime_bench_returns = None
 
+            # Merge rebalance_frequency_days from portfolio constraints into backtest config
+            bt_with_rebalance = {
+                **bt_cfg,
+                "rebalance_frequency_days": portfolio_cfg.get("constraints", {}).get(
+                    "rebalance_frequency_days", 21
+                ),
+            }
             result = run_portfolio_backtest(
                 profile_alloc,
                 regime_prices,
-                bt_cfg,
+                bt_with_rebalance,
                 benchmark_returns=regime_bench_returns,
             )
             result.profile = profile

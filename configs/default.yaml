@@ -77,7 +77,7 @@ training:
   weight_decay: 0.05
   label_smoothing: 0.05
   focal_gamma: 2.0          # focal loss gamma (0 = standard CrossEntropy)
-  noise_std: 0.03           # Gaussian noise augmentation on training inputs
+  noise_std: 0.02           # Gaussian noise augmentation on training inputs (matches optuna fixed_params)
   early_stopping_patience:
     dev: 3
     prod: 15
@@ -117,11 +117,11 @@ training:
     persist: true               # always persist studies in PostgreSQL for warm-starting
     max_history_days:
       dev: 7                    # purge trials older than 7 days in dev
-      prod: 30                  # keep 30 days of history in prod
+      prod: 60                  # keep 60 days of history in prod for better warm-starting
     # Objective function configuration
     objective:
       metric: "precision_at_threshold"  # precision_at_threshold | f_beta
-      threshold: 0.60                   # probability threshold for precision_at_threshold
+      threshold: 0.50                   # probability threshold for precision_at_threshold (lowered from 0.60 so more trials produce signals)
       beta: 0.5                         # F-beta param (only used when metric=f_beta)
       recall_penalty: "quadratic"       # quadratic | linear
     # Search space — Optuna explores these ranges (~10 tunable params)
@@ -132,7 +132,7 @@ training:
       batch_size: [64, 128, 256]
       weight_decay: { low: 1.0e-4, high: 0.1, log: true }
       label_smoothing: { low: 0.0, high: 0.05 }
-      focal_gamma: { low: 0.0, high: 5.0 }
+      focal_gamma: { low: 0.0, high: 3.0 }
       # Architecture
       hidden_size: [64, 96, 128, 256]
       num_layers: { low: 1, high: 4 }

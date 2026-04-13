@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import json
 import os
 from pathlib import Path
 
 import mlflow
+from mlflow.tracking import MlflowClient
 import numpy as np
 import polars as pl
 import torch
@@ -243,6 +245,34 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
     if all_null_cols:
         features_df = features_df.drop(all_null_cols)
 
+    # Normalization drift detection: warn if recent features diverge from training stats
+    norm_stats_path = config.get("normalization", {}).get("output_stats", "data/normalization_stats.json")
+    if Path(norm_stats_path).exists():
+        with open(norm_stats_path) as f:
+            norm_stats = json.load(f)
+        # Check most recent data (last date) against training-period statistics
+        max_date = features_df["date"].max()
+        recent_df = features_df.filter(pl.col("date") == max_date)
+        drift_warnings = []
+        for feat, stats in norm_stats.items():
+            if feat not in recent_df.columns:
+                continue
+            col_vals = recent_df[feat].drop_nulls()
+            if len(col_vals) == 0:
+                continue
+            feat_mean = float(col_vals.mean())
+            train_std = stats.get("std", 1.0)
+            if train_std > 0 and abs(feat_mean) > 3.0:
+                # After Z-score normalization, mean should be ~0. A mean >3 std
+                # indicates the current data has drifted from training distribution
+                drift_warnings.append((feat, feat_mean))
+        if drift_warnings:
+            print(f"  WARNING: {len(drift_warnings)} features show normalization drift (|mean| > 3 std):")
+            for feat, val in drift_warnings[:10]:
+                print(f"    - {feat}: mean={val:.2f} std from training center")
+            if len(drift_warnings) > 10:
+                print(f"    ... and {len(drift_warnings) - 10} more")
+
     all_predictions = []
     skipped_clusters = []
     feature_mismatch_count = 0
@@ -287,7 +317,27 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
 
         print(f"    ✓ {len(ensemble_models)} ensemble models validated")
 
-        # Run inference with each model and average prob_up
+        # Get val_precision_up for each model to weight ensemble predictions
+        mlflow_client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+        model_weights: list[float] = []
+        for _, run_id in ensemble_models:
+            w = 1.0  # default equal weight
+            if run_id:
+                try:
+                    run = mlflow_client.get_run(run_id)
+                    vp = run.data.metrics.get("val_precision_up")
+                    if vp is not None and vp > 0:
+                        w = vp
+                except Exception:
+                    pass
+            model_weights.append(w)
+        total_w = sum(model_weights)
+        model_weights = [w / total_w for w in model_weights]
+
+        weight_str = ", ".join(f"{w:.2f}" for w in model_weights)
+        print(f"    Ensemble weights: [{weight_str}]")
+
+        # Run inference with each model and compute weighted prob_up
         all_model_preds: list[dict[str, float]] = []
         primary_run_id = ensemble_models[0][1]
         for model, _ in ensemble_models:
@@ -296,17 +346,23 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
             )
             all_model_preds.append({p["symbol"]: p["prob_up"] for p in preds})
 
-        # Average predictions across ensemble
+        # Weighted average predictions across ensemble
         all_symbols: set[str] = set()
         for mp in all_model_preds:
             all_symbols.update(mp.keys())
 
         for symbol in all_symbols:
-            probs = [mp[symbol] for mp in all_model_preds if symbol in mp]
+            weighted_sum = 0.0
+            weight_sum = 0.0
+            for i, mp in enumerate(all_model_preds):
+                if symbol in mp:
+                    weighted_sum += mp[symbol] * model_weights[i]
+                    weight_sum += model_weights[i]
+            avg_prob = weighted_sum / weight_sum if weight_sum > 0 else 0.0
             all_predictions.append({
                 "symbol": symbol,
                 "cluster_id": cluster_id,
-                "prob_up": sum(probs) / len(probs),
+                "prob_up": avg_prob,
                 "model_run_id": primary_run_id,
             })
 

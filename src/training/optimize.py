@@ -277,6 +277,7 @@ def _deduplicate_trials(
     top_k: int,
     key_params: tuple[str, ...] = (
         "hidden_size", "num_layers", "learning_rate", "dropout", "sequence_length",
+        "label_smoothing", "focal_gamma", "input_dropout", "weight_decay", "batch_size",
     ),
 ) -> list[optuna.trial.FrozenTrial]:
     """Select top-K trials with meaningfully different hyperparameters.
@@ -370,7 +371,12 @@ def _compute_objective_value(
         predicted_up = probs >= threshold
         n_predicted = int(predicted_up.sum())
         if n_predicted == 0:
-            return 0.0
+            # Return a small but differentiated value based on how close the model
+            # got to the threshold. This gives Optuna gradient to navigate toward
+            # configs that produce higher probabilities, instead of treating all
+            # "no signal" trials as equally bad (0.0).
+            max_prob = float(probs.max()) if len(probs) > 0 else 0.0
+            return max_prob * 0.01  # always << any real precision score
 
         tp = int((predicted_up & (targets == 1)).sum())
         n_positive = int(targets.sum())
