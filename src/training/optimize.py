@@ -218,21 +218,23 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
             return trial.suggest_float(name, float(low), float(high), log=spec.get("log", False))
         return spec
 
-    # Tunable params (~10) — optimized per cluster
+    # Tunable params (~12) — optimized per cluster
     tuned = {
         "learning_rate": _suggest("learning_rate", {"low": 1e-4, "high": 1e-2, "log": True}),
         "batch_size": _suggest("batch_size", [64, 128, 256]),
-        "weight_decay": _suggest("weight_decay", {"low": 1e-4, "high": 0.1, "log": True}),
-        "label_smoothing": _suggest("label_smoothing", {"low": 0.0, "high": 0.15}),
-        "focal_gamma": _suggest("focal_gamma", {"low": 0.0, "high": 5.0}),
-        "hidden_size": _suggest("hidden_size", [64, 96, 128, 256]),
-        "num_layers": _suggest("num_layers", {"low": 1, "high": 4}),
-        "dropout": _suggest("dropout", {"low": 0.1, "high": 0.5}),
+        "weight_decay": _suggest("weight_decay", {"low": 1e-3, "high": 0.2, "log": True}),
+        "label_smoothing": _suggest("label_smoothing", {"low": 0.02, "high": 0.12}),
+        "focal_gamma": _suggest("focal_gamma", {"low": 0.0, "high": 3.0}),
+        "noise_std": _suggest("noise_std", {"low": 0.01, "high": 0.08}),
+        "hidden_size": _suggest("hidden_size", [64, 96, 128]),
+        "num_layers": _suggest("num_layers", {"low": 1, "high": 3}),
+        "dropout": _suggest("dropout", {"low": 0.2, "high": 0.65}),
         "sequence_length": _suggest("sequence_length", [10, 20, 30]),
-        "input_dropout": _suggest("input_dropout", {"low": 0.0, "high": 0.3}),
+        "input_dropout": _suggest("input_dropout", {"low": 0.05, "high": 0.4}),
+        "head_hidden_ratio": _suggest("head_hidden_ratio", {"low": 0.25, "high": 0.5}),
     }
 
-    # Fixed params (~9) — sensible defaults, not searched
+    # Fixed params (~7) — sensible defaults, not searched
     fixed_defaults = {
         "optimizer_name": fixed.get("optimizer_name", "adamw"),
         "scheduler_factor": fixed.get("scheduler_factor", 0.5),
@@ -240,9 +242,8 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
         "gradient_clip_val": fixed.get("gradient_clip_val", 2.0),
         "bidirectional": fixed.get("bidirectional", False),
         "num_attention_heads": fixed.get("num_attention_heads", 0),
-        "head_hidden_ratio": fixed.get("head_hidden_ratio", 0.5),
         "activation": fixed.get("activation", "gelu"),
-        "noise_std": fixed.get("noise_std", 0.02),
+        "feature_mask_rate": fixed.get("feature_mask_rate", 0.0),
     }
 
     return {**tuned, **fixed_defaults}
@@ -431,6 +432,7 @@ def _create_trial_objective(
     obj_metric = obj_cfg.get("metric", "precision_at_threshold")
     obj_threshold = obj_cfg.get("threshold", 0.60)
     beta = obj_cfg.get("beta", 0.5)
+    max_overfit_gap = optuna_cfg.get("max_overfit_gap", 0.25)
 
     features_path = get_normalized_parquet_path(config)
 
@@ -439,8 +441,8 @@ def _create_trial_objective(
 
     def _train_fold(
         params: dict, fold_sd: SplitDates, fold_idx: int, trial: optuna.Trial,
-    ) -> float:
-        """Train and evaluate a single CV fold. Returns F-beta score."""
+    ) -> tuple[float, float]:
+        """Train and evaluate a single CV fold. Returns (score, overfit_gap)."""
         dm = TradingDataModule(
             parquet_path=features_path,
             seq_len=params["sequence_length"],
@@ -449,11 +451,12 @@ def _create_trial_objective(
             cluster_id=cluster_id,
             clusters_parquet=cluster_cfg.output_parquet,
             noise_std=params["noise_std"],
+            feature_mask_rate=params.get("feature_mask_rate", 0.0),
         )
         dm.setup()
 
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
-            return 0.0
+            return 0.0, 0.0
 
         # FocalLoss already handles class imbalance — skip class_weights to avoid double correction
         cw = None if params["focal_gamma"] > 0 else dm.class_weights
@@ -509,37 +512,61 @@ def _create_trial_objective(
         except optuna.exceptions.TrialPruned:
             raise
         except Exception:
-            return 0.0
+            return 0.0, 0.0
         finally:
             del trainer
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
+
+        # Extract overfitting gap from training metrics
+        cb_metrics = model.trainer.callback_metrics if model.trainer else {}
+        train_acc = cb_metrics.get("train_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
+        val_acc = cb_metrics.get("val_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
+        overfit_gap = max(0.0, train_acc - val_acc)
 
         score = _compute_objective_value(
             model, dm, min_recall,
             metric=obj_metric, threshold=obj_threshold, beta=beta,
         )
         del model, dm
-        return score
+        return score, overfit_gap
 
     def objective(trial: optuna.Trial) -> float:
         params = suggest_hyperparams(trial, config)
 
-        # Evaluate on each CV fold, report mean F-beta
+        # Evaluate on each CV fold, report mean score and overfitting gap
         fold_scores = []
+        fold_gaps = []
         for fold_idx, fold_sd in enumerate(fold_splits):
             try:
-                score = _train_fold(params, fold_sd, fold_idx, trial)
+                result = _train_fold(params, fold_sd, fold_idx, trial)
+                if isinstance(result, tuple):
+                    score, gap = result
+                else:
+                    score, gap = result, 0.0
                 fold_scores.append(score)
+                fold_gaps.append(gap)
             except optuna.exceptions.TrialPruned:
                 raise
             except Exception as e:
                 print(f"    Trial {trial.number} fold {fold_idx+1} failed: {e}")
                 fold_scores.append(0.0)
+                fold_gaps.append(0.0)
 
         mean_score = float(np.mean(fold_scores)) if fold_scores else 0.0
+        avg_gap = float(np.mean(fold_gaps)) if fold_gaps else 0.0
+
+        # Penalize overfitting: if gap > max_overfit_gap, scale score down
+        if avg_gap > max_overfit_gap and max_overfit_gap > 0:
+            gap_penalty = max_overfit_gap / avg_gap
+            mean_score *= gap_penalty
+
         trial.set_user_attr("fold_scores", fold_scores)
-        print(f"    Trial {trial.number}: folds={[f'{s:.4f}' for s in fold_scores]}, mean={mean_score:.4f}")
+        trial.set_user_attr("avg_overfit_gap", round(avg_gap, 4))
+        print(
+            f"    Trial {trial.number}: folds={[f'{s:.4f}' for s in fold_scores]}, "
+            f"mean={mean_score:.4f}, gap={avg_gap:.4f}"
+        )
         return mean_score
 
     return objective
@@ -766,8 +793,7 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
             ("optimizer_name", "adamw"), ("scheduler_factor", 0.5),
             ("scheduler_patience", 5), ("gradient_clip_val", 2.0),
             ("bidirectional", False), ("num_attention_heads", 0),
-            ("head_hidden_ratio", 0.5), ("activation", "gelu"),
-            ("noise_std", 0.02),
+            ("activation", "gelu"), ("feature_mask_rate", 0.0),
         ]:
             full_params[key] = fixed.get(key, default)
 
@@ -820,6 +846,7 @@ def train_final_model(
         cluster_id=cluster_id,
         clusters_parquet=cluster_cfg.output_parquet,
         noise_std=best_params["noise_std"],
+        feature_mask_rate=best_params.get("feature_mask_rate", 0.0),
     )
     dm.setup()
 
@@ -872,6 +899,14 @@ def train_final_model(
         mode="max",
         min_delta=0.0,
     )
+    # Secondary early stopping on val_loss as circuit breaker against
+    # training with diverging validation loss
+    early_stop_loss = EarlyStopping(
+        monitor="val_loss",
+        patience=patience + 10,
+        mode="min",
+        min_delta=0.0,
+    )
     checkpoint = ModelCheckpoint(
         dirpath="checkpoints",
         monitor="val_precision_up",
@@ -889,7 +924,7 @@ def train_final_model(
         devices=1,
         precision=precision,
         logger=mlflow_logger,
-        callbacks=[early_stop_precision, checkpoint, progress_cb],
+        callbacks=[early_stop_precision, early_stop_loss, checkpoint, progress_cb],
         log_every_n_steps=10,
         gradient_clip_val=gradient_clip_val,
         enable_progress_bar=False,
@@ -1158,6 +1193,7 @@ def _create_global_trial_objective(
     obj_metric = obj_cfg.get("metric", "precision_at_threshold")
     obj_threshold = obj_cfg.get("threshold", 0.60)
     beta = obj_cfg.get("beta", 0.5)
+    max_overfit_gap = optuna_cfg.get("max_overfit_gap", 0.25)
     features_path = get_normalized_parquet_path(config)
     n_symbols_per_cluster = int(resolve_env_value(
         optuna_cfg.get("n_symbols_per_cluster", 3), default=3
@@ -1196,6 +1232,7 @@ def _create_global_trial_objective(
             cluster_id=None,
             clusters_parquet=cluster_cfg.output_parquet,
             noise_std=params["noise_std"],
+            feature_mask_rate=params.get("feature_mask_rate", 0.0),
         )
         dm._optimization_symbols = selected_symbols
         dm.setup()
@@ -1267,13 +1304,26 @@ def _create_global_trial_objective(
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
 
+        # Extract overfitting gap
+        cb_metrics = model.trainer.callback_metrics if model.trainer else {}
+        train_acc = cb_metrics.get("train_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
+        val_acc = cb_metrics.get("val_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
+        overfit_gap = max(0.0, train_acc - val_acc)
+
         # Compute objective on validation set (top symbols only)
-        result = _compute_objective_value(
+        score = _compute_objective_value(
             model, dm, min_recall,
             metric=obj_metric, threshold=obj_threshold, beta=beta,
         )
+
+        # Penalize overfitting
+        if overfit_gap > max_overfit_gap and max_overfit_gap > 0:
+            gap_penalty = max_overfit_gap / overfit_gap
+            score *= gap_penalty
+
+        trial.set_user_attr("avg_overfit_gap", round(overfit_gap, 4))
         del model, dm
-        return result
+        return score
 
     return objective
 

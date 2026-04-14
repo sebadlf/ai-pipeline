@@ -55,6 +55,7 @@ class TimeSeriesDataset(Dataset):
         target_dtype: torch.dtype = torch.int64,
         is_train: bool = False,
         noise_std: float = 0.01,
+        feature_mask_rate: float = 0.0,
     ) -> None:
         self.features = torch.tensor(features, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=target_dtype)
@@ -62,6 +63,7 @@ class TimeSeriesDataset(Dataset):
         self.valid_indices = valid_indices
         self.is_train = is_train
         self.noise_std = noise_std
+        self.feature_mask_rate = feature_mask_rate
 
     def __len__(self) -> int:
         return len(self.valid_indices)
@@ -74,6 +76,11 @@ class TimeSeriesDataset(Dataset):
         # Gaussian noise augmentation during training only
         if self.is_train and self.noise_std > 0:
             x = x + torch.randn_like(x) * self.noise_std
+
+        # Feature masking: zero out random features during training
+        if self.is_train and self.feature_mask_rate > 0:
+            mask = torch.rand(x.shape[-1]) > self.feature_mask_rate
+            x = x * mask.unsqueeze(0)
 
         return x, y
 
@@ -105,6 +112,7 @@ class TradingDataModule(L.LightningDataModule):
         cluster_id: str | None = None,
         clusters_parquet: str = "data/clusters.parquet",
         noise_std: float = 0.01,
+        feature_mask_rate: float = 0.0,
     ) -> None:
         super().__init__()
         from src.config import SplitDates
@@ -126,6 +134,7 @@ class TradingDataModule(L.LightningDataModule):
         self.split_dates = split_dates
         self.cluster_id = cluster_id
         self.noise_std = noise_std
+        self.feature_mask_rate = feature_mask_rate
         self.clusters_parquet = clusters_parquet
 
         self.feature_cols: list[str] = []
@@ -261,7 +270,7 @@ class TradingDataModule(L.LightningDataModule):
         for arr in (train_x, val_x, test_x):
             np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std)
+        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std, feature_mask_rate=self.feature_mask_rate)
         self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64)
         self.test_ds = TimeSeriesDataset(test_x, test_y, self.seq_len, test_vi, target_dtype=torch.int64)
 

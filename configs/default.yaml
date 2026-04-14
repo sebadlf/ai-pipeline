@@ -72,7 +72,7 @@ training:
     prod: 128
   max_epochs:
     dev: 10
-    prod: 100
+    prod: 50
   learning_rate: 0.0005
   weight_decay: 0.05
   label_smoothing: 0.05
@@ -80,7 +80,7 @@ training:
   noise_std: 0.02           # Gaussian noise augmentation on training inputs (matches optuna fixed_params)
   early_stopping_patience:
     dev: 3
-    prod: 15
+    prod: 10
   actionable_threshold: 0.70  # min prob_up for "actionable" stock count in summaries
   precision: "32"             # "32" or "16-mixed" (MPS mixed precision)
   max_workers:
@@ -112,6 +112,7 @@ training:
     convergence_patience:
       dev: 3                    # stop study if no improvement in N trials
       prod: 5
+    max_overfit_gap: 0.25       # penalize trials with train_acc - val_acc > 25%
     cv_folds: 3                 # time-series CV folds per trial (overtuning mitigation)
     ensemble_top_k: 3           # train top-K configs for ensemble inference
     persist: true               # always persist studies in PostgreSQL for warm-starting
@@ -130,15 +131,17 @@ training:
       # Training hyperparams
       learning_rate: { low: 1.0e-4, high: 1.0e-2, log: true }
       batch_size: [64, 128, 256]
-      weight_decay: { low: 1.0e-4, high: 0.1, log: true }
-      label_smoothing: { low: 0.0, high: 0.05 }
+      weight_decay: { low: 1.0e-3, high: 0.2, log: true }
+      label_smoothing: { low: 0.02, high: 0.12 }
       focal_gamma: { low: 0.0, high: 3.0 }
+      noise_std: { low: 0.01, high: 0.08 }
       # Architecture
-      hidden_size: [64, 96, 128, 256]
-      num_layers: { low: 1, high: 4 }
-      dropout: { low: 0.1, high: 0.5 }
+      hidden_size: [64, 96, 128]
+      num_layers: { low: 1, high: 3 }
+      dropout: { low: 0.2, high: 0.65 }
       sequence_length: [10, 20, 30]
-      input_dropout: { low: 0.0, high: 0.3 }
+      input_dropout: { low: 0.05, high: 0.4 }
+      head_hidden_ratio: { low: 0.25, high: 0.5 }
     # Fixed params — sensible defaults not searched by Optuna
     # Reduces search space dimensionality to prevent overtuning
     fixed_params:
@@ -148,9 +151,8 @@ training:
       gradient_clip_val: 2.0
       bidirectional: false
       num_attention_heads: 0
-      head_hidden_ratio: 0.5
       activation: "gelu"
-      noise_std: 0.02
+      feature_mask_rate: 0.10
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation
