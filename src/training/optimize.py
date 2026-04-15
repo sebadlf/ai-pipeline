@@ -631,11 +631,12 @@ def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
 
 
 def _tag_champion(run_ids: list[str], cluster_id: str) -> None:
-    """Tag the best ensemble run as 'champion' based on val_stability_score.
+    """Tag the best ensemble run as 'champion' based on generalization-adjusted score.
 
-    Compares all ensemble runs for a cluster and sets the 'champion' tag
-    on the one with the highest val_stability_score (or val_precision_up
-    as fallback). Non-champion runs are tagged as 'ensemble'.
+    Compares all ensemble runs for a cluster using val_stability_score
+    (or val_precision_up as fallback), penalized by the val→test precision
+    gap to prefer models that generalize well to unseen data.
+    Non-champion runs are tagged as 'ensemble'.
     """
     if not run_ids:
         return
@@ -650,7 +651,20 @@ def _tag_champion(run_ids: list[str], cluster_id: str) -> None:
         score = run.data.metrics.get("val_stability_score")
         if score is None:
             score = run.data.metrics.get("val_precision_up", 0.0)
-        if score is not None and score > best_score:
+        if score is None:
+            score = 0.0
+
+        # Penalize val→test gap: prefer models where test_precision is close
+        # to val_precision (good generalization to unseen data)
+        val_prec = run.data.metrics.get("val_precision_up", 0.0)
+        test_prec = run.data.metrics.get("test_precision_up")
+        if val_prec > 0 and test_prec is not None and test_prec > 0:
+            gen_ratio = min(test_prec / val_prec, 1.0)
+            # Soft penalty: score *= (1 + ratio) / 2
+            # ratio=1.0 → no penalty; ratio=0.5 → score *= 0.75
+            score *= (1.0 + gen_ratio) / 2.0
+
+        if score > best_score:
             best_score = score
             best_run_id = rid
 

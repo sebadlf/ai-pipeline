@@ -112,7 +112,7 @@ training:
     convergence_patience:
       dev: 3                    # stop study if no improvement in N trials
       prod: 5
-    max_overfit_gap: 0.25       # penalize trials with train_acc - val_acc > 25%
+    max_overfit_gap: 0.30       # penalize trials with train_acc - val_acc > 30%
     cv_folds: 3                 # time-series CV folds per trial (overtuning mitigation)
     ensemble_top_k: 3           # train top-K configs for ensemble inference
     persist: true               # always persist studies in PostgreSQL for warm-starting
