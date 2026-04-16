@@ -146,6 +146,98 @@ def _detect_feature_changes(selected_cols: list[str], manifest_path: Path) -> di
         return {"added": selected_cols, "removed": [], "unchanged": [], "significant_change": True}
 
 
+def detect_drift(
+    df: pl.DataFrame,
+    config: dict,
+    recent_months: int = 6,
+    rank_change_threshold: float = 0.30,
+    verbose: bool = True,
+) -> dict:
+    """Detect feature drift by comparing MI rankings in recent vs full period.
+
+    Compares mutual information rankings of features computed on the full
+    training period against the most recent `recent_months` months. Features
+    whose relative rank changes by more than `rank_change_threshold` are
+    flagged as drifting.
+
+    Args:
+        df: Features DataFrame with symbol, date, target columns.
+        config: Full config dict.
+        recent_months: Number of recent months to compare against full period.
+        rank_change_threshold: Flag features with rank change > this fraction.
+        verbose: Print drift report.
+
+    Returns:
+        dict with 'drifted_features', 'rank_changes', 'n_features', 'has_significant_drift'.
+    """
+    from sklearn.feature_selection import mutual_info_classif
+
+    feature_cols = [c for c in df.columns if _is_feature_col(c)]
+    if not feature_cols or "target" not in df.columns:
+        return {"drifted_features": [], "rank_changes": {}, "n_features": 0, "has_significant_drift": False}
+
+    # Full period MI
+    full_df = df.select(feature_cols + ["target"]).drop_nulls()
+    X_full = full_df.select(feature_cols).to_numpy()
+    y_full = full_df["target"].to_numpy()
+    np.nan_to_num(X_full, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if len(X_full) < 100:
+        return {"drifted_features": [], "rank_changes": {}, "n_features": len(feature_cols), "has_significant_drift": False}
+
+    mi_full = mutual_info_classif(X_full, y_full, random_state=42)
+
+    # Recent period MI
+    cutoff = df["date"].max() - dt.timedelta(days=recent_months * 30)
+    recent_df = df.filter(pl.col("date") >= cutoff).select(feature_cols + ["target"]).drop_nulls()
+    X_recent = recent_df.select(feature_cols).to_numpy()
+    y_recent = recent_df["target"].to_numpy()
+    np.nan_to_num(X_recent, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if len(X_recent) < 100:
+        if verbose:
+            print(f"  Feature drift: not enough recent data ({len(X_recent)} rows), skipping")
+        return {"drifted_features": [], "rank_changes": {}, "n_features": len(feature_cols), "has_significant_drift": False}
+
+    mi_recent = mutual_info_classif(X_recent, y_recent, random_state=42)
+
+    # Compare rankings (normalized to [0, 1])
+    n = len(feature_cols)
+    rank_full = np.argsort(np.argsort(-mi_full)).astype(float) / max(n - 1, 1)
+    rank_recent = np.argsort(np.argsort(-mi_recent)).astype(float) / max(n - 1, 1)
+
+    rank_changes = {}
+    drifted = []
+    for i, col in enumerate(feature_cols):
+        change = abs(rank_full[i] - rank_recent[i])
+        rank_changes[col] = round(float(change), 4)
+        if change > rank_change_threshold:
+            drifted.append(col)
+
+    has_drift = len(drifted) > max(1, int(n * 0.1))  # significant if >10% of features drifted
+
+    if verbose:
+        print(f"\n  Feature drift analysis (last {recent_months} months vs full period):")
+        print(f"    Total features: {n}")
+        print(f"    Drifted features (rank change > {rank_change_threshold:.0%}): {len(drifted)}")
+        if drifted:
+            # Sort by drift magnitude
+            drifted_sorted = sorted(drifted, key=lambda c: rank_changes[c], reverse=True)
+            for col in drifted_sorted[:10]:
+                print(f"      {col}: rank change = {rank_changes[col]:.2%}")
+            if len(drifted_sorted) > 10:
+                print(f"      ... and {len(drifted_sorted) - 10} more")
+        if has_drift:
+            print(f"    WARNING: Significant feature drift detected! Consider retraining.")
+
+    return {
+        "drifted_features": drifted,
+        "rank_changes": rank_changes,
+        "n_features": n,
+        "has_significant_drift": has_drift,
+    }
+
+
 def main() -> None:
     """Run feature selection on the features parquet and save result."""
     from src.config import compute_split_dates
@@ -188,6 +280,12 @@ def main() -> None:
         print(f"\n     ... existing models were trained with DIFFERENT features.")
         print(f"     ... you MUST retrain models: make train")
         print(f"     ... otherwise aggregate/signals will fail or be unreliable.\n")
+
+    # Feature drift detection — compare recent vs full period MI rankings
+    drift_result = detect_drift(df, config, recent_months=6, verbose=True)
+    if drift_result["has_significant_drift"]:
+        print(f"\n  WARNING: {len(drift_result['drifted_features'])} features show significant drift.")
+        print(f"  Models trained on older data may underperform. Consider retraining.")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df_selected.write_parquet(args.output)

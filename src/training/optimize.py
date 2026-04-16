@@ -24,9 +24,12 @@ import mlflow
 import numpy as np
 import optuna
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import MLFlowLogger
 from optuna.integration import PyTorchLightningPruningCallback
+
+from scipy.optimize import minimize_scalar
 
 from src.config import (
     ClusterConfig,
@@ -90,6 +93,41 @@ class ClusterProgressCallback(L.Callback):
         prec_str = f"{val_prec.item():.4f}" if val_prec is not None else "N/A"
         acc_str = f"{val_acc.item():.4f}" if val_acc is not None else "N/A"
         print(f"  {self.prefix} DONE at epoch {epoch} — val_precision_up={prec_str}, val_acc={acc_str}")
+
+
+def calibrate_temperature(
+    model: LSTMForecaster,
+    val_dataloader,
+) -> float:
+    """Find optimal temperature T that minimizes NLL on validation set.
+
+    Temperature scaling (Guo et al. 2017) adjusts logits by dividing by T
+    before softmax, correcting overconfident predictions without changing
+    accuracy or ranking.
+
+    Returns:
+        Optimal temperature value (T > 1 means model was overconfident).
+    """
+    model.eval()
+    all_logits = []
+    all_targets = []
+
+    with torch.no_grad():
+        for batch in val_dataloader:
+            x, y = batch
+            logits = model(x)
+            all_logits.append(logits.cpu())
+            all_targets.append(y.cpu().long())
+
+    all_logits = torch.cat(all_logits)
+    all_targets = torch.cat(all_targets)
+
+    def nll_loss(T: float) -> float:
+        scaled = all_logits / T
+        return F.cross_entropy(scaled, all_targets).item()
+
+    result = minimize_scalar(nll_loss, bounds=(0.1, 10.0), method="bounded")
+    return float(result.x)
 
 
 def _get_random_symbols(
@@ -441,8 +479,8 @@ def _create_trial_objective(
 
     def _train_fold(
         params: dict, fold_sd: SplitDates, fold_idx: int, trial: optuna.Trial,
-    ) -> tuple[float, float]:
-        """Train and evaluate a single CV fold. Returns (score, overfit_gap)."""
+    ) -> tuple[float, float, int]:
+        """Train and evaluate a single CV fold. Returns (score, overfit_gap, n_val_samples)."""
         dm = TradingDataModule(
             parquet_path=features_path,
             seq_len=params["sequence_length"],
@@ -456,7 +494,7 @@ def _create_trial_objective(
         dm.setup()
 
         if len(dm.train_ds) <= 0 or len(dm.val_ds) <= 0:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0
 
         # FocalLoss already handles class imbalance — skip class_weights to avoid double correction
         cw = None if params["focal_gamma"] > 0 else dm.class_weights
@@ -518,18 +556,20 @@ def _create_trial_objective(
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
 
-        # Extract overfitting gap from training metrics
+        # Extract overfitting gap from precision (not accuracy) — precision-specific
+        # gap detects UP class memorization that accuracy gap misses
         cb_metrics = model.trainer.callback_metrics if model.trainer else {}
-        train_acc = cb_metrics.get("train_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
-        val_acc = cb_metrics.get("val_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
-        overfit_gap = max(0.0, train_acc - val_acc)
+        train_prec = cb_metrics.get("train_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        val_prec = cb_metrics.get("val_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        overfit_gap = max(0.0, train_prec - val_prec)
 
+        n_val = len(dm.val_ds)
         score = _compute_objective_value(
             model, dm, min_recall,
             metric=obj_metric, threshold=obj_threshold, beta=beta,
         )
         del model, dm
-        return score, overfit_gap
+        return score, overfit_gap, n_val
 
     def objective(trial: optuna.Trial) -> float:
         params = suggest_hyperparams(trial, config)
@@ -537,21 +577,27 @@ def _create_trial_objective(
         # Evaluate on each CV fold, report mean score and overfitting gap
         fold_scores = []
         fold_gaps = []
+        fold_val_sizes = []
         for fold_idx, fold_sd in enumerate(fold_splits):
             try:
                 result = _train_fold(params, fold_sd, fold_idx, trial)
-                if isinstance(result, tuple):
+                if isinstance(result, tuple) and len(result) == 3:
+                    score, gap, n_val = result
+                elif isinstance(result, tuple):
                     score, gap = result
+                    n_val = 0
                 else:
-                    score, gap = result, 0.0
+                    score, gap, n_val = result, 0.0, 0
                 fold_scores.append(score)
                 fold_gaps.append(gap)
+                fold_val_sizes.append(n_val)
             except optuna.exceptions.TrialPruned:
                 raise
             except Exception as e:
                 print(f"    Trial {trial.number} fold {fold_idx+1} failed: {e}")
                 fold_scores.append(0.0)
                 fold_gaps.append(0.0)
+                fold_val_sizes.append(0)
 
         mean_score = float(np.mean(fold_scores)) if fold_scores else 0.0
         avg_gap = float(np.mean(fold_gaps)) if fold_gaps else 0.0
@@ -563,6 +609,7 @@ def _create_trial_objective(
 
         trial.set_user_attr("fold_scores", fold_scores)
         trial.set_user_attr("avg_overfit_gap", round(avg_gap, 4))
+        trial.set_user_attr("n_val_samples", int(np.mean([v for v in fold_val_sizes if v > 0])) if any(v > 0 for v in fold_val_sizes) else 0)
         print(
             f"    Trial {trial.number}: folds={[f'{s:.4f}' for s in fold_scores]}, "
             f"mean={mean_score:.4f}, gap={avg_gap:.4f}"
@@ -781,6 +828,22 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         _log_error_to_cluster_experiment(config, cluster_id, RuntimeError(msg))
         raise RuntimeError(msg)
 
+    # Multiple testing correction (Bailey & Lopez de Prado, "Deflated Sharpe Ratio", 2014)
+    # Adjusts best score for the number of trials tested to avoid selection bias
+    best_score = top_trials[0].value
+    n_completed = len(completed)
+    # Estimate n_val_samples from first trial's user_attrs if available
+    n_val_samples = top_trials[0].user_attrs.get("n_val_samples", 500)
+    if n_completed > 1 and n_val_samples > 0:
+        correction = np.sqrt(2 * np.log(n_completed) / n_val_samples)
+        corrected_score = best_score - correction
+    else:
+        correction = 0.0
+        corrected_score = best_score
+    print(f"  Multiple testing correction: raw={best_score:.4f}, "
+          f"correction={correction:.4f}, corrected={corrected_score:.4f} "
+          f"(n_trials={n_completed}, n_val≈{n_val_samples})")
+
     # Optuna study summary for logging
     optuna_meta = {
         "optuna_total_trials": len(study.trials),
@@ -788,6 +851,9 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         "optuna_compatible_trials": len(completed),
         "optuna_filtered_trials": filtered_count,
         "optuna_unique_ensemble_configs": len(top_trials),
+        "optuna_best_score_raw": best_score,
+        "optuna_best_score_corrected": corrected_score,
+        "optuna_multiple_testing_correction": correction,
     }
 
     print(f"\n  Top-{len(top_trials)} trials:")
@@ -816,8 +882,15 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         full_params["_optuna_trial_number"] = trial.number
         full_params["_optuna_trial_value"] = trial.value
 
-        print(f"\n  Training ensemble model {rank}/{len(top_trials)} (trial #{trial.number})...")
-        run_id = train_final_model(config, cluster_id, full_params, split_dates, ensemble_rank=rank)
+        # Ensemble temporal diversity: rank 1=100%, rank 2=75%, rank 3=50% of training data
+        ensemble_offsets = [0.0, 0.25, 0.50]
+        offset_pct = ensemble_offsets[rank - 1] if rank <= len(ensemble_offsets) else 0.0
+
+        print(f"\n  Training ensemble model {rank}/{len(top_trials)} (trial #{trial.number}, train_offset={offset_pct:.0%})...")
+        run_id = train_final_model(
+            config, cluster_id, full_params, split_dates,
+            ensemble_rank=rank, train_date_offset_pct=offset_pct,
+        )
         if run_id:
             ensemble_run_ids.append(run_id)
 
@@ -831,6 +904,7 @@ def train_final_model(
     best_params: dict[str, Any],
     split_dates: SplitDates,
     ensemble_rank: int = 1,
+    train_date_offset_pct: float = 0.0,
 ) -> str | None:
     """Train the final model with optimal hyperparameters and log to MLflow.
 
@@ -840,6 +914,8 @@ def train_final_model(
         best_params: Best hyperparameters from Optuna.
         split_dates: Temporal split dates.
         ensemble_rank: Rank in ensemble (1=best, 2=second, 3=third).
+        train_date_offset_pct: Fraction of oldest training data to discard
+            for ensemble temporal diversity (0.0=all data, 0.25=75% most recent).
 
     Returns:
         MLflow run_id of the completed run, or None if training was skipped.
@@ -851,7 +927,16 @@ def train_final_model(
 
     print(f"\n  Training final model for {cluster_id} with best params...")
 
+    # Check normalization stats freshness
+    from src.features.normalize import check_staleness, load_normalization_stats
+    try:
+        norm_stats = load_normalization_stats(config)
+        check_staleness(norm_stats, max_age_days=90)
+    except FileNotFoundError:
+        pass  # Will fail later when loading data
+
     # DataModule
+    time_decay_lambda = float(train_cfg.get("time_decay_lambda", 0.0))
     dm = TradingDataModule(
         parquet_path=features_path,
         seq_len=best_params["sequence_length"],
@@ -861,6 +946,8 @@ def train_final_model(
         clusters_parquet=cluster_cfg.output_parquet,
         noise_std=best_params["noise_std"],
         feature_mask_rate=best_params.get("feature_mask_rate", 0.0),
+        train_date_offset_pct=train_date_offset_pct,
+        time_decay_lambda=time_decay_lambda,
     )
     dm.setup()
 
@@ -952,7 +1039,12 @@ def train_final_model(
     try:
         trainer.fit(model, dm)
 
-        # Test
+        # Temperature scaling calibration (Guo et al. 2017)
+        optimal_temp = calibrate_temperature(model, dm.val_dataloader())
+        model.hparams["calibration_temperature"] = optimal_temp
+        print(f"  Calibration temperature: {optimal_temp:.4f}")
+
+        # Test (predict_proba now uses calibrated temperature)
         test_results = trainer.test(model, dm)
         print(f"  Test results: {test_results}")
 
@@ -1004,6 +1096,9 @@ def train_final_model(
         best_val_loss = checkpoint.best_model_score
         if best_val_loss is not None:
             client.log_metric(run_id, "best_val_precision_up", float(best_val_loss))
+
+        # Log calibration temperature
+        client.log_metric(run_id, "calibration_temperature", optimal_temp)
 
         # Detect which early stopping triggered
         for cb in trainer.callbacks:
@@ -1060,17 +1155,21 @@ def _log_confusion_matrix(
     ]:
         all_preds = []
         all_targets = []
+        all_probs = []
 
         with torch.no_grad():
             for batch in dataloader:
                 x, y = batch
                 logits = model(x)
                 preds = logits.argmax(dim=-1)
+                probs = model.predict_proba(x)
                 all_preds.append(preds.cpu())
                 all_targets.append(y.cpu())
+                all_probs.append(probs[:, 1].cpu())
 
         all_preds_np = torch.cat(all_preds).numpy()
         all_targets_np = torch.cat(all_targets).numpy()
+        all_probs_np = torch.cat(all_probs).numpy()
 
         cm = confusion_matrix(all_targets_np, all_preds_np, labels=[0, 1])
         precision, recall, f1, _ = precision_recall_fscore_support(
@@ -1082,6 +1181,11 @@ def _log_confusion_matrix(
         client.log_metric(run_id, f"{split_name}_precision_up", float(precision[1]))
         client.log_metric(run_id, f"{split_name}_recall_up", float(recall[1]))
         client.log_metric(run_id, f"{split_name}_f1_up", float(f1[1]))
+
+        # Brier score: calibration quality metric (lower is better)
+        up_targets = (all_targets_np == 1).astype(np.float64)
+        brier_score = float(np.mean((all_probs_np - up_targets) ** 2))
+        client.log_metric(run_id, f"{split_name}_brier_score", brier_score)
 
         print(
             f"  {split_name} — precision_up={precision[1]:.3f}, "
@@ -1318,11 +1422,11 @@ def _create_global_trial_objective(
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
 
-        # Extract overfitting gap
+        # Extract overfitting gap from precision (not accuracy)
         cb_metrics = model.trainer.callback_metrics if model.trainer else {}
-        train_acc = cb_metrics.get("train_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
-        val_acc = cb_metrics.get("val_acc", torch.tensor(0.5)).item() if cb_metrics else 0.5
-        overfit_gap = max(0.0, train_acc - val_acc)
+        train_prec = cb_metrics.get("train_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        val_prec = cb_metrics.get("val_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        overfit_gap = max(0.0, train_prec - val_prec)
 
         # Compute objective on validation set (top symbols only)
         score = _compute_objective_value(

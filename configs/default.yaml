@@ -53,6 +53,7 @@ normalization:
 target:
   horizon: 21          # trading days ahead (~1 month)
   buy_threshold: 0.025 # +2.5% → UP (1), otherwise NOT_UP (0)
+  volatility_adjusted: true  # scale threshold by per-stock realized vol (de Prado AFML Ch. 3)
 
 # Model
 model:
@@ -83,6 +84,7 @@ training:
     prod: 10
   actionable_threshold: 0.70  # min prob_up for "actionable" stock count in summaries
   precision: "32"             # "32" or "16-mixed" (MPS mixed precision)
+  time_decay_lambda: 0.5      # exponential time-decay for sample weights (half-life ~1.4 years, 0=disabled)
   max_workers:
     dev: 4                    # parallel cluster training workers
     prod: 4
@@ -232,6 +234,8 @@ portfolio:
     max_single_position: 0.10
     min_single_position: 0.01
     rebalance_frequency_days: 21
+    turnover_penalty: 0.005        # penalize weight changes from previous allocation
+    max_position_drift: 0.03       # rebalance if any position drifts >3% from target
   benchmark: SPY
   output_parquet: data/portfolios.parquet
 
@@ -248,7 +252,8 @@ regime:
 backtest:
   initial_capital: 100000
   commission_pct: 0.001
-  slippage_bps: 5           # 5 basis points slippage on entry/exit
+  slippage_bps: 5           # 5 basis points base slippage on entry/exit
+  volume_impact_factor: 0.1  # volume-dependent slippage factor (Almgren & Chriss 2001, 0=disabled)
   risk:
     position_stop_loss: 0.08
     position_take_profit: 0.50

@@ -6,13 +6,16 @@
 
 ## Purpose
 
-Group stocks into behaviorally similar clusters within each GICS sector. Each cluster then gets its own LSTM model in Stage 2, allowing models to specialize for stocks with similar return profiles, volatility patterns, fundamental characteristics, and macro sensitivities.
+Group stocks into behaviorally similar clusters. Each cluster then gets its own LSTM model in Stage 2, allowing models to specialize for stocks with similar return profiles, volatility patterns, fundamental characteristics, and macro sensitivities.
 
-## Why Per-Sector Then Per-Cluster
+## Clustering Modes
 
-Stocks in different sectors (e.g., Technology vs Utilities) have fundamentally different dynamics. Clustering across sectors would produce noisy groupings. Instead, the pipeline first groups by GICS sector (from `stock_sectors` table), then runs KMeans within each sector to find sub-groups.
+The pipeline supports two clustering modes controlled by `PIPELINE_ENV`:
 
-## Clustering Features (19)
+- **Dev (sector-based)**: Groups by GICS sector first, then runs KMeans within each sector. Faster, produces sector-prefixed cluster IDs like `Technology_0`
+- **Prod (global KMeans)**: Runs KMeans across all stocks globally with sector features included as one-hot encoded inputs (`include_sector_features: true`). Auto-selects optimal K in [`min_clusters`..`max_clusters`] (3-10) via silhouette analysis. Produces global cluster IDs
+
+## Clustering Features (20)
 
 Features are computed from the training period only (before `train_end`) to avoid data leakage.
 
@@ -60,13 +63,16 @@ Most recent quarterly values before `train_end`, from `key_metrics_quarterly` an
 
 ## Clustering Algorithm
 
-### Pipeline per Sector
+### Pipeline (Prod — Global KMeans)
 
 ```
-Stocks in sector
+All stocks
     │
     ▼
-Compute 19 features per stock
+Compute 20 features per stock
+    │
+    ▼
+One-hot encode GICS sector (if include_sector_features: true)
     │
     ▼
 Handle NaN (fill with column medians)
@@ -78,25 +84,25 @@ StandardScaler (zero mean, unit variance)
 PCA (retain 95% of explained variance)
     │
     ▼
-Silhouette search: K = 2..max_clusters_per_sector
+Silhouette search: K = min_clusters..max_clusters (3..10)
     │
     ▼
 KMeans with optimal K
     │
     ▼
-Merge clusters smaller than min_cluster_size
+Merge clusters smaller than min_cluster_size (10)
     │
     ▼
-Assign cluster_id = "{Sector}_{k}"
+Assign cluster_id
 ```
 
 ### PCA Dimensionality Reduction
 
-With 19 features, many are correlated (e.g., ROE with net profit margin, P/E with earnings yield). PCA reduces to the components explaining `pca_variance_ratio` (default 0.95 = 95%) of variance before clustering. This prevents correlated features from dominating the Euclidean distance in KMeans.
+With 20 features (plus optional one-hot sectors), many are correlated (e.g., ROE with net profit margin, P/E with earnings yield). PCA reduces to the components explaining `pca_variance_ratio` (default 0.95 = 95%) of variance before clustering. This prevents correlated features from dominating the Euclidean distance in KMeans.
 
 ### Automatic K Selection
 
-Instead of a fixed number of clusters, the pipeline tests K from 2 to `max_clusters_per_sector` (default 6) and selects the K with the highest silhouette score. If the best K produces any cluster smaller than `min_cluster_size` (default 3), the next-best K is tried.
+Instead of a fixed number of clusters, the pipeline tests K from `min_clusters` (3) to `max_clusters` (10) and selects the K with the highest silhouette score. Clusters smaller than `min_cluster_size` (10) are merged to nearest centroids.
 
 ### Small Cluster Merging
 
@@ -107,14 +113,16 @@ After KMeans, clusters with fewer than `min_cluster_size` stocks are merged into
 ```yaml
 clustering:
   method: kmeans
-  max_clusters_per_sector: 6
+  max_clusters: 10
+  min_clusters: 3
+  include_sector_features: true   # one-hot encode sector as clustering input
   pca_variance_ratio: 0.95
-  min_cluster_size: 3
+  min_cluster_size: 10
   features_for_clustering:
     - return_20d_mean
     - volatility_60d
     - volume_profile
-    # ... (19 features listed in default.yaml)
+    # ... (20 features listed in default.yaml)
   output_parquet: data/clusters.parquet
   cluster_thresholds: {}   # per-cluster buy_threshold overrides
 ```

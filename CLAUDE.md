@@ -19,10 +19,11 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 - Output: `data/clusters.parquet`, `cluster_assignments` table
 
 ### Stage 2: Model Training
-- **Per-cluster Optuna optimization** (`optimize.py`): Each cluster gets its own Optuna study with 3-fold time-series CV, reduced search space (~10 params), and convergence-based early stopping
-- **Ensemble training** (`train.py`): Top-3 Optuna configs per cluster are trained as full models for ensemble inference
+- **Per-cluster Optuna optimization** (`optimize.py`): Each cluster gets its own Optuna study with 3-fold time-series CV, ~12 tunable params, overfitting gap penalty, and convergence-based early stopping
+- **Ensemble training** (`train.py`): Top-3 deduplicated Optuna configs per cluster are trained as full models for ensemble inference
+- **Champion selection**: Best ensemble member is tagged as "champion" using a generalization-adjusted score that penalizes val→test precision gap
 - Each cluster gets its own MLflow experiment (`cluster/{cluster_id}`) with 3 runs (one per ensemble member)
-- Model output is `prob_up` -- the probability of UP, averaged across ensemble. This is the sole signal used downstream
+- Model output is `prob_up` -- the probability of UP, weighted-averaged across ensemble by val_precision_up. This is the sole signal used downstream
 
 ### Stage 3: Model Promotion
 - **Cascading elimination** (`promote.py` + `precision_eval.py`): Precision-focused evaluation with walk-forward stability, minimum recall filters, and FP severity tiebreaking
@@ -32,7 +33,8 @@ Local ML pipeline for evaluating stock trading strategies on the full S&P 500 un
 ### Stage 4: Prediction Aggregation
 - Loads ensemble model checkpoints (top-3) per cluster from MLflow registry
 - Validates feature consistency between models and current data
-- Runs inference with each ensemble member, averages `prob_up` per symbol
+- Runs inference with each ensemble member, computes **weighted average** of `prob_up` per symbol (weights proportional to each model's `val_precision_up`)
+- Detects normalization drift: warns if feature distributions deviate >3 std from training-period statistics
 - Output: `data/predictions.parquet`, `predictions` table
 
 ### Stage 5: Portfolio Optimization
@@ -203,8 +205,8 @@ ai-pipeline/
 - Normalization reads `features_selected.parquet`, computes training-set stats, clips outliers, applies Z-score, outputs `data/features_normalized.parquet` + `data/normalization_stats.json`
 - Training and aggregation read from `features_normalized.parquet`; runner uses `normalization_stats.json` for inference-time normalization
 - Clustering reads sectors from DB + features, assigns clusters with KMeans + PCA, outputs `data/clusters.parquet`
-- Optuna optimizes hyperparameters globally (persisted to PostgreSQL), then per-cluster training uses shared params
-- Aggregation loads champion models from MLflow registry, validates feature compatibility, runs inference with training-period normalization
+- Optuna optimizes hyperparameters per-cluster (persisted to PostgreSQL), with overfitting gap penalty and warm-starting from previous studies
+- Aggregation loads champion models from MLflow registry, validates feature compatibility, runs weighted-average ensemble inference (weights by val_precision_up), detects normalization drift
 - Portfolio optimizer uses predictions + historical returns to construct 3 risk-profiled portfolios
 - Backtesting simulates portfolios across bull/bear/sideways regimes with risk management
 - Data is normalized in a dedicated step (`normalize.py`): outlier clipping to [p01, p99] + Z-score with training-set statistics. Stats saved to `data/normalization_stats.json`, normalized data to `data/features_normalized.parquet`. Used by training, aggregation, and inference
@@ -279,62 +281,69 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 |---|---|---|
 | `ingestion.start_years_back` | 8 years | 20 years |
 | `training.batch_size` | 256 | 128 |
-| `training.max_epochs` | 10 | 200 |
-| `training.early_stopping_patience` | 3 | 15 |
+| `training.max_epochs` | 10 | 50 |
+| `training.early_stopping_patience` | 3 | 10 |
 | `training.optuna.epochs_per_trial` | 5 | 30 |
 | `training.optuna.convergence_patience` | 3 | 5 |
-| `training.optuna.max_history_days` | 7 days | 30 days |
+| `training.optuna.max_history_days` | 7 days | 60 days |
 | Clustering mode | Sector-based (fast) | Global KMeans |
 | Pipeline default | Skips ingestion | Includes ingestion |
 
 ## Model details
 
-- **Architecture**: LSTM with input dropout, configurable activation (GELU/SiLU/Mish), residual connection, optional MultiheadAttention, optional bidirectional
+- **Architecture**: LSTM with input dropout, configurable activation (GELU/SiLU/Mish), last-timestep residual connection, optional MultiheadAttention, optional bidirectional. MLP classification head with tunable `head_hidden_ratio`
 - **Task**: Binary classification -- UP (>=+2.5%) vs NOT_UP in 21 trading days
+- **Loss**: FocalLoss (gamma tunable 0-3) with label smoothing, handles class imbalance. Falls back to CrossEntropy with class weights when focal_gamma=0
 - **Threshold**: buy_threshold configurable per cluster in `configs/default.yaml` under `clustering.cluster_thresholds`
-- **Optimizer**: Configurable (AdamW, RAdam, SGD, Lion) with ReduceLROnPlateau scheduler
-- **Early stopping**: Monitors `val_acc`, patience dev:7 / prod:15
+- **Optimizer**: AdamW with ReduceLROnPlateau scheduler monitoring `val_precision_up` (mode="max")
+- **Early stopping**: Dual early stopping — primary on `val_precision_up` (patience dev:3/prod:10), secondary circuit breaker on `val_loss` (patience+10, prevents diverging val_loss)
+- **Data augmentation**: Gaussian noise injection (tunable 0.01-0.08 std) + feature masking (10% random feature dropout per sample) during training only
 - **Feature names**: Stored in checkpoint hparams for reproducible inference
 - **Precision**: Configurable via `training.precision` — `"32"` (default) or `"16-mixed"` (MPS mixed precision, reduces memory ~40%)
+- **Residual connection**: Projects input features at the last timestep only (not all timesteps) to avoid LSTM bypass
 
-**Note on model/training defaults in YAML**: The values in `model` and `training` sections (hidden_size, dropout, etc.) are **fallback defaults only**. In the standard pipeline flow (`make train-clusters`), Optuna optimizes ~10 tunable hyperparameters per cluster — the YAML defaults are never used. Fixed params (optimizer, activation, etc.) are read from `training.optuna.fixed_params`.
+**Note on model/training defaults in YAML**: The values in `model` and `training` sections (hidden_size, dropout, etc.) are **fallback defaults only**. In the standard pipeline flow (`make train-clusters`), Optuna optimizes ~12 tunable hyperparameters per cluster — the YAML defaults are never used. Fixed params (optimizer, activation, etc.) are read from `training.optuna.fixed_params`.
 
 ## Optuna optimization
 
 - **Per-cluster mode**: Each cluster gets its own Optuna study (`cluster-v2/{cluster_id}`)
-- **Objective**: Mean F-beta score across 3 time-series CV folds (beta=0.5, prioritizing precision)
-- **Recall floor**: Minimum recall of 0.15 before penalizing objective (quadratic penalty)
+- **Objective**: Mean precision-at-threshold (0.50) across 3 time-series CV folds, with overfitting gap penalty
+- **Overfitting penalty**: If avg train_acc - val_acc > `max_overfit_gap` (0.30), the objective score is scaled down by `max_gap / actual_gap`. This prevents Optuna from selecting configs that memorize the training set
+- **Recall floor**: Minimum recall of 0.15 before applying quadratic penalty to objective
 - **Trials**: 5 (dev) / 15 (prod) per cluster, with convergence-based early stopping
 - **Convergence detection**: Study stops if no improvement in 3 (dev) / 5 (prod) consecutive completed trials
 - **CV folds**: 3 expanding-window folds with purge gaps to prevent data leakage
-- **Ensemble**: Top-3 trial configs are trained as full models for ensemble inference
+- **Ensemble**: Top-3 deduplicated trial configs (10 key params checked for near-duplicates) are trained as full models for ensemble inference
+- **Champion selection**: Best ensemble member tagged as "champion" using generalization-adjusted score: `base_score * (1 + test_prec/val_prec) / 2`. Prefers models where test precision is close to validation precision
 - **Pruning**: Startup period without pruning, then MedianPruner on last fold
-- **Persistence**: Studies stored in PostgreSQL for warm-starting; old trials pruned by `max_history_days`
-- **Overtuning mitigations**: Reduced search space (~10 params), time-series CV, convergence stop, ensemble top-3, holdout test, noise augmentation
-- **Tunable search space** (~10 params, configurable in `training.optuna.search_space`):
+- **Persistence**: Studies stored in PostgreSQL for warm-starting; old trials filtered by `max_history_days` (dev:7d, prod:60d)
+- **Overtuning mitigations**: Reduced search space (~12 params), time-series CV, convergence stop, ensemble top-3, holdout test, noise augmentation, feature masking, overfitting gap penalty, capacity limits (max 128 hidden, max 3 layers)
+- **Tunable search space** (~12 params, configurable in `training.optuna.search_space`):
 
 | Parameter | Type | Range/Values |
 |---|---|---|
 | learning_rate | float (log) | 1e-4 to 1e-2 |
 | batch_size | categorical | [64, 128, 256] |
-| weight_decay | float (log) | 1e-4 to 0.1 |
-| label_smoothing | float | 0.0-0.15 |
-| focal_gamma | float | 0.0-5.0 |
-| hidden_size | categorical | [64, 96, 128, 256] |
-| num_layers | int | 1-4 |
-| dropout | float | 0.1-0.5 |
+| weight_decay | float (log) | 1e-3 to 0.2 |
+| label_smoothing | float | 0.02-0.12 |
+| focal_gamma | float | 0.0-3.0 |
+| noise_std | float | 0.01-0.08 |
+| hidden_size | categorical | [64, 96, 128] |
+| num_layers | int | 1-3 |
+| dropout | float | 0.2-0.65 |
 | sequence_length | categorical | [10, 20, 30] |
-| input_dropout | float | 0.0-0.3 |
+| input_dropout | float | 0.05-0.4 |
+| head_hidden_ratio | float | 0.25-0.5 |
 
-- **Fixed params** (not searched, in `training.optuna.fixed_params`): optimizer_name=adamw, scheduler_factor=0.5, scheduler_patience=5, gradient_clip_val=2.0, bidirectional=false, num_attention_heads=0, head_hidden_ratio=0.5, activation=gelu, noise_std=0.02
+- **Fixed params** (not searched, in `training.optuna.fixed_params`): optimizer_name=adamw, scheduler_factor=0.5, scheduler_patience=5, gradient_clip_val=2.0, bidirectional=false, num_attention_heads=0, activation=gelu, feature_mask_rate=0.10
 
 ## Model promotion (cascading elimination)
 
 - **Precision-at-threshold evaluation**: Tests model at thresholds [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
 - **Primary threshold**: 0.65 (used for stability score and recall filters)
 - **Walk-forward stability**: window=63 days (3x horizon), step=21 days (=horizon)
-- **Stability score**: `mean_precision - 1.5 * std_precision` (penalizes inconsistent precision)
-- **Filters**: max std ratio 0.15, min recall 0.10, min 5 UP signals per window
+- **Stability score**: `mean_precision - 1.0 * std_precision` (penalizes inconsistent precision)
+- **Filters**: max std ratio 0.25, min recall 0.10, min 3 UP signals per window
 - **Tiebreaking**: Within 0.01 margin, breaks ties by FP severity (false positive analysis)
 - **Legacy fallback**: When `promotion.evaluation` section is absent, uses simple metric comparison
 
@@ -371,10 +380,10 @@ All price-derived indicators use `adj_close` when available, ensuring consistenc
 
 - Per-position stop-loss at -8%, take-profit at +50%
 - Portfolio drawdown circuit breaker at -25% with 2-day cooldown
+- Periodic rebalancing every 21 trading days: closes all positions and re-opens at target weights using current equity
 - Sector weight limits per profile (20-30%)
 - Max single position weight: 10%, min: 1%
 - Commission: 0.1%, slippage: 5 basis points
-- Monthly rebalance (21 trading days)
 - Initial capital: $100,000
 
 ## Constraints and preferences

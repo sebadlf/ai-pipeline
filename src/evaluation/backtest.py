@@ -77,12 +77,14 @@ def run_portfolio_backtest(
     initial_capital = config.get("initial_capital", 100000)
     commission_pct = config.get("commission_pct", 0.001)
     slippage_bps = config.get("slippage_bps", 5)
-    slippage_pct = slippage_bps / 10_000
+    base_slippage_pct = slippage_bps / 10_000
+    volume_impact_factor = config.get("volume_impact_factor", 0.0)
     stop_loss = risk_cfg.get("position_stop_loss", 0.08)
     take_profit = risk_cfg.get("position_take_profit", 0.50)
     max_dd_limit = risk_cfg.get("max_drawdown_limit", 0.25)
     cooldown_days = risk_cfg.get("cooldown_days", 2)
-    rebalance_days = config.get("rebalance_frequency_days", 21)  # days between rebalancing to target weights
+    rebalance_days = config.get("rebalance_frequency_days", 21)
+    max_position_drift = config.get("max_position_drift", 0.0)
 
     if allocations.is_empty() or prices.is_empty():
         return BacktestResult(final_value=initial_capital)
@@ -94,6 +96,25 @@ def run_portfolio_backtest(
 
     dates = sorted(prices["date"].unique().to_list())
     symbols_in_portfolio = list(alloc_map.keys())
+
+    # Pre-compute average daily volume (ADV) per symbol for volume-dependent slippage
+    adv_map: dict[str, float] = {}
+    if volume_impact_factor > 0 and "volume" in prices.columns:
+        for sym in symbols_in_portfolio:
+            sym_vol = prices.filter(pl.col("symbol") == sym)["volume"]
+            adv_map[sym] = float(sym_vol.mean()) if len(sym_vol) > 0 else 1e9
+
+    def _get_slippage(symbol: str, position_value: float) -> float:
+        """Compute slippage: base + volume-dependent impact (Almgren & Chriss 2001)."""
+        if volume_impact_factor <= 0 or symbol not in adv_map:
+            return base_slippage_pct
+        adv = adv_map[symbol]
+        if adv <= 0:
+            return base_slippage_pct
+        # impact = factor * sqrt(position_value / ADV_dollar)
+        # Use close price approximation for ADV dollar value
+        impact = volume_impact_factor * (position_value / (adv * 50)) ** 0.5  # rough ADV$
+        return base_slippage_pct + impact
 
     cash = initial_capital
     positions: dict[str, Position] = {}
@@ -109,21 +130,55 @@ def run_portfolio_backtest(
     first_day = dates[0] if dates else None
 
     for day in dates:
-        # Periodic rebalancing to target weights
+        # Check for drift-based rebalancing (event-driven)
+        drift_triggered = False
         if (
-            rebalance_days > 0
+            max_position_drift > 0
             and day != first_day
-            and days_since_rebalance >= rebalance_days
             and not circuit_breaker
             and positions
         ):
+            total_value = cash + sum(
+                pos.shares * prices.filter(
+                    (pl.col("date") == day) & (pl.col("symbol") == sym)
+                )["close"][0]
+                for sym, pos in positions.items()
+                if not prices.filter(
+                    (pl.col("date") == day) & (pl.col("symbol") == sym)
+                ).is_empty()
+            )
+            if total_value > 0:
+                for sym, pos in positions.items():
+                    price_row = prices.filter(
+                        (pl.col("date") == day) & (pl.col("symbol") == sym)
+                    )
+                    if price_row.is_empty():
+                        continue
+                    actual_weight = (pos.shares * price_row["close"][0]) / total_value
+                    target_weight = alloc_map.get(sym, 0.0)
+                    if abs(actual_weight - target_weight) > max_position_drift:
+                        drift_triggered = True
+                        break
+
+        # Periodic or drift-triggered rebalancing to target weights
+        should_rebalance = (
+            not circuit_breaker
+            and positions
+            and day != first_day
+            and (
+                (rebalance_days > 0 and days_since_rebalance >= rebalance_days)
+                or drift_triggered
+            )
+        )
+        if should_rebalance:
             # Close all positions
             for sym, pos in list(positions.items()):
                 price_row = prices.filter(
                     (pl.col("date") == day) & (pl.col("symbol") == sym)
                 )
                 if not price_row.is_empty():
-                    proceeds = _close_position(pos, price_row["close"][0], commission_pct, slippage_pct)
+                    slp = _get_slippage(sym, pos.shares * price_row["close"][0])
+                    proceeds = _close_position(pos, price_row["close"][0], commission_pct, slp)
                     trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                     cash += proceeds
             positions.clear()
@@ -140,7 +195,8 @@ def run_portfolio_backtest(
                 if price <= 0:
                     continue
                 capital_for_pos = current_equity * weight
-                entry_price = price * (1 + slippage_pct)
+                slp = _get_slippage(symbol, capital_for_pos)
+                entry_price = price * (1 + slp)
                 shares = (capital_for_pos * (1 - commission_pct)) / entry_price
                 positions[symbol] = Position(
                     symbol=symbol,
@@ -166,7 +222,8 @@ def run_portfolio_backtest(
                     continue
 
                 capital_for_pos = initial_capital * weight
-                entry_price = price * (1 + slippage_pct)  # slippage on entry
+                slp = _get_slippage(symbol, capital_for_pos)
+                entry_price = price * (1 + slp)  # volume-dependent slippage on entry
                 shares = (capital_for_pos * (1 - commission_pct)) / entry_price
                 positions[symbol] = Position(
                     symbol=symbol,
@@ -191,7 +248,8 @@ def run_portfolio_backtest(
 
             # Stop-loss
             if pnl_pct <= -stop_loss:
-                proceeds = _close_position(pos, current_price, commission_pct, slippage_pct)
+                slp = _get_slippage(sym, pos.shares * current_price)
+                proceeds = _close_position(pos, current_price, commission_pct, slp)
                 trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                 cash += proceeds
                 closed_symbols.append(sym)
@@ -199,7 +257,8 @@ def run_portfolio_backtest(
 
             # Take-profit
             if pnl_pct >= take_profit:
-                proceeds = _close_position(pos, current_price, commission_pct, slippage_pct)
+                slp = _get_slippage(sym, pos.shares * current_price)
+                proceeds = _close_position(pos, current_price, commission_pct, slp)
                 trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                 cash += proceeds
                 closed_symbols.append(sym)
@@ -236,7 +295,8 @@ def run_portfolio_backtest(
                     (pl.col("date") == day) & (pl.col("symbol") == sym)
                 )
                 if not price_row.is_empty():
-                    proceeds = _close_position(pos, price_row["close"][0], commission_pct, slippage_pct)
+                    slp = _get_slippage(sym, pos.shares * price_row["close"][0])
+                    proceeds = _close_position(pos, price_row["close"][0], commission_pct, slp)
                     trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
                     cash += proceeds
             positions.clear()
@@ -256,7 +316,8 @@ def run_portfolio_backtest(
             (pl.col("date") == last_date) & (pl.col("symbol") == sym)
         )
         if not price_row.is_empty():
-            proceeds = _close_position(pos, price_row["close"][0], commission_pct, slippage_pct)
+            slp = _get_slippage(sym, pos.shares * price_row["close"][0])
+            proceeds = _close_position(pos, price_row["close"][0], commission_pct, slp)
             trade_returns.append((proceeds - pos.cost_basis) / pos.cost_basis)
             cash += proceeds
     positions.clear()
@@ -435,11 +496,15 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
             else:
                 regime_bench_returns = None
 
-            # Merge rebalance_frequency_days from portfolio constraints into backtest config
+            # Merge portfolio constraints into backtest config
+            port_constraints = portfolio_cfg.get("constraints", {})
             bt_with_rebalance = {
                 **bt_cfg,
-                "rebalance_frequency_days": portfolio_cfg.get("constraints", {}).get(
+                "rebalance_frequency_days": port_constraints.get(
                     "rebalance_frequency_days", 21
+                ),
+                "max_position_drift": port_constraints.get(
+                    "max_position_drift", 0.0
                 ),
             }
             result = run_portfolio_backtest(

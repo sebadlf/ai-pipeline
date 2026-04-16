@@ -174,20 +174,38 @@ Before filling, the pipeline logs features with >50% nulls for diagnostic purpos
 
 **File**: `src/features/selection.py`
 
-Applies three sequential filters:
+Applies four sequential filters:
 
 1. **Null filter**: Drop features with >90% null values (configurable `max_null_pct`)
 2. **Variance filter**: Drop features in the bottom 1% by variance (configurable `min_variance_pct`)
 3. **Correlation filter**: For each pair with `|correlation| > 0.95`, drop the second feature (greedy, index-order)
+4. **Mutual information filter**: Drop features with MI < 0.001 vs target (configurable `min_mutual_info`)
 
 **Output**:
 - `data/features_selected.parquet` — filtered DataFrame
 - `data/selected_features.json` — manifest listing selected feature names and count
 
 **Integration**: When `feature_selection.enabled` is true in config:
-- `src/training/train.py` reads from `features_selected.parquet` via `get_features_parquet_path(config)`
-- `src/aggregation/consolidate.py` reads from `features_selected.parquet` via `get_features_parquet_path(config)`
+- Training reads from normalized features via `get_normalized_parquet_path(config)`
+- `src/aggregation/consolidate.py` reads normalized features
 - `src/strategy/runner.py` loads `selected_features.json` via `get_selected_feature_names(config)` and filters features at inference time
+
+## Feature Normalization (Stage 0d)
+
+**File**: `src/features/normalize.py`
+**Makefile target**: `make normalize`
+**Command**: `uv run python -m src.features.normalize`
+
+Applies a two-step normalization using **training-period statistics only** to prevent data leakage:
+
+1. **Percentile clipping**: Clips outliers to [p01, p99] percentiles computed from training data
+2. **Z-score normalization**: `(x - mean) / std` using training-period mean and std
+
+**Output**:
+- `data/features_normalized.parquet` — normalized DataFrame consumed by training and aggregation
+- `data/normalization_stats.json` — persisted statistics (mean, std, p01, p99 per feature) used by inference/runner
+
+**Key design**: Statistics are computed only from the training split (before `train_end`) and applied to all splits. This prevents future data from leaking into normalization. The stats file is loaded by `src/strategy/runner.py` at inference time for consistent normalization
 
 ## CLI Arguments
 

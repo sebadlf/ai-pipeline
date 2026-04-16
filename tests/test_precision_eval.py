@@ -96,25 +96,27 @@ class TestWalkForwardPrecision:
         prob_up = np.array([0.8, 0.7, 0.9, 0.6, 0.5, 0.8, 0.7, 0.9, 0.6, 0.5])
         targets = np.array([1,   1,   1,   0,   0,   1,   1,   1,   0,   0])
 
-        precisions, mean, std = compute_walk_forward_precision(
+        precisions, mean, std, total_windows = compute_walk_forward_precision(
             prob_up, targets, dates,
             threshold=0.60, window_size=5, step_size=2, min_signals=2,
         )
         assert len(precisions) > 0
         assert mean > 0
+        assert total_windows >= len(precisions)
 
     def test_empty_when_no_windows(self) -> None:
         dates = np.array([dt.date(2024, 1, 1), dt.date(2024, 1, 2)], dtype="datetime64[D]")
         prob_up = np.array([0.8, 0.7])
         targets = np.array([1, 0])
 
-        precisions, mean, std = compute_walk_forward_precision(
+        precisions, mean, std, total_windows = compute_walk_forward_precision(
             prob_up, targets, dates,
             threshold=0.60, window_size=10, step_size=5, min_signals=1,
         )
         assert precisions == []
         assert mean == 0.0
         assert std == 0.0
+        assert total_windows == 0
 
     def test_windows_below_min_signals_excluded(self) -> None:
         dates = np.array([dt.date(2024, 1, i + 1) for i in range(10)], dtype="datetime64[D]")
@@ -122,11 +124,12 @@ class TestWalkForwardPrecision:
         prob_up = np.full(10, 0.3)
         targets = np.zeros(10, dtype=int)
 
-        precisions, mean, std = compute_walk_forward_precision(
+        precisions, mean, std, total_windows = compute_walk_forward_precision(
             prob_up, targets, dates,
             threshold=0.60, window_size=5, step_size=2, min_signals=1,
         )
         assert precisions == []
+        assert total_windows > 0  # windows exist but none qualify
 
 
 # --------------------------------------------------------------------------- #

@@ -56,6 +56,7 @@ class TimeSeriesDataset(Dataset):
         is_train: bool = False,
         noise_std: float = 0.01,
         feature_mask_rate: float = 0.0,
+        sample_weights: np.ndarray | None = None,
     ) -> None:
         self.features = torch.tensor(features, dtype=torch.float32)
         self.targets = torch.tensor(targets, dtype=target_dtype)
@@ -64,11 +65,15 @@ class TimeSeriesDataset(Dataset):
         self.is_train = is_train
         self.noise_std = noise_std
         self.feature_mask_rate = feature_mask_rate
+        self.sample_weights = (
+            torch.tensor(sample_weights, dtype=torch.float32)
+            if sample_weights is not None else None
+        )
 
     def __len__(self) -> int:
         return len(self.valid_indices)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         start = int(self.valid_indices[idx])
         x = self.features[start : start + self.seq_len]
         y = self.targets[start + self.seq_len]
@@ -77,10 +82,15 @@ class TimeSeriesDataset(Dataset):
         if self.is_train and self.noise_std > 0:
             x = x + torch.randn_like(x) * self.noise_std
 
-        # Feature masking: zero out random features during training
+        # Per-timestep feature masking: zero out random features independently
+        # per timestep, forcing robustness to partial absence (not just full-feature dropout)
         if self.is_train and self.feature_mask_rate > 0:
-            mask = torch.rand(x.shape[-1]) > self.feature_mask_rate
-            x = x * mask.unsqueeze(0)
+            mask = (torch.rand_like(x) > self.feature_mask_rate).float()
+            x = x * mask
+
+        if self.sample_weights is not None:
+            w = self.sample_weights[start + self.seq_len]
+            return x, y, w
 
         return x, y
 
@@ -113,6 +123,8 @@ class TradingDataModule(L.LightningDataModule):
         clusters_parquet: str = "data/clusters.parquet",
         noise_std: float = 0.01,
         feature_mask_rate: float = 0.0,
+        train_date_offset_pct: float = 0.0,
+        time_decay_lambda: float = 0.0,
     ) -> None:
         super().__init__()
         from src.config import SplitDates
@@ -136,6 +148,8 @@ class TradingDataModule(L.LightningDataModule):
         self.noise_std = noise_std
         self.feature_mask_rate = feature_mask_rate
         self.clusters_parquet = clusters_parquet
+        self.train_date_offset_pct = train_date_offset_pct
+        self._time_decay_lambda = time_decay_lambda
 
         self.feature_cols: list[str] = []
         self.class_weights: list[float] | None = None
@@ -183,6 +197,7 @@ class TradingDataModule(L.LightningDataModule):
         all_test_x, all_test_y = [], []
         train_valid, val_valid, test_valid = [], [], []
         train_offset, val_offset, test_offset = 0, 0, 0
+        all_train_dates: list[np.ndarray] = []
 
         # Evaluation support: accumulate val dates and forward returns
         all_val_dates: list[np.ndarray] = []
@@ -211,6 +226,10 @@ class TradingDataModule(L.LightningDataModule):
                     if n > self.seq_len:
                         valid_list.extend(range(offset, offset + n - self.seq_len))
 
+            # Accumulate train dates for time-decay weighting
+            if len(train_df) > 0:
+                all_train_dates.append(train_df["date"].to_numpy())
+
             # Accumulate val dates and forward returns for precision evaluation
             if len(val_df) > 0:
                 all_val_dates.append(val_df["date"].to_numpy())
@@ -227,6 +246,19 @@ class TradingDataModule(L.LightningDataModule):
         val_y = np.concatenate(all_val_y)
         test_x = np.concatenate(all_test_x)
         test_y = np.concatenate(all_test_y)
+
+        # Ensemble temporal diversity: drop oldest train_date_offset_pct of training data
+        # Rank 2 uses 75%, Rank 3 uses 50% (most recent portion only)
+        if self.train_date_offset_pct > 0:
+            n_total = len(train_y)
+            n_keep = int(n_total * (1.0 - self.train_date_offset_pct))
+            offset = n_total - n_keep
+            train_x = train_x[offset:]
+            train_y = train_y[offset:]
+            # Adjust valid indices: drop those before offset and rebase
+            train_valid = [idx - offset for idx in train_valid if idx >= offset]
+            tag = f"[{self.cluster_id}] " if self.cluster_id else ""
+            print(f"  {tag}Temporal diversity: keeping {1.0-self.train_date_offset_pct:.0%} most recent training data ({n_keep:,}/{n_total:,})")
 
         train_vi = np.array(train_valid, dtype=np.int64)
         val_vi = np.array(val_valid, dtype=np.int64)
@@ -266,11 +298,30 @@ class TradingDataModule(L.LightningDataModule):
             f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
         ))
 
+        # Time-decay sample weighting: recent samples get higher weight
+        # weight = exp(-lambda * days_from_latest / 365)
+        train_sample_weights = None
+        if all_train_dates:
+            train_dates = np.concatenate(all_train_dates)
+            # Apply same offset as temporal diversity
+            if self.train_date_offset_pct > 0:
+                offset = len(train_dates) - len(train_y)
+                train_dates = train_dates[offset:]
+            time_decay_lambda = self._time_decay_lambda
+            if time_decay_lambda > 0:
+                latest = train_dates.max()
+                days_from_latest = (latest - train_dates).astype("timedelta64[D]").astype(np.float64)
+                train_sample_weights = np.exp(-time_decay_lambda * days_from_latest / 365.0)
+                # Normalize so mean weight = 1.0 (preserves effective learning rate)
+                train_sample_weights = train_sample_weights / train_sample_weights.mean()
+                tag = f"[{self.cluster_id}] " if self.cluster_id else ""
+                print(f"  {tag}Time-decay weighting: lambda={time_decay_lambda}, min_w={train_sample_weights.min():.3f}, max_w={train_sample_weights.max():.3f}")
+
         # Safety net: replace any remaining Inf/NaN after normalization step
         for arr in (train_x, val_x, test_x):
             np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std, feature_mask_rate=self.feature_mask_rate)
+        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std, feature_mask_rate=self.feature_mask_rate, sample_weights=train_sample_weights)
         self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64)
         self.test_ds = TimeSeriesDataset(test_x, test_y, self.seq_len, test_vi, target_dtype=torch.int64)
 

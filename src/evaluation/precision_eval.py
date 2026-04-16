@@ -45,8 +45,14 @@ class PrecisionEvalResult:
     recall_at_primary: float
     signal_count_at_primary: int
 
+    # Walk-forward coverage (fraction of windows that qualified)
+    coverage_ratio: float  # n_qualifying_windows / n_total_windows
+
+    # Brier score
+    brier_score: float
+
     # Elimination result
-    elimination_stage: str  # "passed", "failed_stability", "failed_recall", "failed_signals"
+    elimination_stage: str  # "passed", "failed_stability", "failed_recall", "failed_signals", "failed_coverage"
     passed_all_filters: bool
 
 
@@ -122,7 +128,7 @@ def compute_walk_forward_precision(
     window_size: int,
     step_size: int,
     min_signals: int,
-) -> tuple[list[float], float, float]:
+) -> tuple[list[float], float, float, int]:
     """Compute precision in rolling walk-forward windows.
 
     Windows with fewer than min_signals predictions above threshold are
@@ -138,16 +144,18 @@ def compute_walk_forward_precision(
         min_signals: Minimum predictions above threshold per window.
 
     Returns:
-        (precisions_per_window, mean, std)
+        (precisions_per_window, mean, std, total_windows)
     """
     unique_dates = np.unique(sample_dates)
     unique_dates.sort()
     n_dates = len(unique_dates)
 
     precisions = []
+    total_windows = 0
     start_idx = 0
 
     while start_idx + window_size <= n_dates:
+        total_windows += 1
         window_start = unique_dates[start_idx]
         window_end = unique_dates[min(start_idx + window_size - 1, n_dates - 1)]
 
@@ -166,11 +174,11 @@ def compute_walk_forward_precision(
         start_idx += step_size
 
     if len(precisions) == 0:
-        return [], 0.0, 0.0
+        return [], 0.0, 0.0, total_windows
 
     mean = float(np.mean(precisions))
     std = float(np.std(precisions))
-    return precisions, mean, std
+    return precisions, mean, std, total_windows
 
 
 def compute_fp_severity(
@@ -267,13 +275,19 @@ def evaluate_model(
     auc_pr = compute_auc_pr(prob_up, targets)
 
     # Walk-forward stability at primary threshold
-    wf_precisions, wf_mean, wf_std = compute_walk_forward_precision(
+    wf_precisions, wf_mean, wf_std, wf_total_windows = compute_walk_forward_precision(
         prob_up, targets, sample_dates,
         threshold=eval_config.primary_threshold,
         window_size=eval_config.wf_window_size,
         step_size=eval_config.wf_step_size,
         min_signals=eval_config.min_signals_per_window,
     )
+
+    # Coverage ratio: fraction of windows with enough signals
+    coverage_ratio = len(wf_precisions) / wf_total_windows if wf_total_windows > 0 else 0.0
+
+    # Brier score: calibration quality
+    brier_score = float(np.mean((prob_up - targets.astype(np.float64)) ** 2))
 
     # FP severity at primary threshold
     avg_fp, avg_tp, fp_sev = compute_fp_severity(
@@ -308,8 +322,16 @@ def evaluate_model(
         elimination_stage = "failed_signals"
         passed = False
 
+    # Filter 4: Coverage ratio — penalize models that only predict in few windows
+    if passed and coverage_ratio < 0.5:
+        elimination_stage = "failed_coverage"
+        passed = False
+
     # Stability score (computed regardless, for logging)
+    # Apply coverage penalty: models with low coverage get proportionally lower scores
     stability_score = wf_mean - eval_config.stability_penalty * wf_std
+    if coverage_ratio < 1.0:
+        stability_score *= coverage_ratio
 
     return PrecisionEvalResult(
         precision_at_threshold=precision_dict,
@@ -325,6 +347,8 @@ def evaluate_model(
         fp_severity=fp_sev,
         recall_at_primary=recall_at_primary,
         signal_count_at_primary=signals_at_primary,
+        coverage_ratio=coverage_ratio,
+        brier_score=brier_score,
         elimination_stage=elimination_stage,
         passed_all_filters=passed,
     )
@@ -368,6 +392,10 @@ def log_eval_to_mlflow(
     # Recall and signals at primary threshold
     client.log_metric(run_id, "val_recall_at_primary", result.recall_at_primary)
     client.log_metric(run_id, "val_signals_at_primary", result.signal_count_at_primary)
+
+    # Coverage ratio and Brier score
+    client.log_metric(run_id, "val_coverage_ratio", result.coverage_ratio)
+    client.log_metric(run_id, "val_brier_score", result.brier_score)
 
     # Elimination result (as params, not metrics — for MLflow UI filtering)
     client.log_param(run_id, "val_elimination_stage", result.elimination_stage)

@@ -182,14 +182,34 @@ class LSTMForecaster(L.LightningModule):
         return self.head(last_hidden)
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Return class probabilities."""
-        return torch.softmax(self(x), dim=-1)
+        """Return calibrated class probabilities.
 
-    def _step(self, batch: tuple[torch.Tensor, torch.Tensor], stage: str) -> torch.Tensor:
-        x, y = batch
+        Applies temperature scaling when calibration_temperature is set (> 0).
+        Temperature > 1 softens probabilities (reduces overconfidence).
+        """
+        logits = self(x)
+        temp = self.hparams.get("calibration_temperature", 0.0)
+        if temp > 0:
+            logits = logits / temp
+        return torch.softmax(logits, dim=-1)
+
+    def _step(self, batch: tuple[torch.Tensor, ...], stage: str) -> torch.Tensor:
+        x, y = batch[0], batch[1]
+        sample_weights = batch[2] if len(batch) > 2 else None
         y = y.long()
         logits = self(x)
-        loss = self.loss_fn(logits, y)
+
+        if sample_weights is not None:
+            # Apply per-sample time-decay weights to loss
+            loss = F.cross_entropy(logits, y, reduction="none")
+            if hasattr(self, "loss_fn") and isinstance(self.loss_fn, FocalLoss):
+                ce = F.cross_entropy(logits, y, weight=self.loss_fn.weight, reduction="none",
+                                     label_smoothing=self.loss_fn.label_smoothing)
+                pt = torch.exp(-ce)
+                loss = ((1 - pt) ** self.loss_fn.gamma) * ce
+            loss = (loss * sample_weights).mean()
+        else:
+            loss = self.loss_fn(logits, y)
 
         preds = logits.argmax(dim=-1)
         acc = (preds == y).float().mean()
@@ -219,6 +239,11 @@ class LSTMForecaster(L.LightningModule):
             self.log("val_pct_above_060", (probs[:, 1] > 0.60).float().mean())
             self.log("val_pct_above_065", (probs[:, 1] > 0.65).float().mean())
 
+            # Brier score: measures calibration quality (lower is better)
+            up_targets = (y == 1).float()
+            brier = ((probs[:, 1] - up_targets) ** 2).mean()
+            self.log("val_brier_score", brier)
+
             # Per-class accuracy
             for cls_idx, cls_name in enumerate(["not_up", "up"]):
                 mask = y == cls_idx
@@ -228,13 +253,13 @@ class LSTMForecaster(L.LightningModule):
 
         return loss
 
-    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: tuple[torch.Tensor, ...], batch_idx: int) -> torch.Tensor:
         return self._step(batch, "train")
 
-    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def validation_step(self, batch: tuple[torch.Tensor, ...], batch_idx: int) -> torch.Tensor:
         return self._step(batch, "val")
 
-    def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def test_step(self, batch: tuple[torch.Tensor, ...], batch_idx: int) -> torch.Tensor:
         return self._step(batch, "test")
 
     def configure_optimizers(self) -> dict:

@@ -18,9 +18,10 @@ The pipeline constructs three portfolios simultaneously, each targeting a differ
 |---|---|---|
 | Primary metric | Sortino | Focuses on upside, only penalizes downside volatility |
 | Complementary metric | Omega | Captures full return distribution shape |
+| Validation metric | Information ratio | Outperformance vs benchmark |
 | Max positions | 25 | Higher diversification allowance |
 | Max sector weight | 30% | Moderate sector concentration |
-| Min prob_up | 70% | Lower threshold, more positions |
+| Min prob_up | 60% | Lower threshold, more positions |
 
 ### Moderate
 
@@ -28,9 +29,10 @@ The pipeline constructs three portfolios simultaneously, each targeting a differ
 |---|---|---|
 | Primary metric | Sharpe | Classic risk-adjusted return |
 | Complementary metric | Calmar | Considers drawdown risk |
+| Validation metric | Sortino | Downside risk check |
 | Max positions | 20 | Moderate diversification |
 | Max sector weight | 25% | Balanced sector exposure |
-| Min prob_up | 75% | Medium threshold |
+| Min prob_up | 65% | Medium threshold |
 
 ### Conservative
 
@@ -38,9 +40,10 @@ The pipeline constructs three portfolios simultaneously, each targeting a differ
 |---|---|---|
 | Primary metric | Calmar | Minimizes drawdown-relative return |
 | Complementary metric | Sortino | Downside protection |
+| Validation metric | Sharpe | Risk-adjusted return check |
 | Max positions | 15 | Concentrated, high-conviction |
 | Max sector weight | 20% | Strict sector limits |
-| Min prob_up | 80% | Only high-probability stocks |
+| Min prob_up | 70% | Only high-probability stocks |
 
 ## Optimization Algorithm
 

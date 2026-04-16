@@ -357,6 +357,48 @@ def add_relative_strength_spy(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def add_cross_sectional_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Add cross-sectional features: within-sector z-scores and universe-wide momentum rank.
+
+    Reference: Gu, Kelly & Xiu (2020) find cross-sectional features among the most
+    predictive for stock returns.
+
+    Adds 4 features:
+    - return_20d_sector_zscore: z-score of 20d return vs same-sector peers
+    - rsi_sector_zscore: z-score of RSI vs sector
+    - volume_sector_zscore: z-score of relative_volume vs sector
+    - momentum_rank_pct: percentile rank of 20d return across full universe per date
+    """
+    new_cols = []
+
+    # Within-sector z-scores (requires "sector" column from stock_sectors join)
+    if "sector" in df.columns:
+        for col, alias in [
+            ("return_20d", "return_20d_sector_zscore"),
+            ("rsi_14", "rsi_sector_zscore"),
+            ("relative_volume", "volume_sector_zscore"),
+        ]:
+            if col in df.columns:
+                sector_mean = pl.col(col).mean().over("sector", "date")
+                sector_std = pl.col(col).std().over("sector", "date")
+                new_cols.append(
+                    ((pl.col(col) - sector_mean) / (sector_std + 1e-8)).alias(alias)
+                )
+
+    # Universe-wide momentum rank (percentile, 0-1)
+    if "return_20d" in df.columns:
+        new_cols.append(
+            pl.col("return_20d").rank().over("date")
+            .truediv(pl.col("return_20d").count().over("date"))
+            .alias("momentum_rank_pct")
+        )
+
+    if new_cols:
+        df = df.with_columns(new_cols)
+
+    return df
+
+
 def add_stochastic(df: pl.DataFrame, k_window: int = 14, d_window: int = 3) -> pl.DataFrame:
     """Add Stochastic Oscillator (%K and %D)."""
     return df.with_columns(
@@ -446,24 +488,53 @@ def add_binary_target(
     df: pl.DataFrame,
     horizon: int = 21,
     buy_threshold: float = 0.025,
+    volatility_adjusted: bool = False,
 ) -> pl.DataFrame:
     """Add binary classification target: UP (1) if forward return >= threshold, else NOT_UP (0).
+
+    When volatility_adjusted=True, the threshold is scaled per stock based on its
+    realized volatility relative to the universe median (de Prado AFML Ch. 3):
+        adjusted_threshold = base * (stock_vol / median_vol)
+    This normalizes the target so high-vol stocks need proportionally larger moves
+    and low-vol stocks need smaller moves to qualify as UP.
 
     Args:
         df: DataFrame with close/adj_close prices.
         horizon: Number of trading days ahead.
-        buy_threshold: Minimum positive return for UP class.
+        buy_threshold: Base minimum positive return for UP class.
+        volatility_adjusted: If True, scale threshold by per-stock volatility.
     """
     price_col = "adj_close" if "adj_close" in df.columns and df["adj_close"].null_count() < len(df) else "close"
     forward_return = pl.col(price_col).pct_change(horizon).shift(-horizon).over("symbol")
-    return df.with_columns(
-        forward_return.alias(f"forward_return_{horizon}d"),
-        pl.when(forward_return >= buy_threshold)
-        .then(pl.lit(1))
-        .otherwise(pl.lit(0))
-        .cast(pl.Int64)
-        .alias("target"),
-    )
+
+    if volatility_adjusted and "realized_vol_20d" in df.columns:
+        # Compute per-date median volatility across all stocks
+        df = df.with_columns(
+            pl.col("realized_vol_20d").median().over("date").alias("_median_vol")
+        )
+        # Scale threshold: high-vol stocks get higher threshold, low-vol get lower
+        # Clamp ratio to [0.5, 2.0] to avoid extreme thresholds
+        vol_ratio = (pl.col("realized_vol_20d") / pl.col("_median_vol")).clip(0.5, 2.0)
+        adjusted_threshold = pl.lit(buy_threshold) * vol_ratio
+
+        result = df.with_columns(
+            forward_return.alias(f"forward_return_{horizon}d"),
+            pl.when(forward_return >= adjusted_threshold)
+            .then(pl.lit(1))
+            .otherwise(pl.lit(0))
+            .cast(pl.Int64)
+            .alias("target"),
+        )
+        return result.drop("_median_vol")
+    else:
+        return df.with_columns(
+            forward_return.alias(f"forward_return_{horizon}d"),
+            pl.when(forward_return >= buy_threshold)
+            .then(pl.lit(1))
+            .otherwise(pl.lit(0))
+            .cast(pl.Int64)
+            .alias("target"),
+        )
 
 
 def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
@@ -552,6 +623,11 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
         except Exception as e:
             print(f"  Warning: sector performance skipped ({e})")
 
+    # Cross-sectional features: within-sector z-scores + momentum rank (Gu et al. 2020)
+    if features_cfg.get("cross_sectional", True):
+        df = add_cross_sectional_features(df)
+        print("  Added cross-sectional features")
+
     # Convert absolute indicators to price-relative ratios (scale-invariant)
     close = pl.col("close")
     ratio_exprs = []
@@ -573,6 +649,7 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
         df,
         horizon=target_cfg.get("horizon", 21),
         buy_threshold=target_cfg.get("buy_threshold", 0.025),
+        volatility_adjusted=target_cfg.get("volatility_adjusted", False),
     )
 
     # Restore original column name if we swapped adj_close -> close

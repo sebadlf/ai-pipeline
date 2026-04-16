@@ -153,6 +153,8 @@ def optimize_portfolio(
     sectors_df: pl.DataFrame | None = None,
     commission_pct: float = 0.001,
     rebalance_frequency_days: int = 21,
+    turnover_penalty: float = 0.0,
+    previous_weights: dict[str, float] | None = None,
 ) -> pl.DataFrame:
     """Optimize portfolio weights for a single profile.
 
@@ -163,6 +165,8 @@ def optimize_portfolio(
         constraints: Global constraints dict.
         benchmark_returns: Optional benchmark returns for information ratio.
         sectors_df: Optional DataFrame with [symbol, sector] for sector constraints.
+        turnover_penalty: Penalty factor for weight changes from previous allocation.
+        previous_weights: Previous portfolio weights {symbol: weight} for turnover penalty.
 
     Returns:
         DataFrame with columns [symbol, weight, cluster_id, prob_up].
@@ -193,6 +197,12 @@ def optimize_portfolio(
         # Not enough data — equal weight fallback
         weights = np.ones(n) / n
     else:
+        # Build previous weight vector for turnover penalty
+        prev_w = np.zeros(n)
+        if turnover_penalty > 0 and previous_weights:
+            for i, s in enumerate(symbols):
+                prev_w[i] = previous_weights.get(s, 0.0)
+
         # Optimization objective: maximize primary metric (long-only)
         def _objective(w: np.ndarray) -> float:
             portfolio_returns = returns_matrix[:, :n] @ w
@@ -209,7 +219,13 @@ def optimize_portfolio(
             comp_val = comp_fn(portfolio_returns, equity, benchmark_returns)
 
             # Weighted objective: 80% primary + 20% complementary
-            return -(0.8 * primary_val + 0.2 * comp_val)
+            obj = -(0.8 * primary_val + 0.2 * comp_val)
+
+            # Turnover penalty: penalize large changes from previous allocation
+            if turnover_penalty > 0:
+                obj += turnover_penalty * np.sum(np.abs(w - prev_w))
+
+            return obj
 
         # Constraints
         max_pos = constraints.get("max_single_position", 0.10)
@@ -301,15 +317,19 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
         print("No predictions found. Run aggregation first.")
         return {}
 
-    # Load historical returns from validation period (for optimization estimation)
+    # Load historical returns from the LAST YEAR of training period (not validation)
+    # Using validation returns would be look-ahead bias: optimizing weights on the same
+    # data used to evaluate the model (Grinold & Kahn 2000)
+    import datetime as dt
+    train_returns_start = split_dates.train_end - dt.timedelta(days=365)
     all_symbols = predictions["symbol"].to_list()
     returns_df = load_historical_returns(
-        all_symbols, split_dates.val_start, split_dates.val_end
+        all_symbols, train_returns_start, split_dates.train_end
     )
 
-    # Load benchmark returns
+    # Load benchmark returns from same period
     benchmark_returns = load_benchmark_returns(
-        benchmark_symbol, split_dates.val_start, split_dates.val_end
+        benchmark_symbol, train_returns_start, split_dates.train_end
     )
 
     # Load sector data for constraints
@@ -317,6 +337,24 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
     sectors_df = pl.read_database(
         "SELECT symbol, sector FROM stock_sectors", engine
     )
+
+    # Load previous allocations for turnover penalty
+    turnover_penalty = float(constraints.get("turnover_penalty", 0.0))
+    previous_allocations: dict[str, dict[str, float]] = {}
+    if turnover_penalty > 0:
+        prev_path = Path(agg_cfg.get("output_parquet", "data/predictions.parquet")).parent / "portfolios.parquet"
+        if prev_path.exists():
+            try:
+                prev_df = pl.read_parquet(str(prev_path))
+                for pname in prev_df["profile"].unique().to_list():
+                    profile_rows = prev_df.filter(pl.col("profile") == pname)
+                    previous_allocations[pname] = dict(zip(
+                        profile_rows["symbol"].to_list(),
+                        profile_rows["weight"].to_list(),
+                    ))
+                print(f"  Loaded previous allocations for turnover penalty (lambda={turnover_penalty})")
+            except Exception:
+                pass
 
     results = {}
     for profile_name, profile_dict in profiles.items():
@@ -333,6 +371,8 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
             sectors_df=sectors_df,
             commission_pct=bt_cfg.get("commission_pct", 0.001),
             rebalance_frequency_days=constraints.get("rebalance_frequency_days", 21),
+            turnover_penalty=turnover_penalty,
+            previous_weights=previous_allocations.get(profile_name),
         )
 
         if not allocation.is_empty():

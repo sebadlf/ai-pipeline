@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Load the best trained checkpoint for each cluster, run inference on the most recent time window for every stock, and consolidate all per-cluster predictions into a single unified output. This bridges the gap between per-cluster model training and portfolio-level decision making.
+Load the ensemble model checkpoints (top-3) for each cluster, run inference on the most recent time window for every stock, compute weighted-average predictions, and consolidate all per-cluster results into a single unified output. This bridges the gap between per-cluster model training and portfolio-level decision making.
 
 ## End-to-End Flow
 
@@ -14,28 +14,34 @@ Load the best trained checkpoint for each cluster, run inference on the most rec
 For each cluster_id in clusters.parquet:
     │
     ▼
-Find champion checkpoint from MLflow registry (fallback: local .ckpt)
+Load ensemble checkpoints (up to 3) from MLflow registry
     │
     ▼
-Load LSTMForecaster from checkpoint
+Load LSTMForecaster from each checkpoint
     │
     ▼
 For each symbol in cluster:
     │
     ▼
-  Load features (from features_selected.parquet if enabled)
+  Load features (from features_normalized.parquet)
     │
     ▼
   Extract last seq_len rows for the symbol
     │
     ▼
-  Z-score normalize using training-period statistics
+  Normalize using training-period statistics (from normalization_stats.json)
     │
     ▼
-  Forward pass → softmax → prob_up = P(UP)
+  Forward pass through each ensemble member → softmax → prob_up
+    │
+    ▼
+  Weighted average: weights proportional to each model's val_precision_up
     │
     ▼
 Merge all predictions into single DataFrame
+    │
+    ▼
+Detect normalization drift (warn if feature distributions deviate >3 std)
     │
     ▼
 Save to predictions.parquet + DB + MLflow
@@ -43,24 +49,36 @@ Save to predictions.parquet + DB + MLflow
 
 ## Checkpoint Discovery
 
-`find_best_checkpoint(cluster_id, config)` searches for `.ckpt` files using a multi-path glob strategy across `checkpoints/`, `mlruns/`, and the workspace root. If multiple checkpoints exist, the most recently modified file is selected.
+The aggregation step loads **ensemble member** checkpoints from MLflow Model Registry. For each cluster, it downloads the champion and any additional ensemble members tagged in the experiment. If no champion is registered for a cluster, it falls back to local checkpoint discovery via glob patterns across `checkpoints/`, `mlruns/`, and the workspace root.
 
-The aggregation step first tries to download the **champion** checkpoint from MLflow Model Registry (via `download_champion_checkpoint()`). If no champion is registered for a cluster, it falls back to local checkpoint discovery.
+## Weighted Ensemble Inference
+
+When multiple ensemble members are available for a cluster:
+
+1. Each model produces its own `prob_up` prediction per symbol
+2. Predictions are combined using a **weighted average**, where weights are proportional to each model's `val_precision_up` metric
+3. Models with higher validation precision contribute more to the final prediction
+
+This reduces variance compared to simple averaging and gives more influence to the best-calibrated models.
+
+## Normalization Drift Detection
+
+After computing predictions, the aggregation step checks for **normalization drift**: whether the current feature distributions have shifted significantly from the training-period statistics used for normalization. If any feature's mean or std deviates by more than 3 standard deviations from the stored training statistics, a warning is logged. This helps detect data quality issues or concept drift.
 
 ## Inference Logic
 
-`run_inference_for_cluster(cluster_id, model, features_df, clusters_df, config, split_dates)`:
+`run_inference_for_cluster(cluster_id, models, features_df, clusters_df, config, split_dates)`:
 
 1. Filter features to symbols in the cluster
 2. Determine feature columns (from `get_selected_feature_names()` if enabled, else all non-meta columns)
 3. Validate feature count matches model's `input_size`
-4. Compute normalization statistics from training period only (Z-score)
+4. Load normalization statistics from `normalization_stats.json`
 5. For each symbol:
    - Extract the last `seq_len` rows (most recent data)
    - If insufficient data, skip
    - Normalize features using training-period mean/std
-   - Convert to tensor, forward pass → `predict_proba()` returns `[P(NOT_UP), P(UP)]`
-   - Extract `prob_up = float(probs[1])`
+   - Forward pass through each ensemble member → `predict_proba()` returns `[P(NOT_UP), P(UP)]`
+   - Weighted average of `prob_up` across ensemble members
 6. Return list of dicts with `symbol`, `cluster_id`, `prob_up`
 
 ## Output

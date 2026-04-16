@@ -193,6 +193,34 @@ def apply_normalization_to_array(
     return result
 
 
+def check_staleness(stats: dict, max_age_days: int = 90) -> bool:
+    """Check if normalization stats are stale.
+
+    Args:
+        stats: Normalization stats dict.
+        max_age_days: Maximum acceptable age in days.
+
+    Returns:
+        True if stats are stale (older than max_age_days), False otherwise.
+    """
+    computed_str = stats.get("computed_date")
+    if not computed_str:
+        print("  WARNING: normalization stats missing computed_date — cannot check staleness")
+        return True
+
+    computed_date = date.fromisoformat(computed_str)
+    age_days = (date.today() - computed_date).days
+
+    if age_days > max_age_days:
+        print(
+            f"  WARNING: normalization stats are {age_days} days old "
+            f"(computed {computed_str}, max allowed {max_age_days} days). "
+            f"Run `make normalize` to refresh."
+        )
+        return True
+    return False
+
+
 def main() -> None:
     """Run feature normalization pipeline."""
     parser = argparse.ArgumentParser(description="Normalize features")

@@ -69,13 +69,18 @@ This reveals whether a portfolio that works well in bull markets collapses in be
 Day 1:
   Open long positions according to portfolio weights
   cash -= allocation × initial_capital per position
-  shares = (capital_for_position × (1 - commission)) / price
+  shares = (capital_for_position × (1 - commission - slippage)) / price
 
 Each subsequent day:
   For each open position:
     Compute PnL: (current_price - entry_price) / entry_price
     If PnL <= -stop_loss → close position
     If PnL >= +take_profit → close position
+
+  Every 21 trading days (rebalance_frequency_days):
+    Close ALL positions at market price
+    Re-open positions at target weights using current equity
+    (Ensures portfolio stays aligned with target allocation)
 
   Compute portfolio equity = cash + sum(shares × current_price)
   Compute daily return and drawdown
@@ -202,6 +207,7 @@ Generated at `data/backtest_reports/backtest_{run_date}.md` as a readable table:
 backtest:
   initial_capital: 100000    # starting portfolio value in USD
   commission_pct: 0.001      # 0.1% per trade (buy and sell)
+  slippage_bps: 5            # 5 basis points slippage on entry/exit
   risk:
     position_stop_loss: 0.08     # 8% per-position stop-loss
     position_take_profit: 0.50   # 50% per-position take-profit
@@ -209,6 +215,8 @@ backtest:
     cooldown_days: 2             # days in cash after circuit breaker
   output_dir: data/backtest_reports
 ```
+
+Note: Periodic rebalancing frequency is controlled by `portfolio.constraints.rebalance_frequency_days` (default: 21 trading days, ~1 month).
 
 ## CLI Arguments
 
