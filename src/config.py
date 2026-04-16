@@ -319,6 +319,7 @@ class PromotionEvalConfig:
     primary_threshold: float = 0.65
     min_recall: float = 0.10
     min_signals_per_window: int = 5
+    max_val_test_gap: float = 0.20
     wf_window_size: int = 63
     wf_step_size: int = 21
     max_std_ratio: float = 0.15
@@ -336,6 +337,7 @@ class PromotionEvalConfig:
             primary_threshold=eval_cfg.get("primary_threshold", 0.65),
             min_recall=eval_cfg.get("min_recall", 0.10),
             min_signals_per_window=eval_cfg.get("min_signals_per_window", 5),
+            max_val_test_gap=eval_cfg.get("max_val_test_gap", 0.20),
             wf_window_size=wf_cfg.get("window_size", 63),
             wf_step_size=wf_cfg.get("step_size", 21),
             max_std_ratio=wf_cfg.get("max_std_ratio", 0.15),

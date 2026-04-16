@@ -85,6 +85,11 @@ training:
   actionable_threshold: 0.70  # min prob_up for "actionable" stock count in summaries
   precision: "32"             # "32" or "16-mixed" (MPS mixed precision)
   time_decay_lambda: 0.5      # exponential time-decay for sample weights (half-life ~1.4 years, 0=disabled)
+  calibration:
+    min_temp: 0.5               # lower bound for temperature search (Guo et al. 2017)
+    max_temp: 2.5               # upper bound — T>2.5 is pathological for threshold-based systems
+    min_signal_rate: 0.03       # at least 3% of predictions should exceed primary_threshold
+    signal_penalty_alpha: 5.0   # weight of signal-preservation penalty in composite objective
   max_workers:
     dev: 4                    # parallel cluster training workers
     prod: 4
@@ -124,7 +129,7 @@ training:
     # Objective function configuration
     objective:
       metric: "precision_at_threshold"  # precision_at_threshold | f_beta
-      threshold: 0.50                   # probability threshold for precision_at_threshold (lowered from 0.60 so more trials produce signals)
+      threshold: 0.55                   # probability threshold for precision_at_threshold (aligned closer to promotion primary_threshold=0.65)
       beta: 0.5                         # F-beta param (only used when metric=f_beta)
       recall_penalty: "quadratic"       # quadratic | linear
     # Search space — Optuna explores these ranges (~10 tunable params)
@@ -268,6 +273,7 @@ promotion:
     primary_threshold: 0.65               # threshold for stability score and recall filters
     min_recall: 0.10                      # minimum recall at primary_threshold
     min_signals_per_window: 3             # minimum UP predictions per walk-forward window
+    max_val_test_gap: 0.20                # max allowed val-test precision gap (Filter 5: generalization)
   walk_forward:
     window_size: 63                       # 3x target horizon (trading days)
     step_size: 21                         # = target horizon (trading days)

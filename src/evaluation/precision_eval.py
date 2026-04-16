@@ -52,8 +52,14 @@ class PrecisionEvalResult:
     brier_score: float
 
     # Elimination result
-    elimination_stage: str  # "passed", "failed_stability", "failed_recall", "failed_signals", "failed_coverage"
+    elimination_stage: str  # "passed", "failed_stability", "failed_recall", "failed_signals", "failed_coverage", "failed_generalization"
     passed_all_filters: bool
+
+    # Val-test generalization gap (optional, set when test_precision_up is available)
+    val_test_precision_gap: float = 0.0
+
+    # Adaptive threshold (effective threshold used, may differ from configured primary)
+    effective_threshold: float = 0.65
 
 
 def collect_val_predictions(
@@ -237,6 +243,57 @@ def compute_auc_pr(prob_up: np.ndarray, targets: np.ndarray) -> float:
     return float(average_precision_score(targets, prob_up))
 
 
+def compute_adaptive_threshold(
+    prob_up: np.ndarray,
+    targets: np.ndarray,
+    base_threshold: float = 0.65,
+    min_threshold: float = 0.50,
+    min_signal_pct: float = 0.05,
+    min_precision: float = 0.50,
+    step: float = 0.05,
+) -> float:
+    """Find the highest usable threshold for a given probability distribution.
+
+    Searches from base_threshold downward until finding a threshold where:
+    (1) at least min_signal_pct of predictions exceed it, AND
+    (2) precision at that threshold exceeds min_precision (better than random).
+
+    This adapts the promotion threshold per cluster, accommodating clusters
+    with compressed probability distributions that can't reach the base threshold.
+
+    Args:
+        prob_up: Array of P(UP) per sample.
+        targets: Binary target array (1=UP, 0=NOT_UP).
+        base_threshold: Starting threshold (highest to try).
+        min_threshold: Floor threshold (won't go below this).
+        min_signal_pct: Minimum fraction of predictions above threshold.
+        min_precision: Minimum acceptable precision at threshold.
+        step: Step size for threshold search.
+
+    Returns:
+        Adapted threshold (between min_threshold and base_threshold).
+    """
+    n_samples = len(prob_up)
+    if n_samples == 0:
+        return min_threshold
+
+    threshold = base_threshold
+    while threshold >= min_threshold:
+        predicted_up = prob_up >= threshold
+        n_predicted = int(predicted_up.sum())
+        signal_pct = n_predicted / n_samples
+
+        if signal_pct >= min_signal_pct and n_predicted > 0:
+            tp = int((predicted_up & (targets == 1)).sum())
+            precision = tp / n_predicted
+            if precision >= min_precision:
+                return threshold
+
+        threshold -= step
+
+    return min_threshold
+
+
 def evaluate_model(
     model: torch.nn.Module,
     val_dataloader,
@@ -244,6 +301,8 @@ def evaluate_model(
     sample_dates: np.ndarray,
     forward_returns: np.ndarray | None = None,
     buy_threshold: float = 0.025,
+    test_precision_up: float | None = None,
+    adaptive_threshold: bool = False,
 ) -> PrecisionEvalResult:
     """Full precision-based evaluation of a trained model.
 
@@ -259,12 +318,27 @@ def evaluate_model(
         forward_returns: Continuous forward returns (aligned same as dates).
             If None, FP severity defaults to 0.
         buy_threshold: The target buy threshold (e.g. 0.025).
+        test_precision_up: Test set precision for val-test gap filter.
+            If None, generalization filter is skipped.
+        adaptive_threshold: If True, compute and use an adaptive primary threshold
+            when the base threshold produces no signals.
 
     Returns:
         PrecisionEvalResult with all metrics and elimination status.
     """
     # Collect predictions
     prob_up, targets = collect_val_predictions(model, val_dataloader)
+
+    # Adaptive threshold: if base primary_threshold produces no signals, find a lower usable one
+    effective_threshold = eval_config.primary_threshold
+    if adaptive_threshold:
+        signals_at_base = int((prob_up >= eval_config.primary_threshold).sum())
+        if signals_at_base == 0:
+            effective_threshold = compute_adaptive_threshold(
+                prob_up, targets,
+                base_threshold=eval_config.primary_threshold,
+                min_threshold=0.50,
+            )
 
     # Threshold sweep
     precision_dict, recall_dict, signal_dict = compute_precision_at_thresholds(
@@ -274,10 +348,10 @@ def evaluate_model(
     # AUC-PR
     auc_pr = compute_auc_pr(prob_up, targets)
 
-    # Walk-forward stability at primary threshold
+    # Walk-forward stability at effective threshold (adapted or base)
     wf_precisions, wf_mean, wf_std, wf_total_windows = compute_walk_forward_precision(
         prob_up, targets, sample_dates,
-        threshold=eval_config.primary_threshold,
+        threshold=effective_threshold,
         window_size=eval_config.wf_window_size,
         step_size=eval_config.wf_step_size,
         min_signals=eval_config.min_signals_per_window,
@@ -289,16 +363,27 @@ def evaluate_model(
     # Brier score: calibration quality
     brier_score = float(np.mean((prob_up - targets.astype(np.float64)) ** 2))
 
-    # FP severity at primary threshold
+    # FP severity at effective threshold
     avg_fp, avg_tp, fp_sev = compute_fp_severity(
         prob_up, targets, forward_returns,
-        threshold=eval_config.primary_threshold,
+        threshold=effective_threshold,
         buy_threshold=buy_threshold,
     )
 
-    # Primary threshold metrics
-    recall_at_primary = recall_dict.get(eval_config.primary_threshold, 0.0)
-    signals_at_primary = signal_dict.get(eval_config.primary_threshold, 0)
+    # Effective threshold metrics (uses adaptive threshold if active)
+    recall_at_primary = recall_dict.get(effective_threshold, 0.0)
+    signals_at_primary = signal_dict.get(effective_threshold, 0)
+    # If effective_threshold is not in the swept thresholds, compute directly
+    if effective_threshold not in recall_dict:
+        predicted_up = prob_up >= effective_threshold
+        n_predicted = int(predicted_up.sum())
+        signals_at_primary = n_predicted
+        n_positive = int(targets.sum())
+        if n_predicted > 0 and n_positive > 0:
+            tp = int((predicted_up & (targets == 1)).sum())
+            recall_at_primary = tp / n_positive
+        else:
+            recall_at_primary = 0.0
 
     # Cascading elimination
     elimination_stage = "passed"
@@ -327,11 +412,27 @@ def evaluate_model(
         elimination_stage = "failed_coverage"
         passed = False
 
+    # Compute val-test precision gap (for logging and Filter 5)
+    val_prec_up = precision_dict.get(0.50, 0.0)  # best available val precision
+    val_test_gap = 0.0
+    if test_precision_up is not None and val_prec_up > 0:
+        val_test_gap = val_prec_up - test_precision_up
+
+    # Filter 5: Generalization gap — reject models with excessive val-test degradation
+    if passed and test_precision_up is not None and val_test_gap > eval_config.max_val_test_gap:
+        elimination_stage = "failed_generalization"
+        passed = False
+
     # Stability score (computed regardless, for logging)
     # Apply coverage penalty: models with low coverage get proportionally lower scores
     stability_score = wf_mean - eval_config.stability_penalty * wf_std
     if coverage_ratio < 1.0:
         stability_score *= coverage_ratio
+
+    # Apply generalization penalty to stability score
+    if test_precision_up is not None and val_test_gap > eval_config.max_val_test_gap:
+        gen_penalty = max(0.5, 1.0 - (val_test_gap - eval_config.max_val_test_gap))
+        stability_score *= gen_penalty
 
     return PrecisionEvalResult(
         precision_at_threshold=precision_dict,
@@ -349,6 +450,8 @@ def evaluate_model(
         signal_count_at_primary=signals_at_primary,
         coverage_ratio=coverage_ratio,
         brier_score=brier_score,
+        val_test_precision_gap=val_test_gap,
+        effective_threshold=effective_threshold,
         elimination_stage=elimination_stage,
         passed_all_filters=passed,
     )
@@ -393,9 +496,13 @@ def log_eval_to_mlflow(
     client.log_metric(run_id, "val_recall_at_primary", result.recall_at_primary)
     client.log_metric(run_id, "val_signals_at_primary", result.signal_count_at_primary)
 
-    # Coverage ratio and Brier score
+    # Coverage ratio, Brier score, and generalization gap
     client.log_metric(run_id, "val_coverage_ratio", result.coverage_ratio)
     client.log_metric(run_id, "val_brier_score", result.brier_score)
+    client.log_metric(run_id, "val_test_precision_gap", result.val_test_precision_gap)
+
+    # Adaptive threshold
+    client.log_metric(run_id, "val_effective_threshold", result.effective_threshold)
 
     # Elimination result (as params, not metrics — for MLflow UI filtering)
     client.log_param(run_id, "val_elimination_stage", result.elimination_stage)

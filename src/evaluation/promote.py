@@ -219,33 +219,50 @@ def _find_best_candidate(
                 return run, ckpt
         return None, None
 
-    # Cascading: collect all runs with checkpoints and filter status
-    candidates = []
+    # Cascading: collect all runs with checkpoints and classify into tiers
+    tier1 = []  # Passed all filters, ranked by stability_score
+    tier2 = []  # Failed signals/coverage only, ranked by val_precision_up * gen_ratio
+    tier3 = []  # Failed any single filter, ranked by val_precision_up * gen_ratio
+    tier4 = []  # Any run with checkpoint (fallback)
+
     for run in runs:
         ckpt = _find_run_checkpoint(client, run.info.run_id)
         if ckpt is None:
             continue
 
-        # Merge metrics and params for comparison
         all_metrics = {**run.data.metrics, **run.data.params}
         passed = all_metrics.get("val_passed_all_filters")
         score = all_metrics.get("val_stability_score")
+        elim_stage = all_metrics.get("val_elimination_stage", "unknown")
+        val_prec = float(all_metrics.get("val_precision_up", 0.0))
+        test_prec = float(all_metrics.get("test_precision_up", 0.0))
+
+        # Generalization ratio for ranking
+        gen_ratio = min(test_prec / val_prec, 1.0) if val_prec > 0 and test_prec > 0 else 0.5
+        adjusted_score = val_prec * (1.0 + gen_ratio) / 2.0
+
+        tier4.append((run, ckpt, adjusted_score))
 
         if passed == "true" and score is not None:
-            candidates.append((run, ckpt, float(score)))
+            tier1.append((run, ckpt, float(score)))
+        elif elim_stage in ("failed_signals", "failed_coverage"):
+            tier2.append((run, ckpt, adjusted_score))
+        elif elim_stage != "unknown":
+            tier3.append((run, ckpt, adjusted_score))
 
-    if not candidates:
-        # Fallback: no run passed filters; try most recent with checkpoint
-        for run in runs:
-            ckpt = _find_run_checkpoint(client, run.info.run_id)
-            if ckpt is not None:
-                return run, ckpt
-        return None, None
+    # Try tiers in order
+    for tier_num, tier in [(1, tier1), (2, tier2), (3, tier3), (4, tier4)]:
+        if tier:
+            tier.sort(key=lambda x: x[2], reverse=True)
+            best_run, best_ckpt, best_score = tier[0]
+            # Log the promotion tier
+            try:
+                client.set_tag(best_run.info.run_id, "promotion_tier", str(tier_num))
+            except Exception:
+                pass
+            return best_run, best_ckpt
 
-    # Rank by stability_score descending
-    candidates.sort(key=lambda x: x[2], reverse=True)
-    best_run, best_ckpt, _ = candidates[0]
-    return best_run, best_ckpt
+    return None, None
 
 
 def promote_cluster_model(

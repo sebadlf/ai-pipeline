@@ -337,14 +337,24 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 
 - **Fixed params** (not searched, in `training.optuna.fixed_params`): optimizer_name=adamw, scheduler_factor=0.5, scheduler_patience=5, gradient_clip_val=2.0, bidirectional=false, num_attention_heads=0, activation=gelu, feature_mask_rate=0.10
 
+## Temperature calibration
+
+- **Post-training calibration**: Temperature scaling (Guo et al. 2017) with composite NLL + signal-preservation objective
+- **Temperature bounds**: [0.5, 2.5] — prevents pathological T>>1 that collapses all probabilities to ~0.50
+- **Signal preservation**: Penalizes calibrations where <3% of predictions exceed primary_threshold (0.65)
+- **Safety check**: Falls back to T=1.0 if post-calibration yields <1% signals above 0.60
+- **Diagnostics**: Pre/post calibration probability distribution stats logged to MLflow
+
 ## Model promotion (cascading elimination)
 
 - **Precision-at-threshold evaluation**: Tests model at thresholds [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
-- **Primary threshold**: 0.65 (used for stability score and recall filters)
+- **Primary threshold**: 0.65 (used for stability score and recall filters), with adaptive fallback
+- **Adaptive threshold**: When no predictions exceed primary_threshold, searches downward to find highest usable threshold (min 0.50) with >=5% signal rate and >=50% precision
 - **Walk-forward stability**: window=63 days (3x horizon), step=21 days (=horizon)
-- **Stability score**: `mean_precision - 1.0 * std_precision` (penalizes inconsistent precision)
-- **Filters**: max std ratio 0.25, min recall 0.10, min 3 UP signals per window
+- **Stability score**: `mean_precision - 1.0 * std_precision` (penalizes inconsistent precision), with generalization penalty for val-test gap >20%
+- **Filters**: max std ratio 0.25, min recall 0.10, min 3 UP signals per window, max val-test gap 0.20
 - **Tiebreaking**: Within 0.01 margin, breaks ties by FP severity (false positive analysis)
+- **Graduated fallback**: Tier 1 (passed all filters) -> Tier 2 (failed signals/coverage only) -> Tier 3 (failed one filter) -> Tier 4 (most recent with checkpoint)
 - **Legacy fallback**: When `promotion.evaluation` section is absent, uses simple metric comparison
 
 ## Features

@@ -98,15 +98,31 @@ class ClusterProgressCallback(L.Callback):
 def calibrate_temperature(
     model: LSTMForecaster,
     val_dataloader,
-) -> float:
-    """Find optimal temperature T that minimizes NLL on validation set.
+    primary_threshold: float = 0.65,
+    min_signal_rate: float = 0.03,
+    signal_penalty_alpha: float = 5.0,
+) -> tuple[float, dict[str, float]]:
+    """Find optimal temperature T using composite NLL + signal-preservation objective.
 
     Temperature scaling (Guo et al. 2017) adjusts logits by dividing by T
     before softmax, correcting overconfident predictions without changing
     accuracy or ranking.
 
+    Pure NLL optimization can converge to extreme T values (>>1) that collapse
+    all probabilities toward the base rate (~0.50), destroying the signal needed
+    for threshold-based decisions. The composite objective adds a penalty when
+    too few predictions exceed the primary threshold.
+
+    Args:
+        model: Trained model in eval mode.
+        val_dataloader: Validation data loader.
+        primary_threshold: Probability threshold for signal preservation (from promotion config).
+        min_signal_rate: Minimum fraction of predictions that should exceed primary_threshold.
+        signal_penalty_alpha: Weight of the signal-preservation penalty term.
+
     Returns:
-        Optimal temperature value (T > 1 means model was overconfident).
+        (optimal_temperature, diagnostics_dict) where diagnostics_dict contains
+        pre/post calibration probability statistics for MLflow logging.
     """
     model.eval()
     all_logits = []
@@ -122,12 +138,46 @@ def calibrate_temperature(
     all_logits = torch.cat(all_logits)
     all_targets = torch.cat(all_targets)
 
-    def nll_loss(T: float) -> float:
-        scaled = all_logits / T
-        return F.cross_entropy(scaled, all_targets).item()
+    # Pre-calibration diagnostics (T=1.0)
+    pre_probs = torch.softmax(all_logits, dim=-1)[:, 1]
+    pre_diagnostics = {
+        "pre_cal_prob_mean": float(pre_probs.mean()),
+        "pre_cal_prob_std": float(pre_probs.std()),
+        "pre_cal_pct_above_060": float((pre_probs >= 0.60).float().mean()),
+        "pre_cal_pct_above_065": float((pre_probs >= 0.65).float().mean()),
+    }
 
-    result = minimize_scalar(nll_loss, bounds=(0.1, 10.0), method="bounded")
-    return float(result.x)
+    def composite_objective(T: float) -> float:
+        scaled = all_logits / T
+        nll = F.cross_entropy(scaled, all_targets).item()
+        probs = torch.softmax(scaled, dim=-1)[:, 1]
+        signal_rate = float((probs >= primary_threshold).float().mean())
+        signal_penalty = signal_penalty_alpha * max(0.0, min_signal_rate - signal_rate)
+        return nll + signal_penalty
+
+    result = minimize_scalar(composite_objective, bounds=(0.5, 2.5), method="bounded")
+    optimal_temp = float(result.x)
+
+    # Post-calibration diagnostics
+    post_probs = torch.softmax(all_logits / optimal_temp, dim=-1)[:, 1]
+    post_pct_above_060 = float((post_probs >= 0.60).float().mean())
+
+    # Safety check: if calibration still kills all signals, fall back to T=1.0
+    if post_pct_above_060 < 0.01:
+        print(f"  WARNING: calibration T={optimal_temp:.4f} produces <1% signals above 0.60, falling back to T=1.0")
+        optimal_temp = 1.0
+        post_probs = pre_probs
+        post_pct_above_060 = pre_diagnostics["pre_cal_pct_above_060"]
+
+    diagnostics = {
+        **pre_diagnostics,
+        "post_cal_prob_mean": float(post_probs.mean()),
+        "post_cal_prob_std": float(post_probs.std()),
+        "post_cal_pct_above_060": post_pct_above_060,
+        "post_cal_pct_above_065": float((post_probs >= 0.65).float().mean()),
+    }
+
+    return optimal_temp, diagnostics
 
 
 def _get_random_symbols(
@@ -415,7 +465,9 @@ def _compute_objective_value(
             # configs that produce higher probabilities, instead of treating all
             # "no signal" trials as equally bad (0.0).
             max_prob = float(probs.max()) if len(probs) > 0 else 0.0
-            return max_prob * 0.01  # always << any real precision score
+            # Also reward models with predictions near the threshold (within 0.10)
+            near_threshold = float((probs > threshold - 0.10).mean()) if len(probs) > 0 else 0.0
+            return max_prob * 0.01 + 0.001 * near_threshold  # always << any real precision score
 
         tp = int((predicted_up & (targets == 1)).sum())
         n_positive = int(targets.sum())
@@ -1040,7 +1092,16 @@ def train_final_model(
         trainer.fit(model, dm)
 
         # Temperature scaling calibration (Guo et al. 2017)
-        optimal_temp = calibrate_temperature(model, dm.val_dataloader())
+        promotion_cfg = config.get("promotion", {})
+        eval_cfg = promotion_cfg.get("evaluation", {})
+        cal_cfg = config.get("training", {}).get("calibration", {})
+        primary_thresh = eval_cfg.get("primary_threshold", 0.65)
+        optimal_temp, cal_diagnostics = calibrate_temperature(
+            model, dm.val_dataloader(),
+            primary_threshold=primary_thresh,
+            min_signal_rate=cal_cfg.get("min_signal_rate", 0.03),
+            signal_penalty_alpha=cal_cfg.get("signal_penalty_alpha", 5.0),
+        )
         model.hparams["calibration_temperature"] = optimal_temp
         print(f"  Calibration temperature: {optimal_temp:.4f}")
 
@@ -1097,8 +1158,10 @@ def train_final_model(
         if best_val_loss is not None:
             client.log_metric(run_id, "best_val_precision_up", float(best_val_loss))
 
-        # Log calibration temperature
+        # Log calibration temperature and diagnostics
         client.log_metric(run_id, "calibration_temperature", optimal_temp)
+        for diag_key, diag_val in cal_diagnostics.items():
+            client.log_metric(run_id, diag_key, diag_val)
 
         # Detect which early stopping triggered
         for cb in trainer.callbacks:
@@ -1112,10 +1175,10 @@ def train_final_model(
                 client.log_param(run_id, "early_stop_trigger", "none")
 
         # Confusion matrix + precision/recall/f1
-        _log_confusion_matrix(model, dm, client, run_id)
+        test_precision_up = _log_confusion_matrix(model, dm, client, run_id)
 
         # Precision-based evaluation with walk-forward stability
-        _run_precision_eval(model, dm, config, client, run_id, buy_thresh)
+        _run_precision_eval(model, dm, config, client, run_id, buy_thresh, test_precision_up)
 
         # Trade evaluation
         _run_trade_eval(
@@ -1134,8 +1197,12 @@ def _log_confusion_matrix(
     dm: TradingDataModule,
     client,
     run_id: str,
-) -> None:
-    """Compute and log confusion matrix + classification metrics to MLflow."""
+) -> float | None:
+    """Compute and log confusion matrix + classification metrics to MLflow.
+
+    Returns:
+        test_precision_up for val-test gap computation, or None if unavailable.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1148,6 +1215,7 @@ def _log_confusion_matrix(
 
     model.eval()
     class_names = ["NOT_UP", "UP"]
+    test_precision_up = None
 
     for split_name, dataloader in [
         ("val", dm.val_dataloader()),
@@ -1182,6 +1250,9 @@ def _log_confusion_matrix(
         client.log_metric(run_id, f"{split_name}_recall_up", float(recall[1]))
         client.log_metric(run_id, f"{split_name}_f1_up", float(f1[1]))
 
+        if split_name == "test":
+            test_precision_up = float(precision[1])
+
         # Brier score: calibration quality metric (lower is better)
         up_targets = (all_targets_np == 1).astype(np.float64)
         brier_score = float(np.mean((all_probs_np - up_targets) ** 2))
@@ -1203,6 +1274,8 @@ def _log_confusion_matrix(
             client.log_artifact(run_id, f.name, artifact_path="confusion_matrix")
         plt.close(fig)
 
+    return test_precision_up
+
 
 def _run_precision_eval(
     model: LSTMForecaster,
@@ -1211,6 +1284,7 @@ def _run_precision_eval(
     client,
     run_id: str,
     buy_thresh: float,
+    test_precision_up: float | None = None,
 ) -> None:
     """Run precision-focused evaluation with walk-forward stability."""
     try:
@@ -1244,6 +1318,8 @@ def _run_precision_eval(
             sample_dates=sample_dates,
             forward_returns=fwd_returns,
             buy_threshold=buy_thresh,
+            test_precision_up=test_precision_up,
+            adaptive_threshold=True,
         )
         log_eval_to_mlflow(eval_result, client, run_id)
         print(
