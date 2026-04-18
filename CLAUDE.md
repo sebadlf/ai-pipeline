@@ -462,3 +462,41 @@ make cleanup
 make mlflow-report
 make mlflow-runs-report
 ```
+
+## External References
+
+- **Linear team**: `Becerra` (prefix `BEC`). Use the Linear MCP (`mcp__linear__*`) to read/create/update issues. Issues de este repo van con label o sub-project `ai-pipeline`.
+- **Obsidian vault**: `./ai-pipeline-vault/` — accessible via the `obsidian` MCP server. Contains:
+  - `projects/ai-pipeline/` — project-specific notes (domain, ADRs, runbooks)
+  - `knowledge/` — cross-project knowledge (Python, ML, architecture, DevOps, tools)
+  - `workflows/` — documented workflows
+  - `daily-logs/` — per-day informal log
+- **GitHub**: repo `sebadlf/ai-pipeline`. Use the `github` MCP for PRs, issues, reviews.
+- **MLflow**: local tracking server en `http://localhost:5000` (y `http://192.168.68.64:5000` para reports remotos). Source of truth experimental — no duplicar métricas de runs en el vault.
+
+## Git Conventions
+
+- **Branch format**: `sebadlf-bec-{issue-number}-{short-description}` (copy from the Linear issue — it auto-generates this)
+- **PR body**: must include the Linear issue ID (e.g., `BEC-42`) — triggers auto-link in Linear
+- **Never commit directly to `main`** — protected branch, PR required
+- **CI must pass** before merge: Ruff lint + format check, pytest (`.github/workflows/ci.yml`)
+- **Auto-merge**: PRs no-draft se auto-mergean (squash) cuando CI pasa (`.github/workflows/auto-merge.yml`)
+
+## Workflow
+
+Para issues nuevos, el flujo es:
+
+1. Leer el issue en Linear (via MCP) para entender el contexto.
+2. Consultar notas relevantes del vault (`ai-pipeline-vault/`, via obsidian MCP) — al menos `projects/ai-pipeline/README.md`, ADRs relevantes, runbooks y domain notes que toquen el área. Para temas de ML/trading transversales, revisar `knowledge/ml/`.
+3. Crear branch con el formato correcto.
+4. Implementar, correr Ruff + tests localmente (`uv run ruff check . && uv run ruff format --check . && uv run pytest`).
+5. Commitear y crear PR con link al issue de Linear.
+6. Esperar CI verde y mergear (auto-merge se encarga). Linear auto-cierra el issue.
+7. **Cierre del ticket — actualizar el vault (paso obligatorio, no opcional).** Antes de pasar al próximo ticket, escribir lo que corresponda usando el `obsidian` MCP. Criterios:
+   - **ADR** en `projects/ai-pipeline/decisions/` — si introdujiste una decisión arquitectónica nueva, cambiaste una previa, o evaluaste alternativas que vale la pena recordar. Usar `_templates/tpl-adr.md` y numerar correlativo (`ADR-NNN`).
+   - **Runbook** en `projects/ai-pipeline/runbooks/` — si codificaste un procedimiento operativo que se va a repetir (release, cleanup, debugging de un stage problemático). Usar `_templates/tpl-runbook.md`.
+   - **Domain note** en `projects/ai-pipeline/domain/` — si descubriste un patrón del dominio (feature, modelo, comportamiento del pipeline) que el código solo no comunica.
+   - **Daily log** del día en `daily-logs/YYYY-MM-DD.md` — siempre, una entrada por ticket cerrado con qué se hizo, aprendizajes, y links a notas creadas/actualizadas + runs de MLflow si aplica. Crear el archivo con `_templates/tpl-daily-log.md` si todavía no existe para hoy.
+   - **`projects/ai-pipeline/README.md`** — actualizar si la nota nueva debería listarse en Decisiones, Runbooks o Notas de dominio.
+
+   Si **ninguna** de las primeras tres aplica, igualmente registrar el ticket en el daily log con una línea que diga por qué no generó documentación nueva. Cero documentación silenciosa.
