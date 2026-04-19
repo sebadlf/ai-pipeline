@@ -36,3 +36,6 @@ build/
 
 # UV
 .python-version
+
+# Obsidian local workspace config (not vault content)
+ai-pipeline-vault/.obsidian/
