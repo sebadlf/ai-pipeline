@@ -127,15 +127,11 @@ def normalize_features(config: dict, stats: dict | None = None) -> pl.DataFrame:
 
     # Apply normalization only to feature columns, keep metadata as-is
     metadata_cols = [c for c in df.columns if c not in feature_stats]
-    df_normalized = df.select(
-        [pl.col(c) for c in metadata_cols] + exprs
-    )
+    df_normalized = df.select([pl.col(c) for c in metadata_cols] + exprs)
 
     # Final safety: replace any remaining NaN/Inf
     for col in feature_cols:
-        df_normalized = df_normalized.with_columns(
-            pl.col(col).fill_nan(0.0).alias(col)
-        )
+        df_normalized = df_normalized.with_columns(pl.col(col).fill_nan(0.0).alias(col))
 
     return df_normalized
 
@@ -154,9 +150,7 @@ def load_normalization_stats(config: dict) -> dict:
     """
     stats_path = get_normalization_stats_path(config)
     if not Path(stats_path).exists():
-        raise FileNotFoundError(
-            f"{stats_path} not found. Run `make normalize` first."
-        )
+        raise FileNotFoundError(f"{stats_path} not found. Run `make normalize` first.")
     with open(stats_path) as f:
         return json.load(f)
 
@@ -243,12 +237,15 @@ def main() -> None:
 
     # Print summary of extreme features
     feature_stats = stats["features"]
-    print(f"\n  Feature scale summary (top 10 by raw std):")
+    print("\n  Feature scale summary (top 10 by raw std):")
     sorted_features = sorted(feature_stats.items(), key=lambda x: x[1]["std"], reverse=True)
     for col, s in sorted_features[:10]:
-        print(f"    {col:>35}: mean={s['mean']:>10.4f}  std={s['std']:>10.4f}  clip=[{s['p_low']:.4f}, {s['p_high']:.4f}]")
+        print(
+            f"    {col:>35}: mean={s['mean']:>10.4f}  std={s['std']:>10.4f}  "
+            f"clip=[{s['p_low']:.4f}, {s['p_high']:.4f}]"
+        )
 
-    print(f"\nNormalizing features...")
+    print("\nNormalizing features...")
     df_normalized = normalize_features(config, stats)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

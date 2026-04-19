@@ -1,9 +1,9 @@
 """Discover and document FMP API endpoint response structures."""
+
 import json
-import urllib.request
-import urllib.error
 import ssl
-import sys
+import urllib.error
+import urllib.request
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -14,33 +14,67 @@ BASE = "https://financialmodelingprep.com"
 ENDPOINTS = {
     "COMPANY INFO": [
         ("1. Profile", f"/stable/profile?symbol=AAPL&apikey={API_KEY}"),
-        ("2. Stock Screener", f"/stable/stock-screener?limit=3&marketCapMoreThan=1000000000&apikey={API_KEY}"),
+        (
+            "2. Stock Screener",
+            f"/stable/stock-screener?limit=3&marketCapMoreThan=1000000000&apikey={API_KEY}",
+        ),
         ("3. Most Active", f"/stable/most-active?apikey={API_KEY}"),
         ("4. Top Gainers", f"/stable/top-gainers?apikey={API_KEY}"),
         ("5. Top Losers", f"/stable/top-losers?apikey={API_KEY}"),
     ],
     "FINANCIAL STATEMENTS": [
-        ("6. Income Statement", f"/stable/income-statement?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
-        ("7. Balance Sheet", f"/stable/balance-sheet-statement?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
-        ("8. Cash Flow", f"/stable/cash-flow-statement?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
-        ("9. Income Statement Growth", f"/stable/income-statement-growth?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
-        ("10. Financial Growth", f"/stable/financial-growth?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
+        (
+            "6. Income Statement",
+            f"/stable/income-statement?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
+        (
+            "7. Balance Sheet",
+            f"/stable/balance-sheet-statement?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
+        (
+            "8. Cash Flow",
+            f"/stable/cash-flow-statement?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
+        (
+            "9. Income Statement Growth",
+            f"/stable/income-statement-growth?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
+        (
+            "10. Financial Growth",
+            f"/stable/financial-growth?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
     ],
     "RATIOS & METRICS": [
-        ("11. Ratios (Quarterly)", f"/stable/ratios?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
-        ("12. Key Metrics (Quarterly)", f"/stable/key-metrics?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
+        (
+            "11. Ratios (Quarterly)",
+            f"/stable/ratios?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
+        (
+            "12. Key Metrics (Quarterly)",
+            f"/stable/key-metrics?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
         ("13. Ratios TTM", f"/stable/ratios-ttm?symbol=AAPL&apikey={API_KEY}"),
         ("14. Key Metrics TTM", f"/stable/key-metrics-ttm?symbol=AAPL&apikey={API_KEY}"),
-        ("15. Enterprise Values", f"/stable/enterprise-values?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
+        (
+            "15. Enterprise Values",
+            f"/stable/enterprise-values?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
     ],
     "ANALYST & ESTIMATES": [
-        ("16. Analyst Estimates", f"/stable/analyst-estimates?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}"),
-        ("17. Analyst Recommendations", f"/stable/analyst-stock-recommendations?symbol=AAPL&limit=5&apikey={API_KEY}"),
+        (
+            "16. Analyst Estimates",
+            f"/stable/analyst-estimates?symbol=AAPL&period=quarter&limit=2&apikey={API_KEY}",
+        ),
+        (
+            "17. Analyst Recommendations",
+            f"/stable/analyst-stock-recommendations?symbol=AAPL&limit=5&apikey={API_KEY}",
+        ),
         ("18. Price Target", f"/stable/price-target?symbol=AAPL&apikey={API_KEY}"),
         ("19. Upgrades/Downgrades", f"/stable/upgrades-downgrades?symbol=AAPL&apikey={API_KEY}"),
         ("20. Grade", f"/stable/grade?symbol=AAPL&limit=5&apikey={API_KEY}"),
     ],
 }
+
 
 def fetch(path: str):
     url = BASE + path
@@ -53,6 +87,7 @@ def fetch(path: str):
         return {"__error__": f"HTTP {e.code}", "__body__": body}
     except Exception as e:
         return {"__error__": str(e)}
+
 
 def describe_value(v):
     if v is None:
@@ -73,6 +108,7 @@ def describe_value(v):
         return f"object({len(v)} keys)"
     return type(v).__name__
 
+
 def print_fields(obj, indent=2):
     if isinstance(obj, list):
         if len(obj) == 0:
@@ -86,14 +122,17 @@ def print_fields(obj, indent=2):
     else:
         print(f"{' ' * indent}{describe_value(obj)}")
 
+
 for category, endpoints in ENDPOINTS.items():
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  {category}")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     for name, path in endpoints:
         # Strip apikey from display path
-        display_path = path.split("?")[0] + "?" + "&".join(
-            p for p in path.split("?")[1].split("&") if not p.startswith("apikey=")
+        display_path = (
+            path.split("?")[0]
+            + "?"
+            + "&".join(p for p in path.split("?")[1].split("&") if not p.startswith("apikey="))
         )
         print(f"\n--- {name} ---")
         print(f"  GET {BASE}{display_path.rstrip('?').rstrip('&')}")

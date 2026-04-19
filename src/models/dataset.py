@@ -5,12 +5,16 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+from typing import TYPE_CHECKING
 
-import lightning as L
+import lightning as L  # noqa: N812
 import numpy as np
 import polars as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+if TYPE_CHECKING:
+    from src.config import SplitDates
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,7 @@ def _get_num_workers() -> int:
     DataLoader with workers can cause AttributeError on macOS.
     """
     return 0 if os.uname().sysname == "Darwin" else min(os.cpu_count() or 0, 8)
+
 
 EXCLUDE_COLS = {"id", "symbol", "date", "target", "adj_close"}
 
@@ -67,7 +72,8 @@ class TimeSeriesDataset(Dataset):
         self.feature_mask_rate = feature_mask_rate
         self.sample_weights = (
             torch.tensor(sample_weights, dtype=torch.float32)
-            if sample_weights is not None else None
+            if sample_weights is not None
+            else None
         )
 
     def __len__(self) -> int:
@@ -118,7 +124,7 @@ class TradingDataModule(L.LightningDataModule):
         seq_len: int = 30,
         batch_size: int = 64,
         *,
-        split_dates: "SplitDates | None" = None,
+        split_dates: SplitDates | None = None,
         cluster_id: str | None = None,
         clusters_parquet: str = "data/clusters.parquet",
         noise_std: float = 0.01,
@@ -130,7 +136,10 @@ class TradingDataModule(L.LightningDataModule):
         from src.config import SplitDates
 
         if split_dates is None:
-            logger.warning("split_dates not provided, using hardcoded defaults — this should only happen in testing")
+            logger.warning(
+                "split_dates not provided, using hardcoded defaults — "
+                "this should only happen in testing"
+            )
             split_dates = SplitDates(
                 start_date=dt.date(2016, 4, 1),
                 train_end=dt.date(2022, 10, 1),
@@ -179,10 +188,9 @@ class TradingDataModule(L.LightningDataModule):
         # Filter to cluster symbols if specified
         if self.cluster_id is not None:
             clusters_df = pl.read_parquet(self.clusters_parquet)
-            cluster_symbols = (
-                clusters_df.filter(pl.col("cluster_id") == self.cluster_id)["symbol"]
-                .to_list()
-            )
+            cluster_symbols = clusters_df.filter(pl.col("cluster_id") == self.cluster_id)[
+                "symbol"
+            ].to_list()
             df = df.filter(pl.col("symbol").is_in(cluster_symbols))
             if df.is_empty():
                 raise ValueError(f"No data found for cluster {self.cluster_id}")
@@ -209,9 +217,7 @@ class TradingDataModule(L.LightningDataModule):
             sym_df = df.filter(pl.col("symbol") == symbol)
 
             train_df = sym_df.filter(pl.col("date") < sd.train_end)
-            val_df = sym_df.filter(
-                (pl.col("date") >= sd.val_start) & (pl.col("date") < sd.val_end)
-            )
+            val_df = sym_df.filter((pl.col("date") >= sd.val_start) & (pl.col("date") < sd.val_end))
             test_df = sym_df.filter(pl.col("date") >= sd.test_start)
 
             for split_df, x_list, y_list, valid_list, offset in [
@@ -258,13 +264,19 @@ class TradingDataModule(L.LightningDataModule):
             # Adjust valid indices: drop those before offset and rebase
             train_valid = [idx - offset for idx in train_valid if idx >= offset]
             tag = f"[{self.cluster_id}] " if self.cluster_id else ""
-            print(f"  {tag}Temporal diversity: keeping {1.0-self.train_date_offset_pct:.0%} most recent training data ({n_keep:,}/{n_total:,})")
+            print(
+                f"  {tag}Temporal diversity: keeping "
+                f"{1.0 - self.train_date_offset_pct:.0%} most recent training data "
+                f"({n_keep:,}/{n_total:,})"
+            )
 
         train_vi = np.array(train_valid, dtype=np.int64)
         val_vi = np.array(val_valid, dtype=np.int64)
 
         # Store evaluation arrays for precision eval (indexed by val_vi + seq_len)
-        self.val_dates = np.concatenate(all_val_dates) if all_val_dates else np.array([], dtype="datetime64[ns]")
+        self.val_dates = (
+            np.concatenate(all_val_dates) if all_val_dates else np.array([], dtype="datetime64[ns]")
+        )
         self.val_forward_returns = np.concatenate(all_val_fwd_ret) if all_val_fwd_ret else None
         self.val_valid_indices = val_vi
         test_vi = np.array(test_valid, dtype=np.int64)
@@ -281,10 +293,12 @@ class TradingDataModule(L.LightningDataModule):
 
         # Class balance report
         for name, y in [("train", train_y), ("val", val_y), ("test", test_y)]:
-            counts_map = {cls_name: int((y == cls_idx).sum()) for cls_idx, cls_name in class_names.items()}
+            counts_map = {
+                cls_name: int((y == cls_idx).sum()) for cls_idx, cls_name in class_names.items()
+            }
             total = len(y)
             parts = " | ".join(
-                f"{cls_name}: {count:,} ({count/total:.1%})"
+                f"{cls_name}: {count:,} ({count / total:.1%})"
                 for cls_name, count in counts_map.items()
             )
             print(f"  {tag}{name} class balance — {parts}")
@@ -294,9 +308,12 @@ class TradingDataModule(L.LightningDataModule):
         total = counts.sum()
         weight_map = {int(cls): total / (len(unique) * cnt) for cls, cnt in zip(unique, counts)}
         self.class_weights = [weight_map.get(i, 1.0) for i in range(num_classes)]
-        print(f"  {tag}class weights — " + " | ".join(
-            f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
-        ))
+        print(
+            f"  {tag}class weights — "
+            + " | ".join(
+                f"{class_names.get(i, i)}: {w:.3f}" for i, w in enumerate(self.class_weights)
+            )
+        )
 
         # Time-decay sample weighting: recent samples get higher weight
         # weight = exp(-lambda * days_from_latest / 365)
@@ -310,20 +327,40 @@ class TradingDataModule(L.LightningDataModule):
             time_decay_lambda = self._time_decay_lambda
             if time_decay_lambda > 0:
                 latest = train_dates.max()
-                days_from_latest = (latest - train_dates).astype("timedelta64[D]").astype(np.float64)
+                days_from_latest = (
+                    (latest - train_dates).astype("timedelta64[D]").astype(np.float64)
+                )
                 train_sample_weights = np.exp(-time_decay_lambda * days_from_latest / 365.0)
                 # Normalize so mean weight = 1.0 (preserves effective learning rate)
                 train_sample_weights = train_sample_weights / train_sample_weights.mean()
                 tag = f"[{self.cluster_id}] " if self.cluster_id else ""
-                print(f"  {tag}Time-decay weighting: lambda={time_decay_lambda}, min_w={train_sample_weights.min():.3f}, max_w={train_sample_weights.max():.3f}")
+                print(
+                    f"  {tag}Time-decay weighting: lambda={time_decay_lambda}, "
+                    f"min_w={train_sample_weights.min():.3f}, "
+                    f"max_w={train_sample_weights.max():.3f}"
+                )
 
         # Safety net: replace any remaining Inf/NaN after normalization step
         for arr in (train_x, val_x, test_x):
             np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self.train_ds = TimeSeriesDataset(train_x, train_y, self.seq_len, train_vi, target_dtype=torch.int64, is_train=True, noise_std=self.noise_std, feature_mask_rate=self.feature_mask_rate, sample_weights=train_sample_weights)
-        self.val_ds = TimeSeriesDataset(val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64)
-        self.test_ds = TimeSeriesDataset(test_x, test_y, self.seq_len, test_vi, target_dtype=torch.int64)
+        self.train_ds = TimeSeriesDataset(
+            train_x,
+            train_y,
+            self.seq_len,
+            train_vi,
+            target_dtype=torch.int64,
+            is_train=True,
+            noise_std=self.noise_std,
+            feature_mask_rate=self.feature_mask_rate,
+            sample_weights=train_sample_weights,
+        )
+        self.val_ds = TimeSeriesDataset(
+            val_x, val_y, self.seq_len, val_vi, target_dtype=torch.int64
+        )
+        self.test_ds = TimeSeriesDataset(
+            test_x, test_y, self.seq_len, test_vi, target_dtype=torch.int64
+        )
 
     @property
     def input_size(self) -> int:

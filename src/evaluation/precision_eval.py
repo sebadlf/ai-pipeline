@@ -8,8 +8,7 @@ Used post-training to evaluate model quality before promotion.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -52,7 +51,9 @@ class PrecisionEvalResult:
     brier_score: float
 
     # Elimination result
-    elimination_stage: str  # "passed", "failed_stability", "failed_recall", "failed_signals", "failed_coverage", "failed_generalization"
+    # One of: "passed", "failed_stability", "failed_recall", "failed_signals",
+    # "failed_coverage", "failed_generalization"
+    elimination_stage: str
     passed_all_filters: bool
 
     # Val-test generalization gap (optional, set when test_precision_up is available)
@@ -335,14 +336,17 @@ def evaluate_model(
         signals_at_base = int((prob_up >= eval_config.primary_threshold).sum())
         if signals_at_base == 0:
             effective_threshold = compute_adaptive_threshold(
-                prob_up, targets,
+                prob_up,
+                targets,
                 base_threshold=eval_config.primary_threshold,
                 min_threshold=0.50,
             )
 
     # Threshold sweep
     precision_dict, recall_dict, signal_dict = compute_precision_at_thresholds(
-        prob_up, targets, eval_config.thresholds,
+        prob_up,
+        targets,
+        eval_config.thresholds,
     )
 
     # AUC-PR
@@ -350,7 +354,9 @@ def evaluate_model(
 
     # Walk-forward stability at effective threshold (adapted or base)
     wf_precisions, wf_mean, wf_std, wf_total_windows = compute_walk_forward_precision(
-        prob_up, targets, sample_dates,
+        prob_up,
+        targets,
+        sample_dates,
         threshold=effective_threshold,
         window_size=eval_config.wf_window_size,
         step_size=eval_config.wf_step_size,
@@ -365,7 +371,9 @@ def evaluate_model(
 
     # FP severity at effective threshold
     avg_fp, avg_tp, fp_sev = compute_fp_severity(
-        prob_up, targets, forward_returns,
+        prob_up,
+        targets,
+        forward_returns,
         threshold=effective_threshold,
         buy_threshold=buy_threshold,
     )

@@ -63,13 +63,15 @@ REPORT_PARAMS: tuple[str, ...] = (
 )
 
 # Non per-cluster-training experiments (noise for this report).
-_EXCLUDED_EXPERIMENTS = frozenset({
-    "Default",
-    "clustering",
-    "aggregation",
-    "backtesting",
-    "portfolio-optimization",
-})
+_EXCLUDED_EXPERIMENTS = frozenset(
+    {
+        "Default",
+        "clustering",
+        "aggregation",
+        "backtesting",
+        "portfolio-optimization",
+    }
+)
 
 
 def _experiment_display_name(name: str) -> str:
@@ -197,10 +199,7 @@ def build_report(
         and (not name_contains or name_contains.lower() in e.name.lower())
     ]
 
-    summaries = [
-        _summarize_experiment(client, e.experiment_id, e.name, max_runs)
-        for e in filtered
-    ]
+    summaries = [_summarize_experiment(client, e.experiment_id, e.name, max_runs) for e in filtered]
 
     summaries.sort(key=lambda s: _experiment_display_name(s.name).lower())
 
@@ -223,9 +222,7 @@ def _markdown_table(rows: list[list[str]], headers: list[str]) -> str:
     line = "|" + "|".join("-" * (w[i] + 2) for i in range(len(headers))) + "|"
     out = [sep, line]
     for row in rows:
-        out.append(
-            "|" + "|".join(" " + row[i].ljust(w[i]) + " " for i in range(len(row))) + "|"
-        )
+        out.append("|" + "|".join(" " + row[i].ljust(w[i]) + " " for i in range(len(row))) + "|")
     return "\n".join(out)
 
 
@@ -250,11 +247,7 @@ def report_to_markdown(data: dict[str, Any]) -> str:
         status_str = "/".join(f"{k}:{sc[k]}" for k in sorted(sc.keys()))
         bm = e["best_metrics"]
         lr = e.get("latest_run") or {}
-        latest = (
-            f"{lr.get('status', '—')} @ {lr.get('start_time_iso', '—')[:19]}"
-            if lr
-            else "—"
-        )
+        latest = f"{lr.get('status', '—')} @ {lr.get('start_time_iso', '—')[:19]}" if lr else "—"
         exp_rows.append(
             [
                 _experiment_display_name(e["name"]),
@@ -361,9 +354,7 @@ def report_to_markdown(data: dict[str, Any]) -> str:
         for m in reg:
             lines.append(f"- **{m['name']}**")
             for v in m.get("latest_versions", []):
-                lines.append(
-                    f"  - v{v['version']} stage={v['stage']} aliases={v['aliases']}"
-                )
+                lines.append(f"  - v{v['version']} stage={v['stage']} aliases={v['aliases']}")
     lines.append("")
 
     return "\n".join(lines)

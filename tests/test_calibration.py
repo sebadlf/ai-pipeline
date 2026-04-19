@@ -1,12 +1,9 @@
 """Tests for temperature calibration and adaptive thresholds."""
 
 import numpy as np
-import pytest
 import torch
-import torch.nn.functional as F
 
 from src.evaluation.precision_eval import compute_adaptive_threshold
-
 
 # --------------------------------------------------------------------------- #
 # compute_adaptive_threshold tests                                             #
@@ -25,7 +22,10 @@ class TestAdaptiveThreshold:
         prob_up = np.where(targets == 1, rng.uniform(0.6, 0.9, n), rng.uniform(0.2, 0.5, n))
 
         result = compute_adaptive_threshold(
-            prob_up, targets, base_threshold=0.65, min_threshold=0.50,
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
         )
         assert result == 0.65
 
@@ -38,7 +38,10 @@ class TestAdaptiveThreshold:
         prob_up = np.where(targets == 1, rng.uniform(0.50, 0.58, n), rng.uniform(0.30, 0.48, n))
 
         result = compute_adaptive_threshold(
-            prob_up, targets, base_threshold=0.65, min_threshold=0.50,
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
         )
         assert result < 0.65
         assert result >= 0.50
@@ -50,14 +53,20 @@ class TestAdaptiveThreshold:
         prob_up = np.full(n, 0.3)  # all very low
 
         result = compute_adaptive_threshold(
-            prob_up, targets, base_threshold=0.65, min_threshold=0.50,
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
         )
         assert result == 0.50
 
     def test_empty_input(self):
         """Empty arrays return min_threshold."""
         result = compute_adaptive_threshold(
-            np.array([]), np.array([]), base_threshold=0.65, min_threshold=0.50,
+            np.array([]),
+            np.array([]),
+            base_threshold=0.65,
+            min_threshold=0.50,
         )
         assert result == 0.50
 
@@ -69,7 +78,10 @@ class TestAdaptiveThreshold:
         prob_up = rng.uniform(0.45, 0.70, n)  # many above 0.50 but precision=0
 
         result = compute_adaptive_threshold(
-            prob_up, targets, base_threshold=0.65, min_threshold=0.50,
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
             min_precision=0.50,
         )
         # Should fall to min because precision is always 0 (no true positives)

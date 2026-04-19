@@ -31,7 +31,7 @@ def sortino_ratio(returns: np.ndarray, target: float = 0.0) -> float:
     """
     excess = returns - target
     downside = np.minimum(returns - target, 0.0)
-    downside_std = np.sqrt(np.mean(downside ** 2))
+    downside_std = np.sqrt(np.mean(downside**2))
     if downside_std == 0 or len(returns) < 2:
         return 0.0
     return float(np.sqrt(252) * excess.mean() / downside_std)
@@ -80,9 +80,7 @@ def calmar_ratio(returns: np.ndarray, equity_curve: np.ndarray) -> float:
     return float(annual_return / max_dd)
 
 
-def information_ratio(
-    returns: np.ndarray, benchmark_returns: np.ndarray
-) -> float:
+def information_ratio(returns: np.ndarray, benchmark_returns: np.ndarray) -> float:
     """Annualized Information ratio — excess return / tracking error.
 
     Args:

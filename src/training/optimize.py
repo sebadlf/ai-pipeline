@@ -13,22 +13,24 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import tempfile
 import traceback
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import lightning as L
+import lightning as L  # noqa: N812
 import mlflow
 import numpy as np
 import optuna
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import MLFlowLogger
 from optuna.integration import PyTorchLightningPruningCallback
-
 from scipy.optimize import minimize_scalar
 
 from src.config import (
@@ -41,10 +43,6 @@ from src.config import (
     load_config,
     resolve_env_value,
 )
-import logging
-import warnings
-
-from src.db import get_engine
 from src.keys import MLFLOW_TRACKING_URI, OPTUNA_STORAGE_URL
 from src.models.base_model import LSTMForecaster
 from src.models.dataset import TradingDataModule
@@ -53,11 +51,12 @@ from src.models.dataset import TradingDataModule
 warnings.filterwarnings("ignore", message=".*num_workers.*bottleneck.*")
 warnings.filterwarnings("ignore", message=".*`isinstance.*LeafSpec.*")
 logging.getLogger("lightning.pytorch.trainer.connectors.logger_connector").setLevel(logging.WARNING)
-logging.getLogger("lightning.pytorch.trainer.connectors.callback_connector").setLevel(logging.WARNING)
+logging.getLogger("lightning.pytorch.trainer.connectors.callback_connector").setLevel(
+    logging.WARNING
+)
 logging.getLogger("lightning.pytorch.utilities").setLevel(logging.WARNING)
 
 # Suppress Lightning tips
-import os
 os.environ["LIGHTNING_DISABLE_TIPS"] = "1"
 
 
@@ -74,8 +73,15 @@ class ClusterProgressCallback(L.Callback):
         metrics = trainer.callback_metrics
         parts = [f"{self.prefix} epoch {epoch}/{trainer.max_epochs}"]
 
-        for key in ["train_loss", "train_acc", "val_loss", "val_acc",
-                     "val_precision_up", "val_recall_up", "val_mean_prob_up"]:
+        for key in [
+            "train_loss",
+            "train_acc",
+            "val_loss",
+            "val_acc",
+            "val_precision_up",
+            "val_recall_up",
+            "val_mean_prob_up",
+        ]:
             if key in metrics:
                 val = metrics[key].item() if hasattr(metrics[key], "item") else metrics[key]
                 short_key = key.replace("val_", "v_").replace("train_", "t_")
@@ -92,7 +98,10 @@ class ClusterProgressCallback(L.Callback):
         val_acc = metrics.get("val_acc")
         prec_str = f"{val_prec.item():.4f}" if val_prec is not None else "N/A"
         acc_str = f"{val_acc.item():.4f}" if val_acc is not None else "N/A"
-        print(f"  {self.prefix} DONE at epoch {epoch} — val_precision_up={prec_str}, val_acc={acc_str}")
+        print(
+            f"  {self.prefix} DONE at epoch {epoch} — "
+            f"val_precision_up={prec_str}, val_acc={acc_str}"
+        )
 
 
 def calibrate_temperature(
@@ -147,7 +156,7 @@ def calibrate_temperature(
         "pre_cal_pct_above_065": float((pre_probs >= 0.65).float().mean()),
     }
 
-    def composite_objective(T: float) -> float:
+    def composite_objective(T: float) -> float:  # noqa: N803
         scaled = all_logits / T
         nll = F.cross_entropy(scaled, all_targets).item()
         probs = torch.softmax(scaled, dim=-1)[:, 1]
@@ -164,7 +173,10 @@ def calibrate_temperature(
 
     # Safety check: if calibration still kills all signals, fall back to T=1.0
     if post_pct_above_060 < 0.01:
-        print(f"  WARNING: calibration T={optimal_temp:.4f} produces <1% signals above 0.60, falling back to T=1.0")
+        print(
+            f"  WARNING: calibration T={optimal_temp:.4f} produces <1% signals "
+            "above 0.60, falling back to T=1.0"
+        )
         optimal_temp = 1.0
         post_probs = pre_probs
         post_pct_above_060 = pre_diagnostics["pre_cal_pct_above_060"]
@@ -200,12 +212,11 @@ def _get_random_symbols(
         List of symbol strings.
     """
     import random
+
     import polars as pl
 
     clusters_df = pl.read_parquet(clusters_parquet)
-    cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id)[
-        "symbol"
-    ].to_list()
+    cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
 
     if not cluster_symbols:
         return []
@@ -239,7 +250,9 @@ def _log_exception_to_mlflow_run(
 
 
 def _log_error_to_cluster_experiment(
-    config: dict, cluster_id: str, exc: BaseException,
+    config: dict,
+    cluster_id: str,
+    exc: BaseException,
 ) -> None:
     """Create a FAILED MLflow run with error details when no run exists yet.
 
@@ -337,9 +350,7 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
     return {**tuned, **fixed_defaults}
 
 
-def _trial_matches_current_config(
-    trial: optuna.trial.FrozenTrial, config: dict
-) -> bool:
+def _trial_matches_current_config(trial: optuna.trial.FrozenTrial, config: dict) -> bool:
     """Check if a trial's params are compatible with the current search space.
 
     Rejects trials that were tuned under a different config (e.g., old trials
@@ -365,8 +376,16 @@ def _deduplicate_trials(
     trials: list[optuna.trial.FrozenTrial],
     top_k: int,
     key_params: tuple[str, ...] = (
-        "hidden_size", "num_layers", "learning_rate", "dropout", "sequence_length",
-        "label_smoothing", "focal_gamma", "input_dropout", "weight_decay", "batch_size",
+        "hidden_size",
+        "num_layers",
+        "learning_rate",
+        "dropout",
+        "sequence_length",
+        "label_smoothing",
+        "focal_gamma",
+        "input_dropout",
+        "weight_decay",
+        "batch_size",
     ),
 ) -> list[optuna.trial.FrozenTrial]:
     """Select top-K trials with meaningfully different hyperparameters.
@@ -386,10 +405,7 @@ def _deduplicate_trials(
             else:
                 sig[p] = val
 
-        is_dup = any(
-            all(sig.get(p) == prev.get(p) for p in key_params)
-            for prev in seen_signatures
-        )
+        is_dup = any(all(sig.get(p) == prev.get(p) for p in key_params) for prev in seen_signatures)
 
         if not is_dup:
             selected.append(trial)
@@ -399,10 +415,7 @@ def _deduplicate_trials(
             break
 
     if len(selected) < top_k:
-        print(
-            f"  WARNING: Only {len(selected)} unique configs found "
-            f"for ensemble (wanted {top_k})"
-        )
+        print(f"  WARNING: Only {len(selected)} unique configs found for ensemble (wanted {top_k})")
         for trial in trials:
             if trial not in selected:
                 selected.append(trial)
@@ -484,11 +497,7 @@ def _compute_objective_value(
 
     precisions, recalls, _ = precision_recall_curve(targets, probs)
     beta_sq = beta**2
-    fbetas = (
-        (1 + beta_sq)
-        * (precisions * recalls)
-        / ((beta_sq * precisions) + recalls + 1e-10)
-    )
+    fbetas = (1 + beta_sq) * (precisions * recalls) / ((beta_sq * precisions) + recalls + 1e-10)
     fbetas = np.nan_to_num(fbetas, nan=0.0)
 
     best_idx = np.argmax(fbetas)
@@ -530,7 +539,10 @@ def _create_trial_objective(
     fold_splits = compute_cv_fold_splits(split_dates, n_folds, purge_days)
 
     def _train_fold(
-        params: dict, fold_sd: SplitDates, fold_idx: int, trial: optuna.Trial,
+        params: dict,
+        fold_sd: SplitDates,
+        fold_idx: int,
+        trial: optuna.Trial,
     ) -> tuple[float, float, int]:
         """Train and evaluate a single CV fold. Returns (score, overfit_gap, n_val_samples)."""
         dm = TradingDataModule(
@@ -573,7 +585,9 @@ def _create_trial_objective(
         )
 
         early_stop = EarlyStopping(
-            monitor="val_precision_up", patience=patience_per_trial, mode="max",
+            monitor="val_precision_up",
+            patience=patience_per_trial,
+            mode="max",
             min_delta=0.0,
         )
         # Only add pruning callback on last fold to avoid premature pruning
@@ -611,14 +625,22 @@ def _create_trial_objective(
         # Extract overfitting gap from precision (not accuracy) — precision-specific
         # gap detects UP class memorization that accuracy gap misses
         cb_metrics = model.trainer.callback_metrics if model.trainer else {}
-        train_prec = cb_metrics.get("train_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
-        val_prec = cb_metrics.get("val_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        train_prec = (
+            cb_metrics.get("train_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        )
+        val_prec = (
+            cb_metrics.get("val_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        )
         overfit_gap = max(0.0, train_prec - val_prec)
 
         n_val = len(dm.val_ds)
         score = _compute_objective_value(
-            model, dm, min_recall,
-            metric=obj_metric, threshold=obj_threshold, beta=beta,
+            model,
+            dm,
+            min_recall,
+            metric=obj_metric,
+            threshold=obj_threshold,
+            beta=beta,
         )
         del model, dm
         return score, overfit_gap, n_val
@@ -646,7 +668,7 @@ def _create_trial_objective(
             except optuna.exceptions.TrialPruned:
                 raise
             except Exception as e:
-                print(f"    Trial {trial.number} fold {fold_idx+1} failed: {e}")
+                print(f"    Trial {trial.number} fold {fold_idx + 1} failed: {e}")
                 fold_scores.append(0.0)
                 fold_gaps.append(0.0)
                 fold_val_sizes.append(0)
@@ -661,7 +683,12 @@ def _create_trial_objective(
 
         trial.set_user_attr("fold_scores", fold_scores)
         trial.set_user_attr("avg_overfit_gap", round(avg_gap, 4))
-        trial.set_user_attr("n_val_samples", int(np.mean([v for v in fold_val_sizes if v > 0])) if any(v > 0 for v in fold_val_sizes) else 0)
+        trial.set_user_attr(
+            "n_val_samples",
+            int(np.mean([v for v in fold_val_sizes if v > 0]))
+            if any(v > 0 for v in fold_val_sizes)
+            else 0,
+        )
         print(
             f"    Trial {trial.number}: folds={[f'{s:.4f}' for s in fold_scores]}, "
             f"mean={mean_score:.4f}, gap={avg_gap:.4f}"
@@ -688,18 +715,20 @@ def _convergence_callback(patience: int):
     Returns:
         Callback function for study.optimize().
     """
+
     def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        completed = [
-            t for t in study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE
-        ]
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         if len(completed) < patience:
             return
         best_value = study.best_value
         recent = completed[-patience:]
-        if all(t.value <= best_value for t in recent) and recent[-1].number != study.best_trial.number:
+        if (
+            all(t.value <= best_value for t in recent)
+            and recent[-1].number != study.best_trial.number
+        ):
             print(f"  Convergence: no improvement in {patience} trials, stopping study.")
             study.stop()
+
     return callback
 
 
@@ -796,17 +825,18 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     n_trials = int(resolve_env_value(optuna_cfg.get("n_trials", 15), default=15))
     startup_trials = int(resolve_env_value(optuna_cfg.get("startup_trials", 5), default=5))
     conv_patience = int(resolve_env_value(optuna_cfg.get("convergence_patience", 5), default=5))
-    max_history_days = int(
-        resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
-    )
+    max_history_days = int(resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30))
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Optimizing cluster: {cluster_id}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print("Temporal splits:")
     print(split_dates.summary())
     print(f"  Threshold — UP: +{buy_thresh:.1%}")
-    print(f"  Optuna — {n_trials} trials, {startup_trials} startup, convergence patience {conv_patience}")
+    print(
+        f"  Optuna — {n_trials} trials, {startup_trials} startup, "
+        f"convergence patience {conv_patience}"
+    )
 
     # Storage: PostgreSQL (persistent) or None (in-memory)
     storage = _get_optuna_storage(optuna_cfg)
@@ -860,13 +890,11 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     # Get top-K completed trials for ensemble, filtering incompatible configs
     ensemble_k = optuna_cfg.get("ensemble_top_k", 3)
     all_completed = [
-        t for t in study.trials
+        t
+        for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
     ]
-    completed = [
-        t for t in all_completed
-        if _trial_matches_current_config(t, config)
-    ]
+    completed = [t for t in all_completed if _trial_matches_current_config(t, config)]
     filtered_count = len(all_completed) - len(completed)
     if filtered_count > 0:
         print(f"  Filtered {filtered_count} trials with incompatible param config")
@@ -892,9 +920,11 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     else:
         correction = 0.0
         corrected_score = best_score
-    print(f"  Multiple testing correction: raw={best_score:.4f}, "
-          f"correction={correction:.4f}, corrected={corrected_score:.4f} "
-          f"(n_trials={n_completed}, n_val≈{n_val_samples})")
+    print(
+        f"  Multiple testing correction: raw={best_score:.4f}, "
+        f"correction={correction:.4f}, corrected={corrected_score:.4f} "
+        f"(n_trials={n_completed}, n_val≈{n_val_samples})"
+    )
 
     # Optuna study summary for logging
     optuna_meta = {
@@ -922,10 +952,14 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         full_params = {**trial.params}
         # Fixed params ALWAYS override trial params (they're fixed, not tunable)
         for key, default in [
-            ("optimizer_name", "adamw"), ("scheduler_factor", 0.5),
-            ("scheduler_patience", 5), ("gradient_clip_val", 2.0),
-            ("bidirectional", False), ("num_attention_heads", 0),
-            ("activation", "gelu"), ("feature_mask_rate", 0.0),
+            ("optimizer_name", "adamw"),
+            ("scheduler_factor", 0.5),
+            ("scheduler_patience", 5),
+            ("gradient_clip_val", 2.0),
+            ("bidirectional", False),
+            ("num_attention_heads", 0),
+            ("activation", "gelu"),
+            ("feature_mask_rate", 0.0),
         ]:
             full_params[key] = fixed.get(key, default)
 
@@ -938,10 +972,17 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         ensemble_offsets = [0.0, 0.25, 0.50]
         offset_pct = ensemble_offsets[rank - 1] if rank <= len(ensemble_offsets) else 0.0
 
-        print(f"\n  Training ensemble model {rank}/{len(top_trials)} (trial #{trial.number}, train_offset={offset_pct:.0%})...")
+        print(
+            f"\n  Training ensemble model {rank}/{len(top_trials)} "
+            f"(trial #{trial.number}, train_offset={offset_pct:.0%})..."
+        )
         run_id = train_final_model(
-            config, cluster_id, full_params, split_dates,
-            ensemble_rank=rank, train_date_offset_pct=offset_pct,
+            config,
+            cluster_id,
+            full_params,
+            split_dates,
+            ensemble_rank=rank,
+            train_date_offset_pct=offset_pct,
         )
         if run_id:
             ensemble_run_ids.append(run_id)
@@ -981,6 +1022,7 @@ def train_final_model(
 
     # Check normalization stats freshness
     from src.features.normalize import check_staleness, load_normalization_stats
+
     try:
         norm_stats = load_normalization_stats(config)
         check_staleness(norm_stats, max_age_days=90)
@@ -1085,9 +1127,7 @@ def train_final_model(
     )
 
     client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    print(
-        f"  Training with {dm.input_size} features, seq_len={best_params['sequence_length']}"
-    )
+    print(f"  Training with {dm.input_size} features, seq_len={best_params['sequence_length']}")
     try:
         trainer.fit(model, dm)
 
@@ -1097,7 +1137,8 @@ def train_final_model(
         cal_cfg = config.get("training", {}).get("calibration", {})
         primary_thresh = eval_cfg.get("primary_threshold", 0.65)
         optimal_temp, cal_diagnostics = calibrate_temperature(
-            model, dm.val_dataloader(),
+            model,
+            dm.val_dataloader(),
             primary_threshold=primary_thresh,
             min_signal_rate=cal_cfg.get("min_signal_rate", 0.03),
             signal_penalty_alpha=cal_cfg.get("signal_penalty_alpha", 5.0),
@@ -1181,9 +1222,7 @@ def train_final_model(
         _run_precision_eval(model, dm, config, client, run_id, buy_thresh, test_precision_up)
 
         # Trade evaluation
-        _run_trade_eval(
-            model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet
-        )
+        _run_trade_eval(model, config, cluster_id, split_dates, run_id, cluster_cfg.output_parquet)
 
         return run_id
     except Exception as e:
@@ -1306,9 +1345,7 @@ def _run_precision_eval(
             else np.array([])
         )
         fwd_returns = (
-            dm.val_forward_returns[target_indices]
-            if dm.val_forward_returns is not None
-            else None
+            dm.val_forward_returns[target_indices] if dm.val_forward_returns is not None else None
         )
 
         eval_result = evaluate_model(
@@ -1354,9 +1391,7 @@ def _run_trade_eval(
     try:
         from src.training.train import _evaluate_cluster_trades
 
-        _evaluate_cluster_trades(
-            model, config, cluster_id, split_dates, run_id, clusters_parquet
-        )
+        _evaluate_cluster_trades(model, config, cluster_id, split_dates, run_id, clusters_parquet)
     except Exception as e:
         print(f"  Trade evaluation failed: {e}")
 
@@ -1389,9 +1424,9 @@ def _create_global_trial_objective(
     beta = obj_cfg.get("beta", 0.5)
     max_overfit_gap = optuna_cfg.get("max_overfit_gap", 0.25)
     features_path = get_normalized_parquet_path(config)
-    n_symbols_per_cluster = int(resolve_env_value(
-        optuna_cfg.get("n_symbols_per_cluster", 3), default=3
-    ))
+    n_symbols_per_cluster = int(
+        resolve_env_value(optuna_cfg.get("n_symbols_per_cluster", 3), default=3)
+    )
 
     import polars as pl
 
@@ -1409,7 +1444,8 @@ def _create_global_trial_objective(
         selected_symbols = []
         for cid in cluster_ids:
             symbols = _get_random_symbols(
-                cid, cluster_cfg.output_parquet,
+                cid,
+                cluster_cfg.output_parquet,
                 n=n_symbols_per_cluster,
                 seed=hash((trial.number, cid)),
             )
@@ -1500,14 +1536,22 @@ def _create_global_trial_objective(
 
         # Extract overfitting gap from precision (not accuracy)
         cb_metrics = model.trainer.callback_metrics if model.trainer else {}
-        train_prec = cb_metrics.get("train_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
-        val_prec = cb_metrics.get("val_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        train_prec = (
+            cb_metrics.get("train_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        )
+        val_prec = (
+            cb_metrics.get("val_precision_up", torch.tensor(0.0)).item() if cb_metrics else 0.0
+        )
         overfit_gap = max(0.0, train_prec - val_prec)
 
         # Compute objective on validation set (top symbols only)
         score = _compute_objective_value(
-            model, dm, min_recall,
-            metric=obj_metric, threshold=obj_threshold, beta=beta,
+            model,
+            dm,
+            min_recall,
+            metric=obj_metric,
+            threshold=obj_threshold,
+            beta=beta,
         )
 
         # Penalize overfitting
@@ -1539,13 +1583,11 @@ def optimize_global(config: dict) -> dict[str, Any]:
     optuna_cfg = config["training"].get("optuna", {})
     n_trials = int(resolve_env_value(optuna_cfg.get("n_trials_global", 50), default=50))
     startup_trials = int(resolve_env_value(optuna_cfg.get("startup_trials", 5), default=5))
-    max_history_days = int(
-        resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30)
-    )
+    max_history_days = int(resolve_env_value(optuna_cfg.get("max_history_days", 30), default=30))
 
-    print(f"\n{'='*60}")
-    print(f"GLOBAL OPTIMIZATION: All clusters, all symbols")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("GLOBAL OPTIMIZATION: All clusters, all symbols")
+    print(f"{'=' * 60}")
     print("Temporal splits:")
     print(split_dates.summary())
     print(f"  Optuna — {n_trials} trials, {startup_trials} startup")

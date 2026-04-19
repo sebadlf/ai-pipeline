@@ -33,13 +33,15 @@ REPORT_METRICS: dict[str, str] = {
 }
 
 # Non per-cluster-training experiments (noise for this report)
-_EXCLUDED_EXPERIMENTS = frozenset({
-    "Default",
-    "clustering",
-    "aggregation",
-    "backtesting",
-    "portfolio-optimization",
-})
+_EXCLUDED_EXPERIMENTS = frozenset(
+    {
+        "Default",
+        "clustering",
+        "aggregation",
+        "backtesting",
+        "portfolio-optimization",
+    }
+)
 
 
 @dataclass
@@ -80,9 +82,10 @@ def _get_top_runs(
 
     run_infos = []
     for r in runs:
-        metrics = {k: float(v) for k, v in r.data.metrics.items() 
-                  if k in REPORT_METRICS and v is not None}
-        
+        metrics = {
+            k: float(v) for k, v in r.data.metrics.items() if k in REPORT_METRICS and v is not None
+        }
+
         # Get key hyperparameters
         params = {
             "learning_rate": r.data.params.get("learning_rate", "—"),
@@ -90,15 +93,17 @@ def _get_top_runs(
             "dropout": r.data.params.get("dropout", "—"),
             "sequence_length": r.data.params.get("sequence_length", "—"),
         }
-        
-        run_infos.append(RunInfo(
-            run_id=r.info.run_id,
-            status=r.info.status,
-            start_time_iso=_ms_to_iso(r.info.start_time),
-            start_time_ms=r.info.start_time,
-            metrics=metrics,
-            params=params,
-        ))
+
+        run_infos.append(
+            RunInfo(
+                run_id=r.info.run_id,
+                status=r.info.status,
+                start_time_iso=_ms_to_iso(r.info.start_time),
+                start_time_ms=r.info.start_time,
+                metrics=metrics,
+                params=params,
+            )
+        )
 
     return ExperimentRuns(
         name=name,
@@ -129,10 +134,7 @@ def build_runs_report(
     filtered.sort(key=lambda e: e.name.lower())
 
     # Get top runs for each experiment
-    experiment_runs = [
-        _get_top_runs(client, e.experiment_id, e.name, top_n)
-        for e in filtered
-    ]
+    experiment_runs = [_get_top_runs(client, e.experiment_id, e.name, top_n) for e in filtered]
 
     # Filter out experiments with no runs
     experiment_runs = [er for er in experiment_runs if er.runs]
@@ -155,9 +157,7 @@ def _markdown_table(rows: list[list[str]], headers: list[str]) -> str:
     line = "|" + "|".join("-" * (w[i] + 2) for i in range(len(headers))) + "|"
     out = [sep, line]
     for row in rows:
-        out.append(
-            "|" + "|".join(" " + row[i].ljust(w[i]) + " " for i in range(len(row))) + "|"
-        )
+        out.append("|" + "|".join(" " + row[i].ljust(w[i]) + " " for i in range(len(row))) + "|")
     return "\n".join(out)
 
 
@@ -179,7 +179,7 @@ def report_to_markdown(data: dict[str, Any]) -> str:
     for exp in data["experiments"]:
         exp_name = exp["name"]
         exp_id = exp["experiment_id"]
-        
+
         lines.append(f"## {exp_name}")
         lines.append("")
         lines.append(f"*Experiment ID: `{exp_id}`*")
@@ -195,20 +195,22 @@ def report_to_markdown(data: dict[str, Any]) -> str:
             m = run["metrics"]
             p = run["params"]
             start = run["start_time_iso"][:19] if run["start_time_iso"] else "—"
-            
-            run_rows.append([
-                run["run_id"][:12],
-                run["status"],
-                start,
-                _fmt(m, "val_precision_up"),
-                _fmt(m, "val_recall_up"),
-                _fmt(m, "val_acc"),
-                _fmt(m, "val_loss"),
-                _fmt(m, "test_precision_up"),
-                _fmt(m, "test_recall_up"),
-                str(p.get("learning_rate", "—"))[:8],
-                str(p.get("hidden_size", "—")),
-            ])
+
+            run_rows.append(
+                [
+                    run["run_id"][:12],
+                    run["status"],
+                    start,
+                    _fmt(m, "val_precision_up"),
+                    _fmt(m, "val_recall_up"),
+                    _fmt(m, "val_acc"),
+                    _fmt(m, "val_loss"),
+                    _fmt(m, "test_precision_up"),
+                    _fmt(m, "test_recall_up"),
+                    str(p.get("learning_rate", "—"))[:8],
+                    str(p.get("hidden_size", "—")),
+                ]
+            )
 
         lines.append(
             _markdown_table(

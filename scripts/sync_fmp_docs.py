@@ -78,7 +78,8 @@ def _doc_to_markdown(slug: str, doc: dict) -> str:
     lines = [
         f"# {title}",
         "",
-        f"**Source:** [{SITE_BASE}/developer/docs/stable/{slug}]({SITE_BASE}/developer/docs/stable/{slug})",
+        f"**Source:** [{SITE_BASE}/developer/docs/stable/{slug}]"
+        f"({SITE_BASE}/developer/docs/stable/{slug})",
         "",
         desc,
         "",
@@ -141,7 +142,8 @@ def sync_docs(output_dir: Path, delay_s: float) -> tuple[int, int]:
         index_lines = [
             "# Índice API stable (generado)",
             "",
-            f"Fuente: [{DOCS_MAIN}]({DOCS_MAIN}). Regenerar con `uv run python scripts/sync_fmp_docs.py`.",
+            f"Fuente: [{DOCS_MAIN}]({DOCS_MAIN}). "
+            "Regenerar con `uv run python scripts/sync_fmp_docs.py`.",
             "",
         ]
         for slug in slugs:

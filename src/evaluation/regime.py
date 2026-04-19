@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 
-import numpy as np
 import polars as pl
 
 from src.config import RegimeConfig, compute_split_dates, load_config
@@ -93,14 +92,10 @@ def detect_regimes(
     # Compute trailing annualized return
     lookback = regime_cfg.lookback_days
     prices_df = prices_df.with_columns(
-        (
-            pl.col("close") / pl.col("close").shift(lookback) - 1
-        ).alias("trailing_return"),
+        (pl.col("close") / pl.col("close").shift(lookback) - 1).alias("trailing_return"),
     ).with_columns(
         # Annualize the trailing return
-        (
-            (1 + pl.col("trailing_return")).pow(252 / lookback) - 1
-        ).alias("annual_return"),
+        ((1 + pl.col("trailing_return")).pow(252 / lookback) - 1).alias("annual_return"),
     )
 
     # Classify regimes
@@ -120,9 +115,9 @@ def detect_regimes(
     )
 
     # Filter to the requested date range
-    result = prices_df.filter(
-        (pl.col("date") >= start_date) & (pl.col("date") <= end_date)
-    ).select(["date", "regime"])
+    result = prices_df.filter((pl.col("date") >= start_date) & (pl.col("date") <= end_date)).select(
+        ["date", "regime"]
+    )
 
     # Summary
     for regime in ["bull", "bear", "sideways"]:

@@ -1,20 +1,16 @@
 """Tests for portfolio backtesting."""
 
-import datetime as dt
-
 import numpy as np
 import polars as pl
 import pytest
 
-from src.evaluation.backtest import BacktestResult, Position, run_portfolio_backtest
+from src.evaluation.backtest import BacktestResult, run_portfolio_backtest
 
 
 @pytest.fixture
 def sample_prices() -> pl.DataFrame:
     """Generate 20 days of price data for 2 stocks."""
-    dates = pl.date_range(
-        pl.date(2024, 1, 1), pl.date(2024, 1, 20), eager=True
-    ).to_list()
+    dates = pl.date_range(pl.date(2024, 1, 1), pl.date(2024, 1, 20), eager=True).to_list()
 
     rows = []
     # AAPL: goes up 10% over 20 days
@@ -33,10 +29,12 @@ def sample_prices() -> pl.DataFrame:
 @pytest.fixture
 def sample_allocations() -> pl.DataFrame:
     """Portfolio with 60% AAPL and 40% MSFT (long-only)."""
-    return pl.DataFrame([
-        {"symbol": "AAPL", "weight": 0.6, "cluster_id": "Tech_0", "prob_up": 0.85},
-        {"symbol": "MSFT", "weight": 0.4, "cluster_id": "Tech_0", "prob_up": 0.72},
-    ])
+    return pl.DataFrame(
+        [
+            {"symbol": "AAPL", "weight": 0.6, "cluster_id": "Tech_0", "prob_up": 0.85},
+            {"symbol": "MSFT", "weight": 0.4, "cluster_id": "Tech_0", "prob_up": 0.72},
+        ]
+    )
 
 
 @pytest.fixture
@@ -76,10 +74,14 @@ def test_backtest_long_portfolio_positive_return(
 
 
 def test_backtest_empty_allocations(sample_prices: pl.DataFrame, backtest_config: dict) -> None:
-    empty_alloc = pl.DataFrame(schema={
-        "symbol": pl.Utf8, "weight": pl.Float64,
-        "cluster_id": pl.Utf8, "prob_up": pl.Float64,
-    })
+    empty_alloc = pl.DataFrame(
+        schema={
+            "symbol": pl.Utf8,
+            "weight": pl.Float64,
+            "cluster_id": pl.Utf8,
+            "prob_up": pl.Float64,
+        }
+    )
     result = run_portfolio_backtest(empty_alloc, sample_prices, backtest_config)
     assert result.final_value == 100000
     assert result.num_trades == 0

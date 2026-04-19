@@ -17,17 +17,24 @@ import os
 from pathlib import Path
 
 import mlflow
-from mlflow.tracking import MlflowClient
 import numpy as np
 import polars as pl
 import torch
+from mlflow.tracking import MlflowClient
 from sqlalchemy import text
 
-from src.config import ClusterConfig, compute_split_dates, get_normalized_parquet_path, get_selected_feature_names, load_config
+from src.config import (
+    ClusterConfig,
+    compute_split_dates,
+    get_normalized_parquet_path,
+    get_selected_feature_names,
+    load_config,
+)
 from src.db import get_engine
 from src.evaluation.champion import download_champion_checkpoint, download_ensemble_checkpoints
 from src.keys import MLFLOW_TRACKING_URI
 from src.models.base_model import LSTMForecaster
+
 
 def find_best_checkpoint(cluster_id: str, config: dict) -> str | None:
     """Find the best model checkpoint for a cluster.
@@ -71,8 +78,7 @@ def resolve_feature_cols(
         missing = [c for c in saved_names if c not in features_df.columns]
         if missing:
             raise ValueError(
-                f"Model requires {len(missing)} features not in DataFrame: "
-                f"{missing[:5]}..."
+                f"Model requires {len(missing)} features not in DataFrame: {missing[:5]}..."
             )
         return list(saved_names)
 
@@ -121,7 +127,11 @@ def validate_champion_features(
             str(champion_path), map_location="cpu", weights_only=False
         )
         feature_cols = resolve_feature_cols(model, features_df, config)
-        return True, feature_cols, f"Champion for {cluster_id} validated with {len(feature_cols)} features"
+        return (
+            True,
+            feature_cols,
+            f"Champion for {cluster_id} validated with {len(feature_cols)} features",
+        )
     except ValueError as e:
         if "Feature mismatch" in str(e) or "features not in DataFrame" in str(e):
             return False, None, f"Feature mismatch for {cluster_id}: {e}"
@@ -155,9 +165,7 @@ def _run_inference_core(
     model_cfg = config["model"]
     seq_len = model_cfg["sequence_length"]
 
-    cluster_symbols = (
-        clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
-    )
+    cluster_symbols = clusters_df.filter(pl.col("cluster_id") == cluster_id)["symbol"].to_list()
     feature_cols = resolve_feature_cols(model, features_df, config)
 
     predictions = []
@@ -179,11 +187,13 @@ def _run_inference_core(
             probs = model.predict_proba(x).squeeze(0).numpy()
 
         prob_up = float(probs[1])
-        predictions.append({
-            "symbol": symbol,
-            "cluster_id": cluster_id,
-            "prob_up": prob_up,
-        })
+        predictions.append(
+            {
+                "symbol": symbol,
+                "cluster_id": cluster_id,
+                "prob_up": prob_up,
+            }
+        )
 
     return predictions
 
@@ -216,7 +226,12 @@ def run_inference_for_period(
     Always normalizes with training-period statistics.
     """
     return _run_inference_core(
-        cluster_id, model, features_df, clusters_df, config, split_dates,
+        cluster_id,
+        model,
+        features_df,
+        clusters_df,
+        config,
+        split_dates,
         date_filter_end=period_end,
     )
 
@@ -241,12 +256,16 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
     features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
 
     # Drop all-null columns
-    all_null_cols = [c for c in features_df.columns if features_df[c].null_count() == len(features_df)]
+    all_null_cols = [
+        c for c in features_df.columns if features_df[c].null_count() == len(features_df)
+    ]
     if all_null_cols:
         features_df = features_df.drop(all_null_cols)
 
     # Normalization drift detection: warn if recent features diverge from training stats
-    norm_stats_path = config.get("normalization", {}).get("output_stats", "data/normalization_stats.json")
+    norm_stats_path = config.get("normalization", {}).get(
+        "output_stats", "data/normalization_stats.json"
+    )
     if Path(norm_stats_path).exists():
         with open(norm_stats_path) as f:
             norm_stats = json.load(f)
@@ -267,7 +286,10 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
                 # indicates the current data has drifted from training distribution
                 drift_warnings.append((feat, feat_mean))
         if drift_warnings:
-            print(f"  WARNING: {len(drift_warnings)} features show normalization drift (|mean| > 3 std):")
+            print(
+                f"  WARNING: {len(drift_warnings)} features show normalization drift "
+                "(|mean| > 3 std):"
+            )
             for feat, val in drift_warnings[:10]:
                 print(f"    - {feat}: mean={val:.2f} std from training center")
             if len(drift_warnings) > 10:
@@ -284,7 +306,10 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         try:
             ensemble_paths = download_ensemble_checkpoints(cluster_id, ensemble_k)
             run_ids = [rid[:12] for _, rid in ensemble_paths]
-            print(f"  Loading ensemble for {cluster_id}: {len(ensemble_paths)} models (runs {', '.join(run_ids)})")
+            print(
+                f"  Loading ensemble for {cluster_id}: {len(ensemble_paths)} models "
+                f"(runs {', '.join(run_ids)})"
+            )
         except FileNotFoundError:
             ckpt_path = find_best_checkpoint(cluster_id, config)
             if ckpt_path is None:
@@ -298,7 +323,9 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         for ckpt_path, model_run_id in ensemble_paths:
             try:
                 model = LSTMForecaster.load_from_checkpoint(
-                    str(ckpt_path), map_location="cpu", weights_only=False,
+                    str(ckpt_path),
+                    map_location="cpu",
+                    weights_only=False,
                 )
                 resolve_feature_cols(model, features_df, config)
                 model.eval()
@@ -342,7 +369,12 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         primary_run_id = ensemble_models[0][1]
         for model, _ in ensemble_models:
             preds = run_inference_for_cluster(
-                cluster_id, model, features_df, clusters_df, config, split_dates,
+                cluster_id,
+                model,
+                features_df,
+                clusters_df,
+                config,
+                split_dates,
             )
             all_model_preds.append({p["symbol"]: p["prob_up"] for p in preds})
 
@@ -359,12 +391,14 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
                     weighted_sum += mp[symbol] * model_weights[i]
                     weight_sum += model_weights[i]
             avg_prob = weighted_sum / weight_sum if weight_sum > 0 else 0.0
-            all_predictions.append({
-                "symbol": symbol,
-                "cluster_id": cluster_id,
-                "prob_up": avg_prob,
-                "model_run_id": primary_run_id,
-            })
+            all_predictions.append(
+                {
+                    "symbol": symbol,
+                    "cluster_id": cluster_id,
+                    "prob_up": avg_prob,
+                    "model_run_id": primary_run_id,
+                }
+            )
 
     if feature_mismatch_count > 0:
         print(f"\n  WARNING: {feature_mismatch_count} clusters skipped due to feature mismatches.")
@@ -450,7 +484,9 @@ def main() -> None:
         n_actionable = result_df.filter(pl.col("prob_up") >= actionable_threshold).height
         mlflow.log_metric("n_actionable", n_actionable)
         mlflow.log_metric("mean_prob_up", float(result_df["prob_up"].mean()))
-        output_path = config.get("aggregation", {}).get("output_parquet", "data/predictions.parquet")
+        output_path = config.get("aggregation", {}).get(
+            "output_parquet", "data/predictions.parquet"
+        )
         mlflow.log_artifact(output_path)
     print("Logged aggregation results to MLflow")
 

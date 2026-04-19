@@ -23,8 +23,6 @@ import polars as pl
 from src.config import (
     ClusterConfig,
     SplitDates,
-    compute_split_dates,
-    get_cluster_buy_threshold,
     get_normalized_parquet_path,
     load_config,
     resolve_env_value,
@@ -42,7 +40,9 @@ def _load_entry_exit_prices(
     Returns DataFrame with columns [symbol, date_entry, price_entry, date_exit, price_exit].
     """
     import datetime as dt
+
     from sqlalchemy import text
+
     from src.db import get_engine, in_params
 
     engine = get_engine()
@@ -60,10 +60,15 @@ def _load_entry_exit_prices(
     with engine.connect() as conn:
         prices = pl.read_database(query, conn)
     if prices.is_empty():
-        return pl.DataFrame(schema={
-            "symbol": pl.Utf8, "date_entry": pl.Date, "price_entry": pl.Float64,
-            "date_exit": pl.Date, "price_exit": pl.Float64,
-        })
+        return pl.DataFrame(
+            schema={
+                "symbol": pl.Utf8,
+                "date_entry": pl.Date,
+                "price_entry": pl.Float64,
+                "date_exit": pl.Date,
+                "price_exit": pl.Float64,
+            }
+        )
 
     rows = []
     for symbol in symbols:
@@ -78,13 +83,15 @@ def _load_entry_exit_prices(
         else:
             price_exit = sym_prices["close"][-1]
             date_exit = sym_prices["date"][-1]
-        rows.append({
-            "symbol": symbol,
-            "date_entry": date_entry,
-            "price_entry": float(price_entry),
-            "date_exit": date_exit,
-            "price_exit": float(price_exit),
-        })
+        rows.append(
+            {
+                "symbol": symbol,
+                "date_entry": date_entry,
+                "price_entry": float(price_entry),
+                "date_exit": date_exit,
+                "price_exit": float(price_exit),
+            }
+        )
     return pl.DataFrame(rows)
 
 
@@ -116,11 +123,17 @@ def _build_trade_summary(trades_df: pl.DataFrame) -> dict:
         "avg_loser": float(np.mean(losers)) if len(losers) > 0 else 0.0,
         "best_trade": float(np.max(returns)),
         "worst_trade": float(np.min(returns)),
-        "profit_factor": float(np.sum(winners) / abs(np.sum(losers))) if len(losers) > 0 and np.sum(losers) != 0 else float("inf") if len(winners) > 0 else 0.0,
+        "profit_factor": float(np.sum(winners) / abs(np.sum(losers)))
+        if len(losers) > 0 and np.sum(losers) != 0
+        else float("inf")
+        if len(winners) > 0
+        else 0.0,
         "expectancy": float(
             (len(winners) / len(returns)) * (np.mean(winners) if len(winners) > 0 else 0)
             + (len(losers) / len(returns)) * (np.mean(losers) if len(losers) > 0 else 0)
-        ) if len(returns) > 0 else 0.0,
+        )
+        if len(returns) > 0
+        else 0.0,
         "max_consecutive_winners": int(_max_consecutive(returns > 0)),
         "max_consecutive_losers": int(_max_consecutive(returns < 0)),
     }
@@ -171,7 +184,10 @@ def _run_split_eval(
     n_actionable = sum(1 for p in preds if p["prob_up"] >= min_prob_up)
     n_total = len(preds)
     mean_prob = sum(p["prob_up"] for p in preds) / n_total if n_total else 0
-    print(f"    {prefix}: {n_total} predictions, {n_actionable} actionable (prob_up >= {min_prob_up:.0%}), mean={mean_prob:.2%}")
+    print(
+        f"    {prefix}: {n_total} predictions, {n_actionable} actionable "
+        f"(prob_up >= {min_prob_up:.0%}), mean={mean_prob:.2%}"
+    )
 
     client.log_metric(run_id, f"{prefix}_trade_n_actionable", n_actionable)
     client.log_metric(run_id, f"{prefix}_trade_n_total", n_total)
@@ -221,21 +237,28 @@ def _run_split_eval(
                 summary_df = pl.DataFrame(summary_rows)
                 with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
                     summary_df.write_csv(f.name)
-                    client.log_artifact(run_id, f.name, artifact_path=f"trade_details/{prefix}_summary")
+                    client.log_artifact(
+                        run_id, f.name, artifact_path=f"trade_details/{prefix}_summary"
+                    )
 
     # Backtest on actionable predictions
     if not actionable:
         print(f"    {prefix}: no actionable predictions, skipping backtest")
-        for key in ["total_return", "sharpe", "sortino", "calmar",
-                     "max_drawdown", "win_rate", "num_trades", "avg_return"]:
+        for key in [
+            "total_return",
+            "sharpe",
+            "sortino",
+            "calmar",
+            "max_drawdown",
+            "win_rate",
+            "num_trades",
+            "avg_return",
+        ]:
             client.log_metric(run_id, f"{prefix}_trade_{key}", 0.0)
         return
 
     weight = 1.0 / len(actionable)
-    allocations_df = pl.DataFrame([
-        {"symbol": p["symbol"], "weight": weight}
-        for p in actionable
-    ])
+    allocations_df = pl.DataFrame([{"symbol": p["symbol"], "weight": weight} for p in actionable])
 
     symbols = [p["symbol"] for p in actionable]
     prices_df = load_test_prices(symbols, period_start, period_end)
@@ -262,9 +285,11 @@ def _run_split_eval(
         val = float(value) if value is not None and np.isfinite(value) else 0.0
         client.log_metric(run_id, key, val)
 
-    print(f"    {prefix}: return={result.total_return:+.2%}, "
-          f"sharpe={result.sharpe_ratio:.3f}, trades={result.num_trades}, "
-          f"win_rate={result.win_rate:.1%}")
+    print(
+        f"    {prefix}: return={result.total_return:+.2%}, "
+        f"sharpe={result.sharpe_ratio:.3f}, trades={result.num_trades}, "
+        f"win_rate={result.win_rate:.1%}"
+    )
 
 
 def _evaluate_cluster_trades(
@@ -281,7 +306,9 @@ def _evaluate_cluster_trades(
     features_path = get_normalized_parquet_path(config)
     features_df = pl.read_parquet(features_path).sort(["symbol", "date"])
 
-    all_null_cols = [c for c in features_df.columns if features_df[c].null_count() == len(features_df)]
+    all_null_cols = [
+        c for c in features_df.columns if features_df[c].null_count() == len(features_df)
+    ]
     if all_null_cols:
         features_df = features_df.drop(all_null_cols)
 
@@ -289,7 +316,7 @@ def _evaluate_cluster_trades(
     client = mlflow.MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
 
     model.eval()
-    print(f"  Trade eval across splits:")
+    print("  Trade eval across splits:")
 
     splits = [
         ("train", split_dates.start_date, split_dates.train_end),
@@ -299,12 +326,23 @@ def _evaluate_cluster_trades(
 
     for prefix, period_start, period_end in splits:
         preds = run_inference_for_period(
-            cluster_id, model, features_df, clusters_df, config,
-            split_dates, period_start, period_end,
+            cluster_id,
+            model,
+            features_df,
+            clusters_df,
+            config,
+            split_dates,
+            period_start,
+            period_end,
         )
         _run_split_eval(
-            prefix, preds, period_start, period_end,
-            client, run_id, config,
+            prefix,
+            preds,
+            period_start,
+            period_end,
+            client,
+            run_id,
+            config,
         )
 
 
@@ -340,7 +378,7 @@ def _log_worker_error_to_mlflow(config: dict, cluster_id: str, error_tb: str) ->
             return
         run_id = runs[0].info.run_id
         # Extract last line as error message
-        lines = [l for l in error_tb.strip().splitlines() if l.strip()]
+        lines = [line for line in error_tb.strip().splitlines() if line.strip()]
         error_msg = lines[-1] if lines else "Unknown error"
         error_type = error_msg.split(":")[0] if ":" in error_msg else "Error"
         client.set_tag(run_id, "error_type", error_type[:250])
@@ -362,13 +400,15 @@ def _train_cluster_worker(args: tuple) -> tuple[str, bool, str]:
     try:
         train_single_cluster(config, cluster_id)
         return (cluster_id, True, "")
-    except Exception as e:
+    except Exception:
         import traceback
+
         tb = traceback.format_exc()
         _log_worker_error_to_mlflow(config, cluster_id, tb)
         return (cluster_id, False, tb)
     finally:
         from src.db import dispose_engine
+
         dispose_engine()
 
 
@@ -388,7 +428,7 @@ def _sort_clusters_by_run_count(cluster_ids: list[str], config: dict) -> list[st
             if experiment is None:
                 run_counts[cid] = 0
             else:
-                runs = client.search_runs(
+                client.search_runs(
                     experiment_ids=[experiment.experiment_id],
                     max_results=1,
                     output_format="list",
@@ -426,9 +466,9 @@ def train_all_clusters(config: dict) -> None:
     # don't always retrain the same clusters.
     cluster_ids = _sort_clusters_by_run_count(cluster_ids, config)
 
-    max_workers = int(resolve_env_value(
-        config.get("training", {}).get("max_workers", 1), default=1
-    ))
+    max_workers = int(
+        resolve_env_value(config.get("training", {}).get("max_workers", 1), default=1)
+    )
 
     parallel_info = f", {max_workers} workers" if max_workers > 1 else ""
     print(f"Found {len(cluster_ids)} clusters to train (per-cluster optimization){parallel_info}")
@@ -444,6 +484,7 @@ def train_all_clusters(config: dict) -> None:
             except Exception as e:
                 print(f"  ERROR training {cluster_id}: {e}")
                 import traceback
+
                 traceback.print_exc()
                 failed.append(cluster_id)
     else:
@@ -463,7 +504,10 @@ def train_all_clusters(config: dict) -> None:
                     print(f"  ✗ {cluster_id} FAILED:\n{error_msg}")
                     failed.append(cluster_id)
 
-    print(f"\nTraining complete: {len(cluster_ids) - len(failed)}/{len(cluster_ids)} clusters succeeded.")
+    print(
+        f"\nTraining complete: {len(cluster_ids) - len(failed)}/"
+        f"{len(cluster_ids)} clusters succeeded."
+    )
     if failed:
         print(f"  Failed clusters: {', '.join(failed)}")
 
@@ -479,6 +523,7 @@ def main() -> None:
 
     # Deprecation warning for old global params workflow
     from pathlib import Path
+
     if Path("data/best_hyperparameters.json").exists():
         print("NOTE: data/best_hyperparameters.json found from old global optimization.")
         print("  This file is no longer used. Per-cluster optimization is now the default.")

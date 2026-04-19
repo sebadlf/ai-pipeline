@@ -4,8 +4,9 @@ All secrets and configuration keys are loaded here from .env
 and accessed by the rest of the project via this module.
 """
 
-from dotenv import load_dotenv
 import os
+
+from dotenv import load_dotenv
 
 load_dotenv()
 

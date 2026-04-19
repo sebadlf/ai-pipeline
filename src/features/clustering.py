@@ -9,17 +9,17 @@ Usage:
     uv run python -m src.features.clustering
     uv run python -m src.features.clustering --config configs/default.yaml
 """
+# ruff: noqa: N803, N806  # ML convention: capital X for feature matrices
 
 from __future__ import annotations
 
 import argparse
-import logging
 import datetime as dt
+import logging
+import warnings
 from pathlib import Path
 
 import mlflow
-import warnings
-
 import numpy as np
 import polars as pl
 from sklearn.cluster import KMeans
@@ -29,17 +29,24 @@ from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
 
 from src.config import ClusterConfig, compute_split_dates, load_config
-from src.db import get_engine, in_params, init_db
+from src.db import get_engine, in_params
 from src.keys import MLFLOW_TRACKING_URI
 
 logger = logging.getLogger(__name__)
 
 _KM_FIELDS = [
-    "returnOnEquity", "earningsYield", "freeCashFlowYield", "evToEBITDA",
+    "returnOnEquity",
+    "earningsYield",
+    "freeCashFlowYield",
+    "evToEBITDA",
 ]
 _FR_FIELDS = [
-    "grossProfitMargin", "netProfitMargin", "debtToEquityRatio",
-    "priceToEarningsRatio", "priceToBookRatio", "dividendYield",
+    "grossProfitMargin",
+    "netProfitMargin",
+    "debtToEquityRatio",
+    "priceToEarningsRatio",
+    "priceToBookRatio",
+    "dividendYield",
 ]
 
 
@@ -65,9 +72,7 @@ def _load_fundamentals_for_clustering(
     ph, params = in_params("s", symbols)
     params["train_end"] = train_end
 
-    km_extracts = ", ".join(
-        f"(data->>'{f}')::double precision AS {f}" for f in _KM_FIELDS
-    )
+    km_extracts = ", ".join(f"(data->>'{f}')::double precision AS {f}" for f in _KM_FIELDS)
     km_query = text(f"""
         SELECT DISTINCT ON (symbol) symbol, {km_extracts}
         FROM key_metrics_quarterly
@@ -75,9 +80,7 @@ def _load_fundamentals_for_clustering(
         ORDER BY symbol, date DESC
     """).bindparams(**params)
 
-    fr_extracts = ", ".join(
-        f"(data->>'{f}')::double precision AS {f}" for f in _FR_FIELDS
-    )
+    fr_extracts = ", ".join(f"(data->>'{f}')::double precision AS {f}" for f in _FR_FIELDS)
     fr_query = text(f"""
         SELECT DISTINCT ON (symbol) symbol, {fr_extracts}
         FROM financial_ratios_quarterly
@@ -120,7 +123,8 @@ def _load_macro_series(
         "SELECT date, close AS vix_close FROM vix_daily WHERE date <= :train_end ORDER BY date"
     ).bindparams(train_end=train_end)
     treasury_query = text(
-        "SELECT date, year10 - year2 AS spread_10y_2y FROM treasury_rates WHERE date <= :train_end ORDER BY date"
+        "SELECT date, year10 - year2 AS spread_10y_2y FROM treasury_rates "
+        "WHERE date <= :train_end ORDER BY date"
     ).bindparams(train_end=train_end)
 
     with engine.connect() as conn:
@@ -201,9 +205,13 @@ def compute_clustering_features(
         ORDER BY date
     """
     spy_df = pl.read_database(spy_query, engine)
-    spy_df = spy_df.sort("date").with_columns(
-        pl.col("close").pct_change().alias("spy_return"),
-    ).select(["date", "spy_return"])
+    spy_df = (
+        spy_df.sort("date")
+        .with_columns(
+            pl.col("close").pct_change().alias("spy_return"),
+        )
+        .select(["date", "spy_return"])
+    )
     df = df.join(spy_df, on="date", how="left")
 
     # Load macro series for sensitivity
@@ -222,10 +230,7 @@ def compute_clustering_features(
 
     # Load sector average returns for relative computation
     sector_avgs = _load_sector_avg_returns(engine, train_end)
-    symbol_to_sector = {
-        row["symbol"]: row["sector"]
-        for row in sectors_df.iter_rows(named=True)
-    }
+    symbol_to_sector = {row["symbol"]: row["sector"] for row in sectors_df.iter_rows(named=True)}
 
     # Per-symbol aggregated features
     features = []
@@ -239,19 +244,23 @@ def compute_clustering_features(
 
         # --- Behavioral features (original 5) ---
 
-        return_20d = sym_df.with_columns(
-            pl.col("daily_return").rolling_mean(20).alias("r20")
-        )["r20"].drop_nulls()
+        return_20d = sym_df.with_columns(pl.col("daily_return").rolling_mean(20).alias("r20"))[
+            "r20"
+        ].drop_nulls()
         return_20d_mean = float(return_20d.mean()) if len(return_20d) > 0 else 0.0
 
-        tail_returns = returns[-min(252, len(returns)):]
-        volatility_60d = float(np.std(tail_returns[-60:])) if len(tail_returns) >= 60 else float(np.std(tail_returns))
+        tail_returns = returns[-min(252, len(returns)) :]
+        volatility_60d = (
+            float(np.std(tail_returns[-60:]))
+            if len(tail_returns) >= 60
+            else float(np.std(tail_returns))
+        )
 
-        vol_sma = sym_df.with_columns(
-            pl.col("volume").rolling_mean(20).alias("vol_sma")
-        ).with_columns(
-            (pl.col("volume") / pl.col("vol_sma")).alias("rel_vol")
-        )["rel_vol"].drop_nulls()
+        vol_sma = (
+            sym_df.with_columns(pl.col("volume").rolling_mean(20).alias("vol_sma"))
+            .with_columns((pl.col("volume") / pl.col("vol_sma")).alias("rel_vol"))["rel_vol"]
+            .drop_nulls()
+        )
         volume_profile = float(vol_sma.mean()) if len(vol_sma) > 0 else 1.0
 
         delta = sym_df["daily_return"]
@@ -417,9 +426,7 @@ def run_clustering(
 
     all_symbols = sectors_df["symbol"].to_list()
     print(f"Computing clustering features for {len(all_symbols)} symbols...")
-    feat_df = compute_clustering_features(
-        engine, all_symbols, split_dates.train_end, sectors_df
-    )
+    feat_df = compute_clustering_features(engine, all_symbols, split_dates.train_end, sectors_df)
 
     feat_df = feat_df.join(sectors_df.select(["symbol", "sector"]), on="symbol", how="left")
 
@@ -469,14 +476,19 @@ def run_clustering(
             for s, sec in zip(symbols, sectors)
         ]
         cluster_stats = {
-            "n_stocks": n_stocks, "k_selected": 1, "silhouette": 0.0,
-            "pca_components": n_components_after, "pca_variance": variance_explained,
+            "n_stocks": n_stocks,
+            "k_selected": 1,
+            "silhouette": 0.0,
+            "pca_components": n_components_after,
+            "pca_variance": variance_explained,
         }
         return pl.DataFrame(results), cluster_stats
 
     # Auto-select optimal K
     best_k, best_sil = _find_optimal_k(
-        X_reduced, cluster_cfg.max_clusters, cluster_cfg.min_cluster_size,
+        X_reduced,
+        cluster_cfg.max_clusters,
+        cluster_cfg.min_cluster_size,
         min_k=cluster_cfg.min_clusters,
     )
 
@@ -493,9 +505,7 @@ def run_clustering(
     for label, indices in list(cluster_counts.items()):
         if len(indices) < cluster_cfg.min_cluster_size and best_k > 1:
             for idx in indices:
-                distances = np.linalg.norm(
-                    kmeans.cluster_centers_ - X_reduced[idx], axis=1
-                )
+                distances = np.linalg.norm(kmeans.cluster_centers_ - X_reduced[idx], axis=1)
                 sorted_clusters = np.argsort(distances)
                 for candidate in sorted_clusters:
                     if candidate != label:
@@ -537,12 +547,14 @@ def run_clustering(
 
     results = []
     for idx, symbol in enumerate(symbols):
-        results.append({
-            "symbol": symbol,
-            "sector": sectors[idx],
-            "cluster_id": label_to_name[labels[idx]],
-            "silhouette_score": sil_score,
-        })
+        results.append(
+            {
+                "symbol": symbol,
+                "sector": sectors[idx],
+                "cluster_id": label_to_name[labels[idx]],
+                "silhouette_score": sil_score,
+            }
+        )
 
     cluster_stats = {
         "n_stocks": n_stocks,
@@ -551,12 +563,17 @@ def run_clustering(
         "pca_components": n_components_after,
         "pca_variance": variance_explained,
     }
-    print(f"  Global: K={len(unique_labels)}, silhouette={sil_score:.3f}, "
-          f"PCA {n_components_before}->{n_components_after} ({variance_explained:.1%})")
+    print(
+        f"  Global: K={len(unique_labels)}, silhouette={sil_score:.3f}, "
+        f"PCA {n_components_before}->{n_components_after} ({variance_explained:.1%})"
+    )
 
     result_df = pl.DataFrame(results)
 
-    print(f"\nClustering summary ({len(result_df)} stocks, {result_df['cluster_id'].n_unique()} clusters):")
+    print(
+        f"\nClustering summary ({len(result_df)} stocks, "
+        f"{result_df['cluster_id'].n_unique()} clusters):"
+    )
     for cluster_id in result_df["cluster_id"].unique().sort().to_list():
         count = result_df.filter(pl.col("cluster_id") == cluster_id).height
         print(f"  {cluster_id}: {count} stocks")
@@ -602,8 +619,10 @@ def run_sector_clustering(
         "method": "sector",
     }
 
-    print(f"Sector clustering (dev mode): {len(result_df)} stocks, "
-          f"{result_df['cluster_id'].n_unique()} clusters (by GICS sector)")
+    print(
+        f"Sector clustering (dev mode): {len(result_df)} stocks, "
+        f"{result_df['cluster_id'].n_unique()} clusters (by GICS sector)"
+    )
 
     for cluster_id in result_df["cluster_id"].unique().sort().to_list():
         count = result_df.filter(pl.col("cluster_id") == cluster_id).height
@@ -636,20 +655,24 @@ def save_clusters(
     with engine.begin() as conn:
         for row in result_df.iter_rows(named=True):
             stmt = text("""
-                INSERT INTO cluster_assignments (run_date, symbol, sector, cluster_id, silhouette_score)
+                INSERT INTO cluster_assignments
+                    (run_date, symbol, sector, cluster_id, silhouette_score)
                 VALUES (:run_date, :symbol, :sector, :cluster_id, :silhouette_score)
                 ON CONFLICT (run_date, symbol) DO UPDATE SET
                     sector = EXCLUDED.sector,
                     cluster_id = EXCLUDED.cluster_id,
                     silhouette_score = EXCLUDED.silhouette_score
             """)
-            conn.execute(stmt, {
-                "run_date": run_date,
-                "symbol": row["symbol"],
-                "sector": row["sector"],
-                "cluster_id": row["cluster_id"],
-                "silhouette_score": row["silhouette_score"],
-            })
+            conn.execute(
+                stmt,
+                {
+                    "run_date": run_date,
+                    "symbol": row["symbol"],
+                    "sector": row["sector"],
+                    "cluster_id": row["cluster_id"],
+                    "silhouette_score": row["silhouette_score"],
+                },
+            )
     print(f"Saved {len(result_df)} cluster assignments to database")
 
 
@@ -679,7 +702,8 @@ def main() -> None:
         prev_df = pl.read_parquet(str(prev_path))
         merged = result_df.select(["symbol", "cluster_id"]).join(
             prev_df.select(["symbol", "cluster_id"]).rename({"cluster_id": "prev_cluster"}),
-            on="symbol", how="inner",
+            on="symbol",
+            how="inner",
         )
         changed = merged.filter(pl.col("cluster_id") != pl.col("prev_cluster"))
         if changed.is_empty():
@@ -696,23 +720,27 @@ def main() -> None:
     mlflow.set_experiment("clustering")
     with mlflow.start_run(run_name="cluster-assignment"):
         cluster_cfg = config.get("clustering", {})
-        mlflow.log_params({
-            "method": cluster_cfg.get("method", "kmeans"),
-            "max_clusters": cluster_cfg.get("max_clusters", 10),
-            "min_clusters": cluster_cfg.get("min_clusters", 3),
-            "include_sector_features": cluster_cfg.get("include_sector_features", True),
-            "min_cluster_size": cluster_cfg.get("min_cluster_size", 10),
-            "pca_variance_ratio": cluster_cfg.get("pca_variance_ratio", 0.95),
-            "n_stocks": len(result_df),
-            "n_clusters": result_df["cluster_id"].n_unique(),
-        })
+        mlflow.log_params(
+            {
+                "method": cluster_cfg.get("method", "kmeans"),
+                "max_clusters": cluster_cfg.get("max_clusters", 10),
+                "min_clusters": cluster_cfg.get("min_clusters", 3),
+                "include_sector_features": cluster_cfg.get("include_sector_features", True),
+                "min_cluster_size": cluster_cfg.get("min_cluster_size", 10),
+                "pca_variance_ratio": cluster_cfg.get("pca_variance_ratio", 0.95),
+                "n_stocks": len(result_df),
+                "n_clusters": result_df["cluster_id"].n_unique(),
+            }
+        )
 
-        mlflow.log_metrics({
-            "k_selected": cluster_stats["k_selected"],
-            "silhouette": cluster_stats["silhouette"],
-            "pca_components": cluster_stats["pca_components"],
-            "pca_variance": cluster_stats["pca_variance"],
-        })
+        mlflow.log_metrics(
+            {
+                "k_selected": cluster_stats["k_selected"],
+                "silhouette": cluster_stats["silhouette"],
+                "pca_components": cluster_stats["pca_components"],
+                "pca_variance": cluster_stats["pca_variance"],
+            }
+        )
 
         mlflow.log_artifact(cluster_cfg.get("output_parquet", "data/clusters.parquet"))
     print("Logged clustering results to MLflow")

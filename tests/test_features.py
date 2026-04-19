@@ -22,18 +22,22 @@ def sample_ohlcv() -> pl.DataFrame:
     """Create sample OHLCV data for testing."""
     np.random.seed(42)
     n = 100
-    dates = pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 1, 1) + pl.duration(days=n - 1), eager=True)
+    dates = pl.date_range(
+        pl.date(2023, 1, 1), pl.date(2023, 1, 1) + pl.duration(days=n - 1), eager=True
+    )
     close = np.cumsum(np.random.randn(n) * 0.5) + 100
 
-    return pl.DataFrame({
-        "symbol": ["TEST"] * n,
-        "date": dates,
-        "open": close + np.random.randn(n) * 0.5,
-        "high": close + abs(np.random.randn(n)),
-        "low": close - abs(np.random.randn(n)),
-        "close": close,
-        "volume": np.random.randint(1000, 10000, n),
-    })
+    return pl.DataFrame(
+        {
+            "symbol": ["TEST"] * n,
+            "date": dates,
+            "open": close + np.random.randn(n) * 0.5,
+            "high": close + abs(np.random.randn(n)),
+            "low": close - abs(np.random.randn(n)),
+            "close": close,
+            "volume": np.random.randint(1000, 10000, n),
+        }
+    )
 
 
 def test_add_sma(sample_ohlcv: pl.DataFrame) -> None:
@@ -116,11 +120,15 @@ def test_binary_target_thresholds() -> None:
     # Row 2: close=100, row 7: close=101 -> +1% -> NOT_UP (0)
     close[7] = 101.0
 
-    df = pl.DataFrame({
-        "symbol": ["TEST"] * n,
-        "date": pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 1, 1) + pl.duration(days=n - 1), eager=True),
-        "close": close,
-    })
+    df = pl.DataFrame(
+        {
+            "symbol": ["TEST"] * n,
+            "date": pl.date_range(
+                pl.date(2023, 1, 1), pl.date(2023, 1, 1) + pl.duration(days=n - 1), eager=True
+            ),
+            "close": close,
+        }
+    )
 
     result = add_binary_target(df, horizon=5, buy_threshold=0.05)
     targets = result["target"].to_list()
