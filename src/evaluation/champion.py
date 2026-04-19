@@ -101,7 +101,8 @@ def download_ensemble_checkpoints(
         try:
             mv = client.get_model_version_by_alias(model_name, alias)
             local_dir = mlflow.artifacts.download_artifacts(
-                artifact_uri=mv.source, tracking_uri=tracking_uri,
+                artifact_uri=mv.source,
+                tracking_uri=tracking_uri,
             )
             local_path = Path(local_dir)
             if local_path.is_dir():

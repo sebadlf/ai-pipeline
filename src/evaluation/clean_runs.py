@@ -24,8 +24,8 @@ from pathlib import Path
 from sqlalchemy import create_engine, text
 
 from src.keys import (
-    POSTGRES_HOST,
     POSTGRES_DB,
+    POSTGRES_HOST,
     POSTGRES_PASSWORD,
     POSTGRES_PORT,
     POSTGRES_USER,
@@ -144,7 +144,8 @@ def _cleanup_optuna(dry_run: bool) -> None:
         with trading_engine.connect() as conn:
             result = conn.execute(
                 text(
-                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'studies')"
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = 'studies')"
                 )
             )
             has_optuna = result.scalar()

@@ -24,6 +24,7 @@ from src.config import get_db_url
 # SQL parameterization helpers
 # ---------------------------------------------------------------------------
 
+
 def in_params(prefix: str, values: list) -> tuple[str, dict]:
     """Generate numbered params for IN clauses with SQLAlchemy text().
 
@@ -226,42 +227,54 @@ def init_db(engine: Engine) -> None:
 def _migrate_treasury_columns(engine: Engine) -> None:
     """Add new treasury tenor columns to existing table if missing."""
     new_cols = [
-        "month1", "month2", "month3", "month6",
-        "year1", "year2", "year3", "year5", "year7", "year10", "year20",
+        "month1",
+        "month2",
+        "month3",
+        "month6",
+        "year1",
+        "year2",
+        "year3",
+        "year5",
+        "year7",
+        "year10",
+        "year20",
     ]
     with engine.begin() as conn:
         for col in new_cols:
-            conn.execute(text(
-                f"ALTER TABLE treasury_rates ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION"
-            ))
+            conn.execute(
+                text(f"ALTER TABLE treasury_rates ADD COLUMN IF NOT EXISTS {col} DOUBLE PRECISION")
+            )
 
 
 def _migrate_predictions_to_prob_up(engine: Engine) -> None:
     """Migrate predictions and portfolio_allocations tables to prob_up schema."""
     with engine.begin() as conn:
         # Predictions: add prob_up, backfill from prob_buy, drop old columns
-        conn.execute(text(
-            "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION"
-        ))
+        conn.execute(
+            text("ALTER TABLE predictions ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION")
+        )
         # Backfill from prob_buy if it still exists (idempotent)
-        has_prob_buy = conn.execute(text("""
+        has_prob_buy = conn.execute(
+            text("""
             SELECT 1 FROM information_schema.columns
             WHERE table_name = 'predictions' AND column_name = 'prob_buy'
-        """)).fetchone()
+        """)
+        ).fetchone()
         if has_prob_buy:
-            conn.execute(text("""
+            conn.execute(
+                text("""
                 UPDATE predictions SET prob_up = prob_buy
                 WHERE prob_up IS NULL AND prob_buy IS NOT NULL
-            """))
+            """)
+            )
         for col in ["prediction", "confidence", "prob_buy", "prob_sell", "prob_hold"]:
-            conn.execute(text(
-                f"ALTER TABLE predictions DROP COLUMN IF EXISTS {col}"
-            ))
+            conn.execute(text(f"ALTER TABLE predictions DROP COLUMN IF EXISTS {col}"))
 
         # Portfolio allocations: add prob_up, drop signal
-        conn.execute(text(
-            "ALTER TABLE portfolio_allocations ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION"
-        ))
-        conn.execute(text(
-            "ALTER TABLE portfolio_allocations DROP COLUMN IF EXISTS signal"
-        ))
+        conn.execute(
+            text(
+                "ALTER TABLE portfolio_allocations "
+                "ADD COLUMN IF NOT EXISTS prob_up DOUBLE PRECISION"
+            )
+        )
+        conn.execute(text("ALTER TABLE portfolio_allocations DROP COLUMN IF EXISTS signal"))

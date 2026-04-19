@@ -97,6 +97,7 @@ def resolve_env_value(value: int | float | dict, default: int | float = 0) -> in
     if isinstance(value, (int, float)):
         return value
     from src.keys import PIPELINE_ENV
+
     return value.get(PIPELINE_ENV, value.get("dev", default))
 
 
@@ -112,7 +113,8 @@ def resolve_start_years_back(config: dict) -> int:
 class SplitDates:
     """Date boundaries for temporal train/val/test splits with purge gaps.
 
-    Timeline: start_date ... train_end | PURGE | val_start ... val_end | PURGE | test_start ... today
+    Timeline:
+        start_date ... train_end | PURGE | val_start ... val_end | PURGE | test_start ... today
     """
 
     start_date: dt.date
@@ -205,14 +207,16 @@ def compute_cv_fold_splits(
             fold_val_start = sd.val_start
             fold_val_end = sd.val_end
 
-        folds.append(SplitDates(
-            start_date=sd.start_date,
-            train_end=fold_train_end,
-            val_start=fold_val_start,
-            val_end=fold_val_end,
-            test_start=sd.test_start,
-            today=sd.today,
-        ))
+        folds.append(
+            SplitDates(
+                start_date=sd.start_date,
+                train_end=fold_train_end,
+                val_start=fold_val_start,
+                val_end=fold_val_end,
+                test_start=sd.test_start,
+                today=sd.today,
+            )
+        )
 
     return folds
 
@@ -231,13 +235,26 @@ class ClusterConfig:
     pca_variance_ratio: float = 0.95
     features_for_clustering: list[str] = field(
         default_factory=lambda: [
-            "return_20d_mean", "volatility_60d", "volume_profile",
-            "rsi_14_mean", "beta_60d", "momentum_60d", "drawdown_max",
-            "relative_to_sector_avg", "vix_beta", "yield_sensitivity",
-            "km_returnonequity", "km_earningsyield", "km_freecashflowyield",
-            "km_evtoebitda", "fr_grossprofitmargin", "fr_netprofitmargin",
-            "fr_debttoequityratio", "fr_pricetoearningsratio",
-            "fr_pricetobookratio", "fr_dividendyield",
+            "return_20d_mean",
+            "volatility_60d",
+            "volume_profile",
+            "rsi_14_mean",
+            "beta_60d",
+            "momentum_60d",
+            "drawdown_max",
+            "relative_to_sector_avg",
+            "vix_beta",
+            "yield_sensitivity",
+            "km_returnonequity",
+            "km_earningsyield",
+            "km_freecashflowyield",
+            "km_evtoebitda",
+            "fr_grossprofitmargin",
+            "fr_netprofitmargin",
+            "fr_debttoequityratio",
+            "fr_pricetoearningsratio",
+            "fr_pricetobookratio",
+            "fr_dividendyield",
         ]
     )
     min_cluster_size: int = 10
@@ -315,7 +332,9 @@ class RegimeConfig:
 class PromotionEvalConfig:
     """Configuration for precision-based model evaluation and promotion."""
 
-    thresholds: list[float] = field(default_factory=lambda: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80])
+    thresholds: list[float] = field(
+        default_factory=lambda: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    )
     primary_threshold: float = 0.65
     min_recall: float = 0.10
     min_signals_per_window: int = 5
@@ -357,9 +376,7 @@ def get_features_parquet_path(config: dict) -> str:
         selected_path = "data/features_selected.parquet"
         if Path(selected_path).exists():
             return selected_path
-        raise FileNotFoundError(
-            f"{selected_path} not found. Run `make select-features` first."
-        )
+        raise FileNotFoundError(f"{selected_path} not found. Run `make select-features` first.")
     return "data/features.parquet"
 
 
@@ -392,9 +409,7 @@ def get_normalized_parquet_path(config: dict) -> str:
     norm_path = norm_cfg.get("output_parquet", "data/features_normalized.parquet")
     if Path(norm_path).exists():
         return norm_path
-    raise FileNotFoundError(
-        f"{norm_path} not found. Run `make normalize` first."
-    )
+    raise FileNotFoundError(f"{norm_path} not found. Run `make normalize` first.")
 
 
 def get_normalization_stats_path(config: dict) -> str:

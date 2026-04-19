@@ -14,9 +14,8 @@ Usage:
 
 from __future__ import annotations
 
-import logging
-
 import argparse
+import logging
 from typing import Any
 
 import mlflow
@@ -34,6 +33,7 @@ MODEL_NAME_PREFIX = "trading-forecaster"
 # --------------------------------------------------------------------------- #
 # Legacy scoring helpers                                                       #
 # --------------------------------------------------------------------------- #
+
 
 def build_score_tuple(
     metrics: dict[str, Any],
@@ -63,6 +63,7 @@ def build_score_tuple(
 # --------------------------------------------------------------------------- #
 # Cascading elimination                                                        #
 # --------------------------------------------------------------------------- #
+
 
 def cascading_compare(
     cand_metrics: dict[str, Any],
@@ -119,16 +120,21 @@ def cascading_compare(
     champ_fp_sev = float(champ_metrics.get("val_fp_severity", float("inf")))
 
     if cand_fp_sev < champ_fp_sev:
-        return True, (f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
-                      f"< champion {champ_fp_sev:.4f} (scores within {margin})")
+        return True, (
+            f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
+            f"< champion {champ_fp_sev:.4f} (scores within {margin})"
+        )
 
-    return False, (f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
-                   f">= champion {champ_fp_sev:.4f} (scores within {margin})")
+    return False, (
+        f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
+        f">= champion {champ_fp_sev:.4f} (scores within {margin})"
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Unified comparison                                                           #
 # --------------------------------------------------------------------------- #
+
 
 def candidate_beats_champion(
     candidate_metrics: dict[str, Any],
@@ -170,6 +176,7 @@ def candidate_beats_champion(
 # Checkpoint resolution                                                        #
 # --------------------------------------------------------------------------- #
 
+
 def _find_run_checkpoint(client: MlflowClient, run_id: str) -> str | None:
     """Return the artifact path to a .ckpt file in the run, or None."""
     artifacts = client.list_artifacts(run_id)
@@ -193,6 +200,7 @@ def _find_run_checkpoint(client: MlflowClient, run_id: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # Per-cluster promotion                                                        #
 # --------------------------------------------------------------------------- #
+
 
 def _find_best_candidate(
     client: MlflowClient,
@@ -343,7 +351,9 @@ def promote_cluster_model(
 
     # Compare
     should_promote, reason = candidate_beats_champion(
-        candidate_metrics, champion_metrics, promotion_cfg,
+        candidate_metrics,
+        champion_metrics,
+        promotion_cfg,
     )
 
     if not should_promote:
@@ -366,7 +376,9 @@ def promote_cluster_model(
     # Set tags for audit
     if use_cascading:
         score_val = candidate_metrics.get("val_stability_score", "N/A")
-        client.set_model_version_tag(model_name, mv.version, "promotion_metric", "val_stability_score")
+        client.set_model_version_tag(
+            model_name, mv.version, "promotion_metric", "val_stability_score"
+        )
         client.set_model_version_tag(model_name, mv.version, "promotion_score", str(score_val))
     else:
         primary = promotion_cfg.get("primary_metric", "val_acc")
@@ -431,7 +443,9 @@ def _promote_ensemble_members(
 
         artifact_uri = f"runs:/{run.info.run_id}/{ckpt}"
         mv = client.create_model_version(
-            name=model_name, source=artifact_uri, run_id=run.info.run_id,
+            name=model_name,
+            source=artifact_uri,
+            run_id=run.info.run_id,
         )
         alias = f"champion-{rank}"
         client.set_registered_model_alias(model_name, alias, mv.version)

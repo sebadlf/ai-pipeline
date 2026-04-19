@@ -6,6 +6,7 @@ the feature space before model training.
 Usage:
     uv run python -m src.features.selection
 """
+# ruff: noqa: N806  # ML convention: capital X for feature matrices
 
 from __future__ import annotations
 
@@ -45,7 +46,10 @@ def select_features(
     # Use only training data for computing statistics (avoid leaking val/test info)
     stats_df = df.filter(pl.col("date") < train_end) if train_end else df
     if verbose and train_end:
-        print(f"  Computing selection statistics on training data only (< {train_end}, {len(stats_df):,} rows)")
+        print(
+            f"  Computing selection statistics on training data only "
+            f"(< {train_end}, {len(stats_df):,} rows)"
+        )
 
     feature_cols = [c for c in df.columns if _is_feature_col(c)]
     initial_count = len(feature_cols)
@@ -66,7 +70,10 @@ def select_features(
     low_var = [feature_cols[i] for i, v in enumerate(variances) if v <= variance_threshold]
     feature_cols = [c for c in feature_cols if c not in low_var]
     if verbose:
-        print(f"  Variance filter (bottom {min_variance_pct:.0%}): dropped {len(low_var)}, kept {len(feature_cols)}")
+        print(
+            f"  Variance filter (bottom {min_variance_pct:.0%}): "
+            f"dropped {len(low_var)}, kept {len(feature_cols)}"
+        )
 
     # 3. Remove highly correlated features (computed on training data)
     if len(feature_cols) > 1:
@@ -85,7 +92,10 @@ def select_features(
                     to_drop.add(feature_cols[j])
         feature_cols = [c for c in feature_cols if c not in to_drop]
         if verbose:
-            print(f"  Correlation filter (>{max_correlation}): dropped {len(to_drop)}, kept {len(feature_cols)}")
+            print(
+                f"  Correlation filter (>{max_correlation}): "
+                f"dropped {len(to_drop)}, kept {len(feature_cols)}"
+            )
 
     # 4. Remove features with low mutual information vs target
     min_mi = sel_cfg.get("min_mutual_info", 0.0)
@@ -142,7 +152,7 @@ def _detect_feature_changes(selected_cols: list[str], manifest_path: Path) -> di
             "prev_count": len(prev_features),
             "curr_count": len(selected_cols),
         }
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return {"added": selected_cols, "removed": [], "unchanged": [], "significant_change": True}
 
 
@@ -174,7 +184,12 @@ def detect_drift(
 
     feature_cols = [c for c in df.columns if _is_feature_col(c)]
     if not feature_cols or "target" not in df.columns:
-        return {"drifted_features": [], "rank_changes": {}, "n_features": 0, "has_significant_drift": False}
+        return {
+            "drifted_features": [],
+            "rank_changes": {},
+            "n_features": 0,
+            "has_significant_drift": False,
+        }
 
     # Full period MI
     full_df = df.select(feature_cols + ["target"]).drop_nulls()
@@ -183,7 +198,12 @@ def detect_drift(
     np.nan_to_num(X_full, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     if len(X_full) < 100:
-        return {"drifted_features": [], "rank_changes": {}, "n_features": len(feature_cols), "has_significant_drift": False}
+        return {
+            "drifted_features": [],
+            "rank_changes": {},
+            "n_features": len(feature_cols),
+            "has_significant_drift": False,
+        }
 
     mi_full = mutual_info_classif(X_full, y_full, random_state=42)
 
@@ -197,7 +217,12 @@ def detect_drift(
     if len(X_recent) < 100:
         if verbose:
             print(f"  Feature drift: not enough recent data ({len(X_recent)} rows), skipping")
-        return {"drifted_features": [], "rank_changes": {}, "n_features": len(feature_cols), "has_significant_drift": False}
+        return {
+            "drifted_features": [],
+            "rank_changes": {},
+            "n_features": len(feature_cols),
+            "has_significant_drift": False,
+        }
 
     mi_recent = mutual_info_classif(X_recent, y_recent, random_state=42)
 
@@ -228,7 +253,7 @@ def detect_drift(
             if len(drifted_sorted) > 10:
                 print(f"      ... and {len(drifted_sorted) - 10} more")
         if has_drift:
-            print(f"    WARNING: Significant feature drift detected! Consider retraining.")
+            print("    WARNING: Significant feature drift detected! Consider retraining.")
 
     return {
         "drifted_features": drifted,
@@ -270,22 +295,24 @@ def main() -> None:
     changes = _detect_feature_changes(selected_cols, manifest_path)
 
     if changes["significant_change"] and manifest_path.exists():
-        print(f"\n  ⚠️  WARNING: Significant feature changes detected!")
+        print("\n  ⚠️  WARNING: Significant feature changes detected!")
         print(f"     Previous: {changes.get('prev_count', 0)} features")
         print(f"     Current:  {changes['curr_count']} features")
         if changes["added"]:
             print(f"     Added:   {len(changes['added'])} features")
         if changes["removed"]:
             print(f"     Removed: {len(changes['removed'])} features")
-        print(f"\n     ... existing models were trained with DIFFERENT features.")
-        print(f"     ... you MUST retrain models: make train")
-        print(f"     ... otherwise aggregate/signals will fail or be unreliable.\n")
+        print("\n     ... existing models were trained with DIFFERENT features.")
+        print("     ... you MUST retrain models: make train")
+        print("     ... otherwise aggregate/signals will fail or be unreliable.\n")
 
     # Feature drift detection — compare recent vs full period MI rankings
     drift_result = detect_drift(df, config, recent_months=6, verbose=True)
     if drift_result["has_significant_drift"]:
-        print(f"\n  WARNING: {len(drift_result['drifted_features'])} features show significant drift.")
-        print(f"  Models trained on older data may underperform. Consider retraining.")
+        print(
+            f"\n  WARNING: {len(drift_result['drifted_features'])} features show significant drift."
+        )
+        print("  Models trained on older data may underperform. Consider retraining.")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df_selected.write_parquet(args.output)

@@ -1,4 +1,5 @@
 """Tests for stock clustering module."""
+# ruff: noqa: N806  # ML convention: capital X for feature matrices
 
 import numpy as np
 import polars as pl
@@ -15,53 +16,65 @@ def sample_clustering_features() -> pl.DataFrame:
     stocks = []
     # Technology sector — 6 stocks with 2 distinct behavior groups
     for i in range(3):
-        stocks.append({
-            "symbol": f"TECH_HIGH_{i}",
-            "sector": "Technology",
-            "return_20d_mean": 0.005 + np.random.normal(0, 0.001),
-            "volatility_60d": 0.03 + np.random.normal(0, 0.002),
-            "volume_profile": 1.5 + np.random.normal(0, 0.1),
-            "rsi_14_mean": 60 + np.random.normal(0, 2),
-            "beta_60d": 1.3 + np.random.normal(0, 0.1),
-        })
+        stocks.append(
+            {
+                "symbol": f"TECH_HIGH_{i}",
+                "sector": "Technology",
+                "return_20d_mean": 0.005 + np.random.normal(0, 0.001),
+                "volatility_60d": 0.03 + np.random.normal(0, 0.002),
+                "volume_profile": 1.5 + np.random.normal(0, 0.1),
+                "rsi_14_mean": 60 + np.random.normal(0, 2),
+                "beta_60d": 1.3 + np.random.normal(0, 0.1),
+            }
+        )
     for i in range(3):
-        stocks.append({
-            "symbol": f"TECH_LOW_{i}",
-            "sector": "Technology",
-            "return_20d_mean": -0.002 + np.random.normal(0, 0.001),
-            "volatility_60d": 0.01 + np.random.normal(0, 0.002),
-            "volume_profile": 0.8 + np.random.normal(0, 0.1),
-            "rsi_14_mean": 40 + np.random.normal(0, 2),
-            "beta_60d": 0.7 + np.random.normal(0, 0.1),
-        })
+        stocks.append(
+            {
+                "symbol": f"TECH_LOW_{i}",
+                "sector": "Technology",
+                "return_20d_mean": -0.002 + np.random.normal(0, 0.001),
+                "volatility_60d": 0.01 + np.random.normal(0, 0.002),
+                "volume_profile": 0.8 + np.random.normal(0, 0.1),
+                "rsi_14_mean": 40 + np.random.normal(0, 2),
+                "beta_60d": 0.7 + np.random.normal(0, 0.1),
+            }
+        )
     # Healthcare sector — 6 stocks
     for i in range(3):
-        stocks.append({
-            "symbol": f"HEALTH_A_{i}",
-            "sector": "Healthcare",
-            "return_20d_mean": 0.003 + np.random.normal(0, 0.001),
-            "volatility_60d": 0.02 + np.random.normal(0, 0.002),
-            "volume_profile": 1.0 + np.random.normal(0, 0.1),
-            "rsi_14_mean": 55 + np.random.normal(0, 2),
-            "beta_60d": 0.9 + np.random.normal(0, 0.1),
-        })
+        stocks.append(
+            {
+                "symbol": f"HEALTH_A_{i}",
+                "sector": "Healthcare",
+                "return_20d_mean": 0.003 + np.random.normal(0, 0.001),
+                "volatility_60d": 0.02 + np.random.normal(0, 0.002),
+                "volume_profile": 1.0 + np.random.normal(0, 0.1),
+                "rsi_14_mean": 55 + np.random.normal(0, 2),
+                "beta_60d": 0.9 + np.random.normal(0, 0.1),
+            }
+        )
     for i in range(3):
-        stocks.append({
-            "symbol": f"HEALTH_B_{i}",
-            "sector": "Healthcare",
-            "return_20d_mean": -0.001 + np.random.normal(0, 0.001),
-            "volatility_60d": 0.015 + np.random.normal(0, 0.002),
-            "volume_profile": 1.2 + np.random.normal(0, 0.1),
-            "rsi_14_mean": 45 + np.random.normal(0, 2),
-            "beta_60d": 1.1 + np.random.normal(0, 0.1),
-        })
+        stocks.append(
+            {
+                "symbol": f"HEALTH_B_{i}",
+                "sector": "Healthcare",
+                "return_20d_mean": -0.001 + np.random.normal(0, 0.001),
+                "volatility_60d": 0.015 + np.random.normal(0, 0.002),
+                "volume_profile": 1.2 + np.random.normal(0, 0.1),
+                "rsi_14_mean": 45 + np.random.normal(0, 2),
+                "beta_60d": 1.1 + np.random.normal(0, 0.1),
+            }
+        )
     return pl.DataFrame(stocks)
 
 
 def test_kmeans_produces_expected_clusters(sample_clustering_features: pl.DataFrame) -> None:
     """KMeans should produce 2 clusters per sector on clearly separable data."""
     feature_cols = [
-        "return_20d_mean", "volatility_60d", "volume_profile", "rsi_14_mean", "beta_60d"
+        "return_20d_mean",
+        "volatility_60d",
+        "volume_profile",
+        "rsi_14_mean",
+        "beta_60d",
     ]
 
     for sector in ["Technology", "Healthcare"]:
@@ -79,7 +92,11 @@ def test_kmeans_produces_expected_clusters(sample_clustering_features: pl.DataFr
 def test_silhouette_score_positive(sample_clustering_features: pl.DataFrame) -> None:
     """Silhouette score should be positive for clearly separable clusters."""
     feature_cols = [
-        "return_20d_mean", "volatility_60d", "volume_profile", "rsi_14_mean", "beta_60d"
+        "return_20d_mean",
+        "volatility_60d",
+        "volume_profile",
+        "rsi_14_mean",
+        "beta_60d",
     ]
 
     sector_df = sample_clustering_features.filter(pl.col("sector") == "Technology")
@@ -95,20 +112,28 @@ def test_silhouette_score_positive(sample_clustering_features: pl.DataFrame) -> 
 
 def test_single_stock_sector_no_crash() -> None:
     """A sector with 1 stock should produce a single cluster without error."""
-    df = pl.DataFrame([{
-        "symbol": "SOLO",
-        "sector": "Energy",
-        "return_20d_mean": 0.001,
-        "volatility_60d": 0.02,
-        "volume_profile": 1.0,
-        "rsi_14_mean": 50.0,
-        "beta_60d": 1.0,
-    }])
+    df = pl.DataFrame(
+        [
+            {
+                "symbol": "SOLO",
+                "sector": "Energy",
+                "return_20d_mean": 0.001,
+                "volatility_60d": 0.02,
+                "volume_profile": 1.0,
+                "rsi_14_mean": 50.0,
+                "beta_60d": 1.0,
+            }
+        ]
+    )
 
     feature_cols = [
-        "return_20d_mean", "volatility_60d", "volume_profile", "rsi_14_mean", "beta_60d"
+        "return_20d_mean",
+        "volatility_60d",
+        "volume_profile",
+        "rsi_14_mean",
+        "beta_60d",
     ]
-    X = df.select(feature_cols).to_numpy()
+    df.select(feature_cols).to_numpy()
     # Can't cluster with n_clusters >= n_samples
     n_clusters = min(3, len(df))
     assert n_clusters == 1
@@ -116,12 +141,15 @@ def test_single_stock_sector_no_crash() -> None:
 
 def test_cluster_id_format(sample_clustering_features: pl.DataFrame) -> None:
     """Cluster IDs should be descriptive based on sector composition."""
-    from src.features.clustering import run_clustering
 
     # Build a minimal config that exercises run_clustering's naming logic
     # We test the naming logic directly instead
     feature_cols = [
-        "return_20d_mean", "volatility_60d", "volume_profile", "rsi_14_mean", "beta_60d"
+        "return_20d_mean",
+        "volatility_60d",
+        "volume_profile",
+        "rsi_14_mean",
+        "beta_60d",
     ]
     sectors = sample_clustering_features["sector"].to_list()
 

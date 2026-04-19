@@ -10,9 +10,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-from pathlib import Path
-
 import time
+from pathlib import Path
 
 import httpx
 from sqlalchemy import text
@@ -120,8 +119,18 @@ def fetch_ohlcv(
 
 
 _TREASURY_TENORS = [
-    "month1", "month2", "month3", "month6",
-    "year1", "year2", "year3", "year5", "year7", "year10", "year20", "year30",
+    "month1",
+    "month2",
+    "month3",
+    "month6",
+    "year1",
+    "year2",
+    "year3",
+    "year5",
+    "year7",
+    "year10",
+    "year20",
+    "year30",
 ]
 
 
@@ -152,10 +161,7 @@ def fetch_treasury_rates(
         print("  No treasury rate data returned")
         return []
 
-    return [
-        {"date": row["date"], **{t: row.get(t) for t in _TREASURY_TENORS}}
-        for row in data
-    ]
+    return [{"date": row["date"], **{t: row.get(t) for t in _TREASURY_TENORS}} for row in data]
 
 
 def upsert_treasury_rates(engine, rows: list[dict]) -> int:
@@ -268,8 +274,11 @@ def upsert_ohlcv(engine, rows: list[dict]) -> int:
     with engine.begin() as conn:
         for row in rows:
             stmt = text("""
-                INSERT INTO ohlcv_daily (symbol, date, open, high, low, close, adj_close, volume, change_percent)
-                VALUES (:symbol, :date, :open, :high, :low, :close, :adj_close, :volume, :change_percent)
+                INSERT INTO ohlcv_daily
+                    (symbol, date, open, high, low, close, adj_close, volume, change_percent)
+                VALUES
+                    (:symbol, :date, :open, :high, :low, :close, :adj_close, :volume,
+                     :change_percent)
                 ON CONFLICT (symbol, date) DO NOTHING
             """)
             result = conn.execute(stmt, row)
@@ -300,17 +309,21 @@ def fetch_sectors(
             data = resp.json()
             if data and len(data) > 0:
                 profile = data[0]
-                results.append({
-                    "symbol": symbol,
-                    "sector": profile.get("sector", "Unknown"),
-                    "sub_industry": profile.get("industry"),
-                })
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "sector": profile.get("sector", "Unknown"),
+                        "sub_industry": profile.get("industry"),
+                    }
+                )
         except httpx.HTTPStatusError:
-            results.append({
-                "symbol": symbol,
-                "sector": "Unknown",
-                "sub_industry": None,
-            })
+            results.append(
+                {
+                    "symbol": symbol,
+                    "sector": "Unknown",
+                    "sub_industry": None,
+                }
+            )
 
     return results
 
@@ -373,8 +386,7 @@ def fetch_adj_close(
         return []
 
     return [
-        {"symbol": symbol, "date": row["date"], "adj_close": row.get("adjClose")}
-        for row in data
+        {"symbol": symbol, "date": row["date"], "adj_close": row.get("adjClose")} for row in data
     ]
 
 
@@ -422,11 +434,14 @@ def check_adjclose_changed(
     with engine.connect() as conn:
         ph, params = in_params("d", probe_dates)
         params["symbol"] = symbol
-        result = conn.execute(text(f"""
+        result = conn.execute(
+            text(f"""
             SELECT date, adj_close FROM ohlcv_daily
             WHERE symbol = :symbol AND date IN ({ph})
             ORDER BY date
-        """), params)
+        """),
+            params,
+        )
         db_rows = {str(row[0]): row[1] for row in result}
 
     if not db_rows or any(v is None for v in db_rows.values()):
@@ -492,8 +507,11 @@ def fetch_key_metrics(
             "fiscal_year": row.get("fiscalYear"),
             "period": row.get("period"),
         }
-        metrics = {k: v for k, v in row.items()
-                   if k not in ("symbol", "date", "fiscalYear", "period", "reportedCurrency")}
+        metrics = {
+            k: v
+            for k, v in row.items()
+            if k not in ("symbol", "date", "fiscalYear", "period", "reportedCurrency")
+        }
         meta["data"] = json.dumps(metrics)
         results.append(meta)
     return results
@@ -559,8 +577,11 @@ def fetch_financial_ratios(
             "fiscal_year": row.get("fiscalYear"),
             "period": row.get("period"),
         }
-        ratios = {k: v for k, v in row.items()
-                  if k not in ("symbol", "date", "fiscalYear", "period", "reportedCurrency")}
+        ratios = {
+            k: v
+            for k, v in row.items()
+            if k not in ("symbol", "date", "fiscalYear", "period", "reportedCurrency")
+        }
         meta["data"] = json.dumps(ratios)
         results.append(meta)
     return results
@@ -587,9 +608,17 @@ def upsert_financial_ratios(engine, rows: list[dict]) -> int:
 
 
 GICS_SECTORS = [
-    "Technology", "Healthcare", "Financial Services", "Consumer Cyclical",
-    "Communication Services", "Industrials", "Consumer Defensive",
-    "Energy", "Real Estate", "Utilities", "Basic Materials",
+    "Technology",
+    "Healthcare",
+    "Financial Services",
+    "Consumer Cyclical",
+    "Communication Services",
+    "Industrials",
+    "Consumer Defensive",
+    "Energy",
+    "Real Estate",
+    "Utilities",
+    "Basic Materials",
 ]
 
 
@@ -658,6 +687,7 @@ def main() -> None:
 
     from src.config import resolve_start_years_back
     from src.keys import PIPELINE_ENV
+
     start_years_back = resolve_start_years_back(config)
     print(f"Pipeline environment: {PIPELINE_ENV} ({start_years_back} years of data)")
     today = dt.date.today()
@@ -682,11 +712,23 @@ def main() -> None:
     parser.add_argument("--skip-treasury", action="store_true", help="Skip treasury rate ingestion")
     parser.add_argument("--skip-vix", action="store_true", help="Skip VIX ingestion")
     parser.add_argument("--skip-sectors", action="store_true", help="Skip GICS sector ingestion")
-    parser.add_argument("--skip-adjclose", action="store_true", help="Skip adjusted close ingestion")
-    parser.add_argument("--force-adjclose", action="store_true", help="Force full adjClose re-download without probe check")
-    parser.add_argument("--skip-fundamentals", action="store_true", help="Skip key metrics + ratios ingestion")
-    parser.add_argument("--skip-sector-perf", action="store_true", help="Skip historical sector performance")
-    parser.add_argument("--force", action="store_true", help="Force ingestion even if already completed today")
+    parser.add_argument(
+        "--skip-adjclose", action="store_true", help="Skip adjusted close ingestion"
+    )
+    parser.add_argument(
+        "--force-adjclose",
+        action="store_true",
+        help="Force full adjClose re-download without probe check",
+    )
+    parser.add_argument(
+        "--skip-fundamentals", action="store_true", help="Skip key metrics + ratios ingestion"
+    )
+    parser.add_argument(
+        "--skip-sector-perf", action="store_true", help="Skip historical sector performance"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Force ingestion even if already completed today"
+    )
     args = parser.parse_args()
 
     # Skip if already completed today (unless --force)
@@ -738,13 +780,17 @@ def main() -> None:
                 else:
                     adj_skipped += 1
                 if i % 50 == 0 or i == len(args.symbols):
-                    print(f"  [{i}/{len(args.symbols)}] refreshed: {adj_refreshed}, "
-                          f"skipped: {adj_skipped}, rows updated: {adj_total}")
+                    print(
+                        f"  [{i}/{len(args.symbols)}] refreshed: {adj_refreshed}, "
+                        f"skipped: {adj_skipped}, rows updated: {adj_total}"
+                    )
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
                 print(f"  {symbol}: adj_close FAILED ({type(e).__name__})")
                 adj_failed.append(symbol)
-        print(f"  Adjusted close done. {adj_refreshed} refreshed, "
-              f"{adj_skipped} unchanged, {adj_total} rows updated.")
+        print(
+            f"  Adjusted close done. {adj_refreshed} refreshed, "
+            f"{adj_skipped} unchanged, {adj_total} rows updated."
+        )
         if adj_failed:
             print(f"  Failed ({len(adj_failed)}): {', '.join(adj_failed[:10])}...")
 
@@ -754,8 +800,7 @@ def main() -> None:
         treasury_rows = fetch_treasury_rates(args.start, args.end)
         n_treasury = upsert_treasury_rates(engine, treasury_rows)
         print(
-            f"  Treasury rates: {n_treasury} rows inserted/updated"
-            f" ({len(treasury_rows)} fetched)"
+            f"  Treasury rates: {n_treasury} rows inserted/updated ({len(treasury_rows)} fetched)"
         )
 
     # --- VIX ingestion ---
@@ -763,10 +808,7 @@ def main() -> None:
         print("\nFetching VIX data...")
         vix_rows = fetch_vix(args.start, args.end)
         n_vix = upsert_vix(engine, vix_rows)
-        print(
-            f"  VIX: {n_vix} rows inserted/updated"
-            f" ({len(vix_rows)} fetched)"
-        )
+        print(f"  VIX: {n_vix} rows inserted/updated ({len(vix_rows)} fetched)")
 
     # --- GICS sector ingestion ---
     if not args.skip_sectors:
@@ -781,13 +823,13 @@ def main() -> None:
         print("\nFetching key metrics and financial ratios (quarterly)...")
         freshness_cutoff = (today - dt.timedelta(days=90)).isoformat()
         with engine.connect() as conn:
-            result = conn.execute(text(
-                "SELECT symbol, MAX(date) FROM key_metrics_quarterly GROUP BY symbol"
-            ))
+            result = conn.execute(
+                text("SELECT symbol, MAX(date) FROM key_metrics_quarterly GROUP BY symbol")
+            )
             km_last = {row[0]: str(row[1]) for row in result}
-            result = conn.execute(text(
-                "SELECT symbol, MAX(date) FROM financial_ratios_quarterly GROUP BY symbol"
-            ))
+            result = conn.execute(
+                text("SELECT symbol, MAX(date) FROM financial_ratios_quarterly GROUP BY symbol")
+            )
             fr_last = {row[0]: str(row[1]) for row in result}
 
         km_total = 0
@@ -800,8 +842,10 @@ def main() -> None:
             if km_fresh and fr_fresh:
                 fund_skipped += 1
                 if i % 50 == 0 or i == len(args.symbols):
-                    print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, "
-                          f"ratios: {fr_total}, skipped: {fund_skipped}")
+                    print(
+                        f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, "
+                        f"ratios: {fr_total}, skipped: {fund_skipped}"
+                    )
                 continue
             try:
                 if not km_fresh:
@@ -814,10 +858,14 @@ def main() -> None:
                 print(f"  {symbol}: fundamentals FAILED ({type(e).__name__})")
                 fund_failed.append(symbol)
             if i % 50 == 0 or i == len(args.symbols):
-                print(f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, "
-                      f"ratios: {fr_total}, skipped: {fund_skipped}")
-        print(f"  Fundamentals done. KM: {km_total}, Ratios: {fr_total}, "
-              f"skipped (fresh): {fund_skipped}")
+                print(
+                    f"  [{i}/{len(args.symbols)}] key_metrics: {km_total}, "
+                    f"ratios: {fr_total}, skipped: {fund_skipped}"
+                )
+        print(
+            f"  Fundamentals done. KM: {km_total}, Ratios: {fr_total}, "
+            f"skipped (fresh): {fund_skipped}"
+        )
         if fund_failed:
             print(f"  Failed ({len(fund_failed)}): {', '.join(fund_failed[:10])}...")
 
@@ -844,10 +892,10 @@ def main() -> None:
     new_data_marker = Path("data/.new_data")
     if has_new_data:
         new_data_marker.write_text(today.isoformat())
-        print(f"\nIngestion complete. New data flag set.")
+        print("\nIngestion complete. New data flag set.")
     else:
         new_data_marker.unlink(missing_ok=True)
-        print(f"\nIngestion complete. No new price data.")
+        print("\nIngestion complete. No new price data.")
 
 
 if __name__ == "__main__":

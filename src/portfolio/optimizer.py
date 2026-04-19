@@ -23,7 +23,6 @@ from scipy.optimize import minimize
 from sqlalchemy import text
 
 from src.config import (
-    ClusterConfig,
     PortfolioProfileConfig,
     compute_split_dates,
     load_config,
@@ -79,9 +78,14 @@ def load_historical_returns(
     if df.is_empty():
         return pl.DataFrame(schema={"date": pl.Date, "symbol": pl.Utf8, "daily_return": pl.Float64})
 
-    df = df.sort(["symbol", "date"]).with_columns(
-        pl.col("close").pct_change().over("symbol").alias("daily_return"),
-    ).drop_nulls(subset=["daily_return"]).select(["date", "symbol", "daily_return"])
+    df = (
+        df.sort(["symbol", "date"])
+        .with_columns(
+            pl.col("close").pct_change().over("symbol").alias("daily_return"),
+        )
+        .drop_nulls(subset=["daily_return"])
+        .select(["date", "symbol", "daily_return"])
+    )
 
     return df
 
@@ -113,9 +117,12 @@ def load_benchmark_returns(
     if df.is_empty():
         return np.array([0.0])
 
-    returns = df.sort("date").with_columns(
-        pl.col("close").pct_change().alias("ret")
-    ).drop_nulls(subset=["ret"])["ret"].to_numpy()
+    returns = (
+        df.sort("date")
+        .with_columns(pl.col("close").pct_change().alias("ret"))
+        .drop_nulls(subset=["ret"])["ret"]
+        .to_numpy()
+    )
 
     return returns
 
@@ -172,8 +179,10 @@ def optimize_portfolio(
         DataFrame with columns [symbol, weight, cluster_id, prob_up].
     """
     empty_schema = {
-        "symbol": pl.Utf8, "weight": pl.Float64,
-        "cluster_id": pl.Utf8, "prob_up": pl.Float64,
+        "symbol": pl.Utf8,
+        "weight": pl.Float64,
+        "cluster_id": pl.Utf8,
+        "prob_up": pl.Float64,
     }
 
     # Filter by min_prob_up threshold
@@ -238,23 +247,26 @@ def optimize_portfolio(
 
         # Sector constraints
         if sectors_df is not None:
-            sector_map = dict(zip(
-                sectors_df["symbol"].to_list(),
-                sectors_df["sector"].to_list(),
-            ))
+            sector_map = dict(
+                zip(
+                    sectors_df["symbol"].to_list(),
+                    sectors_df["sector"].to_list(),
+                )
+            )
             sectors_in_portfolio = set(sector_map.get(s, "Unknown") for s in symbols)
             for sector in sectors_in_portfolio:
                 sector_indices = [
-                    i for i, s in enumerate(symbols)
-                    if sector_map.get(s, "Unknown") == sector
+                    i for i, s in enumerate(symbols) if sector_map.get(s, "Unknown") == sector
                 ]
                 if sector_indices:
-                    constraint_list.append({
-                        "type": "ineq",
-                        "fun": lambda w, idx=sector_indices: (
-                            profile_config.max_sector_weight - sum(w[i] for i in idx)
-                        ),
-                    })
+                    constraint_list.append(
+                        {
+                            "type": "ineq",
+                            "fun": lambda w, idx=sector_indices: (
+                                profile_config.max_sector_weight - sum(w[i] for i in idx)
+                            ),
+                        }
+                    )
 
         # Initial guess: equal weight
         w0 = np.ones(n) / n
@@ -276,12 +288,14 @@ def optimize_portfolio(
     rows = []
     for i, symbol in enumerate(symbols):
         row = candidates.filter(pl.col("symbol") == symbol).row(0, named=True)
-        rows.append({
-            "symbol": symbol,
-            "weight": float(weights[i]),
-            "cluster_id": row["cluster_id"],
-            "prob_up": row["prob_up"],
-        })
+        rows.append(
+            {
+                "symbol": symbol,
+                "weight": float(weights[i]),
+                "cluster_id": row["cluster_id"],
+                "prob_up": row["prob_up"],
+            }
+        )
 
     return pl.DataFrame(rows)
 
@@ -321,11 +335,10 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
     # Using validation returns would be look-ahead bias: optimizing weights on the same
     # data used to evaluate the model (Grinold & Kahn 2000)
     import datetime as dt
+
     train_returns_start = split_dates.train_end - dt.timedelta(days=365)
     all_symbols = predictions["symbol"].to_list()
-    returns_df = load_historical_returns(
-        all_symbols, train_returns_start, split_dates.train_end
-    )
+    returns_df = load_historical_returns(all_symbols, train_returns_start, split_dates.train_end)
 
     # Load benchmark returns from same period
     benchmark_returns = load_benchmark_returns(
@@ -334,25 +347,31 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
 
     # Load sector data for constraints
     engine = get_engine()
-    sectors_df = pl.read_database(
-        "SELECT symbol, sector FROM stock_sectors", engine
-    )
+    sectors_df = pl.read_database("SELECT symbol, sector FROM stock_sectors", engine)
 
     # Load previous allocations for turnover penalty
     turnover_penalty = float(constraints.get("turnover_penalty", 0.0))
     previous_allocations: dict[str, dict[str, float]] = {}
     if turnover_penalty > 0:
-        prev_path = Path(agg_cfg.get("output_parquet", "data/predictions.parquet")).parent / "portfolios.parquet"
+        prev_path = (
+            Path(agg_cfg.get("output_parquet", "data/predictions.parquet")).parent
+            / "portfolios.parquet"
+        )
         if prev_path.exists():
             try:
                 prev_df = pl.read_parquet(str(prev_path))
                 for pname in prev_df["profile"].unique().to_list():
                     profile_rows = prev_df.filter(pl.col("profile") == pname)
-                    previous_allocations[pname] = dict(zip(
-                        profile_rows["symbol"].to_list(),
-                        profile_rows["weight"].to_list(),
-                    ))
-                print(f"  Loaded previous allocations for turnover penalty (lambda={turnover_penalty})")
+                    previous_allocations[pname] = dict(
+                        zip(
+                            profile_rows["symbol"].to_list(),
+                            profile_rows["weight"].to_list(),
+                        )
+                    )
+                print(
+                    "  Loaded previous allocations for turnover penalty "
+                    f"(lambda={turnover_penalty})"
+                )
             except Exception:
                 pass
 
@@ -376,12 +395,12 @@ def optimize_all_portfolios(config: dict) -> dict[str, pl.DataFrame]:
         )
 
         if not allocation.is_empty():
-            allocation = allocation.with_columns(
-                pl.lit(profile_name).alias("profile")
+            allocation = allocation.with_columns(pl.lit(profile_name).alias("profile"))
+            print(
+                f"  {profile_name}: {len(allocation)} positions, "
+                f"max weight: {allocation['weight'].max():.2%}, "
+                f"min weight: {allocation['weight'].min():.2%}"
             )
-            print(f"  {profile_name}: {len(allocation)} positions, "
-                  f"max weight: {allocation['weight'].max():.2%}, "
-                  f"min weight: {allocation['weight'].min():.2%}")
 
             # Validation metric
             if returns_df.height > 0:
@@ -422,10 +441,15 @@ def save_portfolios(
     if not all_dfs:
         print("No portfolio allocations to save.")
         # Write empty parquet so downstream stages can detect and handle gracefully
-        empty = pl.DataFrame(schema={
-            "symbol": pl.Utf8, "weight": pl.Float64,
-            "cluster_id": pl.Utf8, "prob_up": pl.Float64, "profile": pl.Utf8,
-        })
+        empty = pl.DataFrame(
+            schema={
+                "symbol": pl.Utf8,
+                "weight": pl.Float64,
+                "cluster_id": pl.Utf8,
+                "prob_up": pl.Float64,
+                "profile": pl.Utf8,
+            }
+        )
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         empty.write_parquet(output_path)
         return
@@ -476,7 +500,9 @@ def main() -> None:
             for profile_name, allocation in results.items():
                 if not allocation.is_empty():
                     mlflow.log_metric(f"{profile_name}_n_positions", len(allocation))
-                    mlflow.log_metric(f"{profile_name}_max_weight", float(allocation["weight"].max()))
+                    mlflow.log_metric(
+                        f"{profile_name}_max_weight", float(allocation["weight"].max())
+                    )
             if Path(output_path).exists():
                 mlflow.log_artifact(output_path)
         except Exception as e:

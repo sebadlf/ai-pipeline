@@ -8,11 +8,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import math
 import warnings
 
 import polars as pl
-
 from sqlalchemy import text
 
 from src.config import load_config
@@ -27,7 +27,9 @@ def load_ohlcv(symbols: list[str] | None = None) -> pl.DataFrame:
     """
     if symbols:
         ph, params = in_params("s", symbols)
-        query = text(f"SELECT * FROM ohlcv_daily WHERE symbol IN ({ph}) ORDER BY symbol, date").bindparams(**params)
+        query = text(
+            f"SELECT * FROM ohlcv_daily WHERE symbol IN ({ph}) ORDER BY symbol, date"
+        ).bindparams(**params)
     else:
         query = text("SELECT * FROM ohlcv_daily ORDER BY symbol, date")
 
@@ -55,37 +57,40 @@ def add_rsi(df: pl.DataFrame, window: int = 14) -> pl.DataFrame:
     gain = delta.clip(lower_bound=0).rolling_mean(window).over("symbol")
     loss = (-delta.clip(upper_bound=0)).rolling_mean(window).over("symbol")
 
-    return df.with_columns(
-        (100 - 100 / (1 + gain / loss)).alias(f"rsi_{window}")
-    )
+    return df.with_columns((100 - 100 / (1 + gain / loss)).alias(f"rsi_{window}"))
 
 
-def add_macd(
-    df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9
-) -> pl.DataFrame:
+def add_macd(df: pl.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pl.DataFrame:
     """Add MACD, signal line, and histogram columns."""
-    macd_line = (
-        pl.col("close").ewm_mean(span=fast).over("symbol")
-        - pl.col("close").ewm_mean(span=slow).over("symbol")
-    )
-    return df.with_columns(
-        macd_line.alias("macd"),
-    ).with_columns(
-        pl.col("macd").ewm_mean(span=signal).over("symbol").alias("macd_signal"),
-    ).with_columns(
-        (pl.col("macd") - pl.col("macd_signal")).alias("macd_hist"),
+    macd_line = pl.col("close").ewm_mean(span=fast).over("symbol") - pl.col("close").ewm_mean(
+        span=slow
+    ).over("symbol")
+    return (
+        df.with_columns(
+            macd_line.alias("macd"),
+        )
+        .with_columns(
+            pl.col("macd").ewm_mean(span=signal).over("symbol").alias("macd_signal"),
+        )
+        .with_columns(
+            (pl.col("macd") - pl.col("macd_signal")).alias("macd_hist"),
+        )
     )
 
 
 def add_bollinger_bands(df: pl.DataFrame, window: int = 20) -> pl.DataFrame:
     """Add Bollinger Bands (upper, middle, lower)."""
-    return df.with_columns(
-        pl.col("close").rolling_mean(window).over("symbol").alias("bb_middle"),
-        pl.col("close").rolling_std(window).over("symbol").alias("_bb_std"),
-    ).with_columns(
-        (pl.col("bb_middle") + 2 * pl.col("_bb_std")).alias("bb_upper"),
-        (pl.col("bb_middle") - 2 * pl.col("_bb_std")).alias("bb_lower"),
-    ).drop("_bb_std")
+    return (
+        df.with_columns(
+            pl.col("close").rolling_mean(window).over("symbol").alias("bb_middle"),
+            pl.col("close").rolling_std(window).over("symbol").alias("_bb_std"),
+        )
+        .with_columns(
+            (pl.col("bb_middle") + 2 * pl.col("_bb_std")).alias("bb_upper"),
+            (pl.col("bb_middle") - 2 * pl.col("_bb_std")).alias("bb_lower"),
+        )
+        .drop("_bb_std")
+    )
 
 
 def add_atr(df: pl.DataFrame, window: int = 14) -> pl.DataFrame:
@@ -99,9 +104,7 @@ def add_atr(df: pl.DataFrame, window: int = 14) -> pl.DataFrame:
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     )
-    return df.with_columns(
-        tr.rolling_mean(window).over("symbol").alias(f"atr_{window}")
-    )
+    return df.with_columns(tr.rolling_mean(window).over("symbol").alias(f"atr_{window}"))
 
 
 def add_volume_sma(df: pl.DataFrame, window: int = 20) -> pl.DataFrame:
@@ -114,8 +117,18 @@ def add_volume_sma(df: pl.DataFrame, window: int = 20) -> pl.DataFrame:
 
 
 _TREASURY_TENORS = [
-    "month1", "month2", "month3", "month6",
-    "year1", "year2", "year3", "year5", "year7", "year10", "year20", "year30",
+    "month1",
+    "month2",
+    "month3",
+    "month6",
+    "year1",
+    "year2",
+    "year3",
+    "year5",
+    "year7",
+    "year10",
+    "year20",
+    "year30",
 ]
 
 
@@ -144,16 +157,16 @@ def add_treasury_features(df: pl.DataFrame, treasury: pl.DataFrame) -> pl.DataFr
     ]
     df = df.with_columns(spread_exprs)
 
-    change_exprs = [
-        pl.col(t).diff().over("symbol").alias(f"{t}_change")
-        for t in _TREASURY_TENORS
-    ]
+    change_exprs = [pl.col(t).diff().over("symbol").alias(f"{t}_change") for t in _TREASURY_TENORS]
     return df.with_columns(change_exprs)
 
 
 def load_vix() -> pl.DataFrame:
     """Load VIX daily data from PostgreSQL into a Polars DataFrame."""
-    query = "SELECT date, open AS vix_open, high AS vix_high, low AS vix_low, close AS vix_close FROM vix_daily ORDER BY date"
+    query = (
+        "SELECT date, open AS vix_open, high AS vix_high, low AS vix_low, "
+        "close AS vix_close FROM vix_daily ORDER BY date"
+    )
     return pl.read_database(query, get_engine())
 
 
@@ -167,54 +180,117 @@ def add_vix_features(df: pl.DataFrame, vix: pl.DataFrame) -> pl.DataFrame:
         (pl.col("vix_high") - pl.col("vix_low")).alias("vix_range"),
         pl.col("vix_close").rolling_mean(5).over("symbol").alias("vix_sma_5"),
         pl.col("vix_close").rolling_mean(20).over("symbol").alias("vix_sma_20"),
-        (pl.col("vix_close") / pl.col("vix_close").rolling_mean(20).over("symbol") - 1).alias("vix_sma20_ratio"),
+        (pl.col("vix_close") / pl.col("vix_close").rolling_mean(20).over("symbol") - 1).alias(
+            "vix_sma20_ratio"
+        ),
     )
 
 
 _KEY_METRIC_FIELDS = [
-    "returnOnEquity", "returnOnAssets", "returnOnInvestedCapital",
-    "returnOnCapitalEmployed", "currentRatio", "earningsYield",
-    "freeCashFlowYield", "evToEBITDA", "netDebtToEBITDA", "incomeQuality",
-    "capexToRevenue", "researchAndDevelopementToRevenue", "evToSales",
-    "cashConversionCycle", "daysOfSalesOutstanding", "daysOfInventoryOutstanding",
-    "evToFreeCashFlow", "evToOperatingCashFlow", "marketCap", "enterpriseValue",
-    "averageInventory", "averagePayables", "averageReceivables",
-    "capexToDepreciation", "capexToOperatingCashFlow",
-    "daysOfPayablesOutstanding", "freeCashFlowToEquity", "freeCashFlowToFirm",
-    "grahamNetNet", "grahamNumber", "intangiblesToTotalAssets", "interestBurden",
-    "investedCapital", "netCurrentAssetValue", "operatingCycle",
-    "operatingReturnOnAssets", "returnOnTangibleAssets",
-    "salesGeneralAndAdministrativeToRevenue", "stockBasedCompensationToRevenue",
-    "tangibleAssetValue", "taxBurden", "workingCapital",
+    "returnOnEquity",
+    "returnOnAssets",
+    "returnOnInvestedCapital",
+    "returnOnCapitalEmployed",
+    "currentRatio",
+    "earningsYield",
+    "freeCashFlowYield",
+    "evToEBITDA",
+    "netDebtToEBITDA",
+    "incomeQuality",
+    "capexToRevenue",
+    "researchAndDevelopementToRevenue",
+    "evToSales",
+    "cashConversionCycle",
+    "daysOfSalesOutstanding",
+    "daysOfInventoryOutstanding",
+    "evToFreeCashFlow",
+    "evToOperatingCashFlow",
+    "marketCap",
+    "enterpriseValue",
+    "averageInventory",
+    "averagePayables",
+    "averageReceivables",
+    "capexToDepreciation",
+    "capexToOperatingCashFlow",
+    "daysOfPayablesOutstanding",
+    "freeCashFlowToEquity",
+    "freeCashFlowToFirm",
+    "grahamNetNet",
+    "grahamNumber",
+    "intangiblesToTotalAssets",
+    "interestBurden",
+    "investedCapital",
+    "netCurrentAssetValue",
+    "operatingCycle",
+    "operatingReturnOnAssets",
+    "returnOnTangibleAssets",
+    "salesGeneralAndAdministrativeToRevenue",
+    "stockBasedCompensationToRevenue",
+    "tangibleAssetValue",
+    "taxBurden",
+    "workingCapital",
 ]
 
 _RATIO_FIELDS = [
-    "grossProfitMargin", "operatingProfitMargin", "netProfitMargin",
-    "currentRatio", "quickRatio", "cashRatio",
-    "debtToEquityRatio", "debtToAssetsRatio",
-    "priceToEarningsRatio", "priceToBookRatio", "priceToSalesRatio",
-    "priceToFreeCashFlowRatio", "dividendYield", "interestCoverageRatio",
-    "financialLeverageRatio", "receivablesTurnover", "inventoryTurnover",
-    "assetTurnover", "operatingCashFlowSalesRatio",
+    "grossProfitMargin",
+    "operatingProfitMargin",
+    "netProfitMargin",
+    "currentRatio",
+    "quickRatio",
+    "cashRatio",
+    "debtToEquityRatio",
+    "debtToAssetsRatio",
+    "priceToEarningsRatio",
+    "priceToBookRatio",
+    "priceToSalesRatio",
+    "priceToFreeCashFlowRatio",
+    "dividendYield",
+    "interestCoverageRatio",
+    "financialLeverageRatio",
+    "receivablesTurnover",
+    "inventoryTurnover",
+    "assetTurnover",
+    "operatingCashFlowSalesRatio",
     "freeCashFlowOperatingCashFlowRatio",
-    "bookValuePerShare", "bottomLineProfitMargin", "capexPerShare",
-    "capitalExpenditureCoverageRatio", "cashPerShare",
-    "continuousOperationsProfitMargin", "debtServiceCoverageRatio",
-    "debtToCapitalRatio", "debtToMarketCap",
-    "dividendPaidAndCapexCoverageRatio", "dividendPayoutRatio",
-    "dividendPerShare", "dividendYieldPercentage", "ebitMargin",
-    "ebitdaMargin", "ebtPerEbit", "effectiveTaxRate",
-    "enterpriseValueMultiple", "fixedAssetTurnover",
-    "forwardPriceToEarningsGrowthRatio", "freeCashFlowPerShare",
-    "interestDebtPerShare", "longTermDebtToCapitalRatio",
-    "netIncomePerEBT", "netIncomePerShare",
-    "operatingCashFlowCoverageRatio", "operatingCashFlowPerShare",
-    "operatingCashFlowRatio", "payablesTurnover", "pretaxProfitMargin",
-    "priceToEarningsGrowthRatio", "priceToFairValue",
-    "priceToOperatingCashFlowRatio", "revenuePerShare",
+    "bookValuePerShare",
+    "bottomLineProfitMargin",
+    "capexPerShare",
+    "capitalExpenditureCoverageRatio",
+    "cashPerShare",
+    "continuousOperationsProfitMargin",
+    "debtServiceCoverageRatio",
+    "debtToCapitalRatio",
+    "debtToMarketCap",
+    "dividendPaidAndCapexCoverageRatio",
+    "dividendPayoutRatio",
+    "dividendPerShare",
+    "dividendYieldPercentage",
+    "ebitMargin",
+    "ebitdaMargin",
+    "ebtPerEbit",
+    "effectiveTaxRate",
+    "enterpriseValueMultiple",
+    "fixedAssetTurnover",
+    "forwardPriceToEarningsGrowthRatio",
+    "freeCashFlowPerShare",
+    "interestDebtPerShare",
+    "longTermDebtToCapitalRatio",
+    "netIncomePerEBT",
+    "netIncomePerShare",
+    "operatingCashFlowCoverageRatio",
+    "operatingCashFlowPerShare",
+    "operatingCashFlowRatio",
+    "payablesTurnover",
+    "pretaxProfitMargin",
+    "priceToEarningsGrowthRatio",
+    "priceToFairValue",
+    "priceToOperatingCashFlowRatio",
+    "revenuePerShare",
     "shareholdersEquityPerShare",
-    "shortTermOperatingCashFlowCoverageRatio", "solvencyRatio",
-    "tangibleBookValuePerShare", "workingCapitalTurnoverRatio",
+    "shortTermOperatingCashFlowCoverageRatio",
+    "solvencyRatio",
+    "tangibleBookValuePerShare",
+    "workingCapitalTurnoverRatio",
 ]
 
 
@@ -273,7 +349,9 @@ def add_fundamental_features(
 
 def load_sector_performance() -> pl.DataFrame:
     """Load historical sector performance from PostgreSQL."""
-    query = "SELECT date, sector, average_change FROM sector_performance_daily ORDER BY sector, date"
+    query = (
+        "SELECT date, sector, average_change FROM sector_performance_daily ORDER BY sector, date"
+    )
     return pl.read_database(query, get_engine())
 
 
@@ -323,15 +401,25 @@ def add_vix_percentile(df: pl.DataFrame) -> pl.DataFrame:
     Uses rolling min/max to approximate percentile efficiently:
     percentile = (vix - rolling_min) / (rolling_max - rolling_min).
     """
-    return df.with_columns(
-        pl.col("vix_close").rolling_min(252, min_samples=20).over("symbol").alias("_vix_min_252"),
-        pl.col("vix_close").rolling_max(252, min_samples=20).over("symbol").alias("_vix_max_252"),
-    ).with_columns(
-        (
-            (pl.col("vix_close") - pl.col("_vix_min_252"))
-            / (pl.col("_vix_max_252") - pl.col("_vix_min_252"))
-        ).alias("vix_percentile_252d"),
-    ).drop("_vix_min_252", "_vix_max_252")
+    return (
+        df.with_columns(
+            pl.col("vix_close")
+            .rolling_min(252, min_samples=20)
+            .over("symbol")
+            .alias("_vix_min_252"),
+            pl.col("vix_close")
+            .rolling_max(252, min_samples=20)
+            .over("symbol")
+            .alias("_vix_max_252"),
+        )
+        .with_columns(
+            (
+                (pl.col("vix_close") - pl.col("_vix_min_252"))
+                / (pl.col("_vix_max_252") - pl.col("_vix_min_252"))
+            ).alias("vix_percentile_252d"),
+        )
+        .drop("_vix_min_252", "_vix_max_252")
+    )
 
 
 def add_relative_strength_spy(df: pl.DataFrame) -> pl.DataFrame:
@@ -345,10 +433,18 @@ def add_relative_strength_spy(df: pl.DataFrame) -> pl.DataFrame:
     if spy_df.is_empty():
         return df
 
-    spy_price = "adj_close" if "adj_close" in spy_df.columns and spy_df["adj_close"].null_count() < len(spy_df) else "close"
-    spy_df = spy_df.sort("date").with_columns(
-        pl.col(spy_price).pct_change(20).alias("spy_return_20d"),
-    ).select(["date", "spy_return_20d"])
+    spy_price = (
+        "adj_close"
+        if "adj_close" in spy_df.columns and spy_df["adj_close"].null_count() < len(spy_df)
+        else "close"
+    )
+    spy_df = (
+        spy_df.sort("date")
+        .with_columns(
+            pl.col(spy_price).pct_change(20).alias("spy_return_20d"),
+        )
+        .select(["date", "spy_return_20d"])
+    )
 
     df = df.join(spy_df, on="date", how="left")
     df = df.with_columns(
@@ -381,14 +477,14 @@ def add_cross_sectional_features(df: pl.DataFrame) -> pl.DataFrame:
             if col in df.columns:
                 sector_mean = pl.col(col).mean().over("sector", "date")
                 sector_std = pl.col(col).std().over("sector", "date")
-                new_cols.append(
-                    ((pl.col(col) - sector_mean) / (sector_std + 1e-8)).alias(alias)
-                )
+                new_cols.append(((pl.col(col) - sector_mean) / (sector_std + 1e-8)).alias(alias))
 
     # Universe-wide momentum rank (percentile, 0-1)
     if "return_20d" in df.columns:
         new_cols.append(
-            pl.col("return_20d").rank().over("date")
+            pl.col("return_20d")
+            .rank()
+            .over("date")
             .truediv(pl.col("return_20d").count().over("date"))
             .alias("momentum_rank_pct")
         )
@@ -401,60 +497,84 @@ def add_cross_sectional_features(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_stochastic(df: pl.DataFrame, k_window: int = 14, d_window: int = 3) -> pl.DataFrame:
     """Add Stochastic Oscillator (%K and %D)."""
-    return df.with_columns(
-        pl.col("high").rolling_max(k_window).over("symbol").alias("_stoch_high"),
-        pl.col("low").rolling_min(k_window).over("symbol").alias("_stoch_low"),
-    ).with_columns(
-        (
-            (pl.col("close") - pl.col("_stoch_low"))
-            / (pl.col("_stoch_high") - pl.col("_stoch_low"))
-            * 100
-        ).alias("stoch_k"),
-    ).with_columns(
-        pl.col("stoch_k").rolling_mean(d_window).over("symbol").alias("stoch_d"),
-    ).drop("_stoch_high", "_stoch_low")
+    return (
+        df.with_columns(
+            pl.col("high").rolling_max(k_window).over("symbol").alias("_stoch_high"),
+            pl.col("low").rolling_min(k_window).over("symbol").alias("_stoch_low"),
+        )
+        .with_columns(
+            (
+                (pl.col("close") - pl.col("_stoch_low"))
+                / (pl.col("_stoch_high") - pl.col("_stoch_low"))
+                * 100
+            ).alias("stoch_k"),
+        )
+        .with_columns(
+            pl.col("stoch_k").rolling_mean(d_window).over("symbol").alias("stoch_d"),
+        )
+        .drop("_stoch_high", "_stoch_low")
+    )
 
 
 def add_obv(df: pl.DataFrame) -> pl.DataFrame:
     """Add On-Balance Volume rate of change (normalized, scale-invariant)."""
-    sign = pl.when(pl.col("close").diff().over("symbol") > 0).then(pl.col("volume")) \
-        .when(pl.col("close").diff().over("symbol") < 0).then(-pl.col("volume")) \
+    sign = (
+        pl.when(pl.col("close").diff().over("symbol") > 0)
+        .then(pl.col("volume"))
+        .when(pl.col("close").diff().over("symbol") < 0)
+        .then(-pl.col("volume"))
         .otherwise(pl.lit(0))
+    )
 
-    return df.with_columns(
-        sign.cum_sum().over("symbol").alias("_obv"),
-    ).with_columns(
-        pl.col("_obv").pct_change(20).over("symbol").alias("obv_roc_20d"),
-    ).with_columns(
-        pl.when(pl.col("obv_roc_20d").is_infinite())
-        .then(None)
-        .otherwise(pl.col("obv_roc_20d"))
-        .alias("obv_roc_20d"),
-    ).drop("_obv")
+    return (
+        df.with_columns(
+            sign.cum_sum().over("symbol").alias("_obv"),
+        )
+        .with_columns(
+            pl.col("_obv").pct_change(20).over("symbol").alias("obv_roc_20d"),
+        )
+        .with_columns(
+            pl.when(pl.col("obv_roc_20d").is_infinite())
+            .then(None)
+            .otherwise(pl.col("obv_roc_20d"))
+            .alias("obv_roc_20d"),
+        )
+        .drop("_obv")
+    )
 
 
 def add_mean_reversion_zscore(df: pl.DataFrame, window: int = 20) -> pl.DataFrame:
     """Add mean-reversion z-score: how many std devs price is from its SMA."""
-    return df.with_columns(
-        pl.col("close").rolling_mean(window).over("symbol").alias("_mr_mean"),
-        pl.col("close").rolling_std(window).over("symbol").alias("_mr_std"),
-    ).with_columns(
-        ((pl.col("close") - pl.col("_mr_mean")) / pl.col("_mr_std")).alias("mean_reversion_zscore"),
-    ).drop("_mr_mean", "_mr_std")
+    return (
+        df.with_columns(
+            pl.col("close").rolling_mean(window).over("symbol").alias("_mr_mean"),
+            pl.col("close").rolling_std(window).over("symbol").alias("_mr_std"),
+        )
+        .with_columns(
+            ((pl.col("close") - pl.col("_mr_mean")) / pl.col("_mr_std")).alias(
+                "mean_reversion_zscore"
+            ),
+        )
+        .drop("_mr_mean", "_mr_std")
+    )
 
 
 def add_cyclical_time(df: pl.DataFrame) -> pl.DataFrame:
     """Add sin/cos encoding of day-of-week and month-of-year."""
 
-    return df.with_columns(
-        pl.col("date").dt.weekday().alias("_dow"),
-        pl.col("date").dt.month().alias("_moy"),
-    ).with_columns(
-        (pl.col("_dow").cast(pl.Float64) * 2 * math.pi / 5).sin().alias("dow_sin"),
-        (pl.col("_dow").cast(pl.Float64) * 2 * math.pi / 5).cos().alias("dow_cos"),
-        (pl.col("_moy").cast(pl.Float64) * 2 * math.pi / 12).sin().alias("moy_sin"),
-        (pl.col("_moy").cast(pl.Float64) * 2 * math.pi / 12).cos().alias("moy_cos"),
-    ).drop("_dow", "_moy")
+    return (
+        df.with_columns(
+            pl.col("date").dt.weekday().alias("_dow"),
+            pl.col("date").dt.month().alias("_moy"),
+        )
+        .with_columns(
+            (pl.col("_dow").cast(pl.Float64) * 2 * math.pi / 5).sin().alias("dow_sin"),
+            (pl.col("_dow").cast(pl.Float64) * 2 * math.pi / 5).cos().alias("dow_cos"),
+            (pl.col("_moy").cast(pl.Float64) * 2 * math.pi / 12).sin().alias("moy_sin"),
+            (pl.col("_moy").cast(pl.Float64) * 2 * math.pi / 12).cos().alias("moy_cos"),
+        )
+        .drop("_dow", "_moy")
+    )
 
 
 def add_lagged_macros(df: pl.DataFrame) -> pl.DataFrame:
@@ -476,7 +596,11 @@ def add_lagged_macros(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_returns(df: pl.DataFrame) -> pl.DataFrame:
     """Add daily and multi-period return columns using adj_close when available."""
-    price_col = "adj_close" if "adj_close" in df.columns and df["adj_close"].null_count() < len(df) else "close"
+    price_col = (
+        "adj_close"
+        if "adj_close" in df.columns and df["adj_close"].null_count() < len(df)
+        else "close"
+    )
     return df.with_columns(
         pl.col(price_col).pct_change().over("symbol").alias("return_1d"),
         pl.col(price_col).pct_change(5).over("symbol").alias("return_5d"),
@@ -504,14 +628,16 @@ def add_binary_target(
         buy_threshold: Base minimum positive return for UP class.
         volatility_adjusted: If True, scale threshold by per-stock volatility.
     """
-    price_col = "adj_close" if "adj_close" in df.columns and df["adj_close"].null_count() < len(df) else "close"
+    price_col = (
+        "adj_close"
+        if "adj_close" in df.columns and df["adj_close"].null_count() < len(df)
+        else "close"
+    )
     forward_return = pl.col(price_col).pct_change(horizon).shift(-horizon).over("symbol")
 
     if volatility_adjusted and "realized_vol_20d" in df.columns:
         # Compute per-date median volatility across all stocks
-        df = df.with_columns(
-            pl.col("realized_vol_20d").median().over("date").alias("_median_vol")
-        )
+        df = df.with_columns(pl.col("realized_vol_20d").median().over("date").alias("_median_vol"))
         # Scale threshold: high-vol stocks get higher threshold, low-vol get lower
         # Clamp ratio to [0.5, 2.0] to avoid extreme thresholds
         vol_ratio = (pl.col("realized_vol_20d") / pl.col("_median_vol")).clip(0.5, 2.0)
@@ -604,7 +730,9 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
             fr_df = load_financial_ratios()
             if len(km_df) > 0 and len(fr_df) > 0:
                 df = add_fundamental_features(df, km_df, fr_df)
-                print(f"  Added {len(_KEY_METRIC_FIELDS)} key metrics + {len(_RATIO_FIELDS)} ratios")
+                print(
+                    f"  Added {len(_KEY_METRIC_FIELDS)} key metrics + {len(_RATIO_FIELDS)} ratios"
+                )
             else:
                 print("  Warning: no fundamental data found, skipping")
         except Exception as e:
@@ -634,13 +762,15 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
     for w in windows:
         ratio_exprs.append((pl.col(f"sma_{w}") / close - 1).alias(f"sma_{w}_ratio"))
         ratio_exprs.append((pl.col(f"ema_{w}") / close - 1).alias(f"ema_{w}_ratio"))
-    ratio_exprs.extend([
-        (pl.col("bb_upper") / close - 1).alias("bb_upper_ratio"),
-        (pl.col("bb_lower") / close - 1).alias("bb_lower_ratio"),
-        (pl.col("atr_14") / close).alias("atr_14_ratio"),
-        (pl.col("macd") / close).alias("macd_ratio"),
-        (pl.col("macd_signal") / close).alias("macd_signal_ratio"),
-    ])
+    ratio_exprs.extend(
+        [
+            (pl.col("bb_upper") / close - 1).alias("bb_upper_ratio"),
+            (pl.col("bb_lower") / close - 1).alias("bb_lower_ratio"),
+            (pl.col("atr_14") / close).alias("atr_14_ratio"),
+            (pl.col("macd") / close).alias("macd_ratio"),
+            (pl.col("macd_signal") / close).alias("macd_signal_ratio"),
+        ]
+    )
     df = df.with_columns(ratio_exprs)
 
     # Target: binary classification UP/NOT_UP (needs close or adj_close)
@@ -658,10 +788,26 @@ def build_features(df: pl.DataFrame, config: dict) -> pl.DataFrame:
 
     # Drop absolute price columns (keep only scale-invariant features)
     abs_cols = (
-        ["open", "high", "low", "close", "adj_close", "volume", "change_percent",
-         "bb_middle", "bb_upper", "bb_lower", "atr_14", "volume_sma_20",
-         "macd", "macd_signal", "sector",
-         "vix_open", "vix_high", "vix_low"]
+        [
+            "open",
+            "high",
+            "low",
+            "close",
+            "adj_close",
+            "volume",
+            "change_percent",
+            "bb_middle",
+            "bb_upper",
+            "bb_lower",
+            "atr_14",
+            "volume_sma_20",
+            "macd",
+            "macd_signal",
+            "sector",
+            "vix_open",
+            "vix_high",
+            "vix_low",
+        ]
         + [f"sma_{w}" for w in windows]
         + [f"ema_{w}" for w in windows]
     )
@@ -692,9 +838,7 @@ def fill_nulls(df: pl.DataFrame, *, train_end: dt.date | None = None) -> pl.Data
     # Step 1: Forward-fill fundamental features per symbol (quarterly gaps are expected)
     fundamental_cols = [c for c in feature_cols if c.startswith(("km_", "fr_"))]
     if fundamental_cols:
-        df = df.with_columns(
-            [pl.col(c).forward_fill().over("symbol") for c in fundamental_cols]
-        )
+        df = df.with_columns([pl.col(c).forward_fill().over("symbol") for c in fundamental_cols])
 
     # Step 2: Fill remaining nulls with median computed on training data only
     remaining_null_cols = [c for c in feature_cols if df[c].null_count() > 0 and c != "target"]
@@ -703,16 +847,24 @@ def fill_nulls(df: pl.DataFrame, *, train_end: dt.date | None = None) -> pl.Data
             # Compute medians from training period only (avoid data leakage)
             train_df = df.filter(pl.col("date") < train_end)
             medians = {c: train_df[c].median() for c in remaining_null_cols}
-            median_fills = [pl.col(c).fill_null(pl.lit(medians[c])).alias(c) for c in remaining_null_cols if medians[c] is not None]
+            median_fills = [
+                pl.col(c).fill_null(pl.lit(medians[c])).alias(c)
+                for c in remaining_null_cols
+                if medians[c] is not None
+            ]
         else:
             # Fallback: per-symbol median over full dataset
-            median_fills = [pl.col(c).fill_null(pl.col(c).median().over("symbol")).alias(c) for c in remaining_null_cols]
+            median_fills = [
+                pl.col(c).fill_null(pl.col(c).median().over("symbol")).alias(c)
+                for c in remaining_null_cols
+            ]
         if median_fills:
             df = df.with_columns(median_fills)
 
     # Step 3: Drop rows that still have nulls in critical columns only
-    critical_cols = [c for c in ["return_1d", "return_5d", "return_20d", "target"]
-                     if c in df.columns]
+    critical_cols = [
+        c for c in ["return_1d", "return_5d", "return_20d", "target"] if c in df.columns
+    ]
     if critical_cols:
         df = df.drop_nulls(subset=critical_cols)
 
@@ -750,10 +902,11 @@ def main() -> None:
     feature_cols = [c for c in df.columns if c not in meta_cols]
 
     dropped = initial_len - len(df)
-    print(f"  Dropped {dropped:,} rows with critical nulls ({dropped/max(initial_len,1):.1%})")
+    print(f"  Dropped {dropped:,} rows with critical nulls ({dropped / max(initial_len, 1):.1%})")
 
     # Save to parquet
     from pathlib import Path
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(args.output)
     print(f"  Saved {len(df):,} rows to {args.output}")

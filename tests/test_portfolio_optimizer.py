@@ -1,7 +1,5 @@
 """Tests for portfolio optimizer."""
 
-import datetime as dt
-
 import numpy as np
 import polars as pl
 import pytest
@@ -12,16 +10,18 @@ from src.config import PortfolioProfileConfig
 @pytest.fixture
 def sample_predictions() -> pl.DataFrame:
     """Sample prediction data for 8 stocks with prob_up."""
-    return pl.DataFrame([
-        {"symbol": "AAPL", "cluster_id": "Tech_0", "prob_up": 0.85},
-        {"symbol": "MSFT", "cluster_id": "Tech_0", "prob_up": 0.78},
-        {"symbol": "GOOGL", "cluster_id": "Tech_1", "prob_up": 0.72},
-        {"symbol": "JPM", "cluster_id": "Finance_0", "prob_up": 0.65},
-        {"symbol": "GS", "cluster_id": "Finance_0", "prob_up": 0.40},
-        {"symbol": "JNJ", "cluster_id": "Health_0", "prob_up": 0.60},
-        {"symbol": "PFE", "cluster_id": "Health_0", "prob_up": 0.55},
-        {"symbol": "XOM", "cluster_id": "Energy_0", "prob_up": 0.68},
-    ])
+    return pl.DataFrame(
+        [
+            {"symbol": "AAPL", "cluster_id": "Tech_0", "prob_up": 0.85},
+            {"symbol": "MSFT", "cluster_id": "Tech_0", "prob_up": 0.78},
+            {"symbol": "GOOGL", "cluster_id": "Tech_1", "prob_up": 0.72},
+            {"symbol": "JPM", "cluster_id": "Finance_0", "prob_up": 0.65},
+            {"symbol": "GS", "cluster_id": "Finance_0", "prob_up": 0.40},
+            {"symbol": "JNJ", "cluster_id": "Health_0", "prob_up": 0.60},
+            {"symbol": "PFE", "cluster_id": "Health_0", "prob_up": 0.55},
+            {"symbol": "XOM", "cluster_id": "Energy_0", "prob_up": 0.68},
+        ]
+    )
 
 
 def test_aggressive_has_lowest_threshold(sample_predictions: pl.DataFrame) -> None:
@@ -81,9 +81,11 @@ def test_max_positions_limit(sample_predictions: pl.DataFrame) -> None:
         max_sector_weight=0.50,
         min_prob_up=0.50,
     )
-    candidates = sample_predictions.filter(
-        pl.col("prob_up") >= config.min_prob_up
-    ).sort("prob_up", descending=True).head(config.max_positions)
+    candidates = (
+        sample_predictions.filter(pl.col("prob_up") >= config.min_prob_up)
+        .sort("prob_up", descending=True)
+        .head(config.max_positions)
+    )
     assert len(candidates) <= 2
 
 

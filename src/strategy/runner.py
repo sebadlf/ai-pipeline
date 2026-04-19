@@ -17,16 +17,16 @@ import polars as pl
 import torch
 
 from src.aggregation.consolidate import resolve_feature_cols
-from src.config import ClusterConfig, compute_split_dates, load_config
-from src.evaluation.champion import download_champion_checkpoint, download_ensemble_checkpoints
+from src.config import ClusterConfig, load_config
+from src.evaluation.champion import download_ensemble_checkpoints
 from src.features.normalize import apply_normalization_to_array, load_normalization_stats
 from src.features.technical import build_features, fill_nulls, load_ohlcv
 from src.models.base_model import LSTMForecaster
 
 
-
 def load_cluster_ensemble(
-    cluster_id: str, ensemble_k: int = 3,
+    cluster_id: str,
+    ensemble_k: int = 3,
 ) -> list[LSTMForecaster]:
     """Load ensemble of champion models for a cluster from MLflow registry.
 
@@ -44,7 +44,9 @@ def load_cluster_ensemble(
         run_ids = []
         for ckpt_path, run_id in paths:
             model = LSTMForecaster.load_from_checkpoint(
-                str(ckpt_path), map_location="cpu", weights_only=False,
+                str(ckpt_path),
+                map_location="cpu",
+                weights_only=False,
             )
             model.eval()
             models.append(model)
@@ -115,14 +117,20 @@ def generate_signals(
             fcols = resolve_feature_cols(models[0], df, config)
         except ValueError as e:
             if "features not in DataFrame" in str(e) or "Feature mismatch" in str(e):
-                print(f"  Feature mismatch for {cid}: skipping. Retrain after feature selection changes.")
+                print(
+                    f"  Feature mismatch for {cid}: skipping. "
+                    "Retrain after feature selection changes."
+                )
                 feature_mismatch_clusters.append(cid)
                 continue
             raise
         cluster_feature_cols[cid] = fcols
 
     if feature_mismatch_clusters:
-        print(f"\n  WARNING: {len(feature_mismatch_clusters)} clusters skipped due to feature mismatch: {', '.join(feature_mismatch_clusters)}")
+        print(
+            f"\n  WARNING: {len(feature_mismatch_clusters)} clusters skipped due "
+            f"to feature mismatch: {', '.join(feature_mismatch_clusters)}"
+        )
         print("  Recommendation: Retrain models after feature selection changes.\n")
 
     # Generate predictions per symbol (ensemble-averaged)
@@ -165,12 +173,14 @@ def generate_signals(
         last_date = sym_df["date"].tail(1).item()
         avg_prob_up = sum(prob_ups) / len(prob_ups)
 
-        results.append({
-            "symbol": symbol,
-            "date": last_date,
-            "prob_up": round(avg_prob_up, 4),
-            "cluster_id": cluster_id,
-        })
+        results.append(
+            {
+                "symbol": symbol,
+                "date": last_date,
+                "prob_up": round(avg_prob_up, 4),
+                "cluster_id": cluster_id,
+            }
+        )
 
     return pl.DataFrame(results)
 
@@ -199,9 +209,12 @@ def main() -> None:
 
     target_cfg = config.get("target", {})
     buy_threshold = target_cfg.get("buy_threshold", 0.025)
-    min_prob_up = config.get("portfolio", {}).get("profiles", {}).get(
-        "aggressive", {}
-    ).get("min_prob_up", 0.70)
+    min_prob_up = (
+        config.get("portfolio", {})
+        .get("profiles", {})
+        .get("aggressive", {})
+        .get("min_prob_up", 0.70)
+    )
 
     # Display actionable stocks (above min threshold)
     actionable = signals.filter(pl.col("prob_up") >= min_prob_up).sort("prob_up", descending=True)
@@ -219,7 +232,10 @@ def main() -> None:
         if len(below) > 20:
             print(f"  ... and {len(below) - 20} more")
 
-    print(f"\nTarget: UP >= +{buy_threshold:.1%} in {target_cfg.get('horizon', 21)} trading days (~1 month)")
+    print(
+        f"\nTarget: UP >= +{buy_threshold:.1%} in "
+        f"{target_cfg.get('horizon', 21)} trading days (~1 month)"
+    )
 
 
 if __name__ == "__main__":

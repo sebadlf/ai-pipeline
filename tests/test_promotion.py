@@ -4,10 +4,10 @@ import pytest
 
 from src.evaluation.promote import build_score_tuple, candidate_beats_champion, cascading_compare
 
-
 # --------------------------------------------------------------------------- #
 # Default promotion config for tests                                           #
 # --------------------------------------------------------------------------- #
+
 
 @pytest.fixture
 def promo_cfg() -> dict:
@@ -21,6 +21,7 @@ def promo_cfg() -> dict:
 # --------------------------------------------------------------------------- #
 # build_score_tuple                                                            #
 # --------------------------------------------------------------------------- #
+
 
 class TestBuildScoreTuple:
     def test_basic_score(self, promo_cfg: dict) -> None:
@@ -68,6 +69,7 @@ class TestBuildScoreTuple:
 # --------------------------------------------------------------------------- #
 # candidate_beats_champion                                                     #
 # --------------------------------------------------------------------------- #
+
 
 class TestCandidateBeatsChampion:
     def test_no_champion(self, promo_cfg: dict) -> None:
@@ -118,6 +120,7 @@ class TestCandidateBeatsChampion:
 # --------------------------------------------------------------------------- #
 # Cascading elimination                                                        #
 # --------------------------------------------------------------------------- #
+
 
 @pytest.fixture
 def cascading_cfg() -> dict:
@@ -245,4 +248,3 @@ class TestCascadingCompare:
         beats, reason = candidate_beats_champion(cand, None, cascading_cfg)
         assert beats is True
         assert "no existing champion" in reason
-

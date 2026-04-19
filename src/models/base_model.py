@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import lightning as L
+import lightning as L  # noqa: N812
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 
 # Activation registry
 _ACTIVATIONS: dict[str, type[nn.Module]] = {
@@ -40,7 +40,10 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         ce_loss = F.cross_entropy(
-            logits, targets, weight=self.weight, reduction="none",
+            logits,
+            targets,
+            weight=self.weight,
+            reduction="none",
             label_smoothing=self.label_smoothing,
         )
         pt = torch.exp(-ce_loss)
@@ -146,12 +149,14 @@ class LSTMForecaster(L.LightningModule):
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
         if focal_gamma > 0:
             self.loss_fn = FocalLoss(
-                gamma=focal_gamma, weight=weight_tensor,
+                gamma=focal_gamma,
+                weight=weight_tensor,
                 label_smoothing=label_smoothing,
             )
         else:
             self.loss_fn = nn.CrossEntropyLoss(
-                weight=weight_tensor, label_smoothing=label_smoothing,
+                weight=weight_tensor,
+                label_smoothing=label_smoothing,
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -203,8 +208,13 @@ class LSTMForecaster(L.LightningModule):
             # Apply per-sample time-decay weights to loss
             loss = F.cross_entropy(logits, y, reduction="none")
             if hasattr(self, "loss_fn") and isinstance(self.loss_fn, FocalLoss):
-                ce = F.cross_entropy(logits, y, weight=self.loss_fn.weight, reduction="none",
-                                     label_smoothing=self.loss_fn.label_smoothing)
+                ce = F.cross_entropy(
+                    logits,
+                    y,
+                    weight=self.loss_fn.weight,
+                    reduction="none",
+                    label_smoothing=self.loss_fn.label_smoothing,
+                )
                 pt = torch.exp(-ce)
                 loss = ((1 - pt) ** self.loss_fn.gamma) * ce
             loss = (loss * sample_weights).mean()
@@ -225,8 +235,12 @@ class LSTMForecaster(L.LightningModule):
             fn = (~up_preds & up_targets).float().sum()
             denom_prec = tp + fp
             denom_rec = tp + fn
-            precision_up = tp / denom_prec if denom_prec > 0 else torch.zeros(1, device=x.device).squeeze()
-            recall_up = tp / denom_rec if denom_rec > 0 else torch.zeros(1, device=x.device).squeeze()
+            precision_up = (
+                tp / denom_prec if denom_prec > 0 else torch.zeros(1, device=x.device).squeeze()
+            )
+            recall_up = (
+                tp / denom_rec if denom_rec > 0 else torch.zeros(1, device=x.device).squeeze()
+            )
             self.log(f"{stage}_precision_up", precision_up, prog_bar=(stage == "val"))
             self.log(f"{stage}_recall_up", recall_up, prog_bar=(stage == "val"))
 
@@ -268,29 +282,47 @@ class LSTMForecaster(L.LightningModule):
 
         if optimizer_name == "radam":
             optimizer = torch.optim.RAdam(
-                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+                self.parameters(),
+                lr=self.learning_rate,
+                weight_decay=weight_decay,
             )
         elif optimizer_name == "sgd":
             optimizer = torch.optim.SGD(
-                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
-                momentum=0.9, nesterov=True,
+                self.parameters(),
+                lr=self.learning_rate,
+                weight_decay=weight_decay,
+                momentum=0.9,
+                nesterov=True,
             )
         elif optimizer_name == "lion":
             from lion_pytorch import Lion
+
             optimizer = Lion(
-                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+                self.parameters(),
+                lr=self.learning_rate,
+                weight_decay=weight_decay,
             )
         else:  # adamw (default)
             optimizer = torch.optim.AdamW(
-                self.parameters(), lr=self.learning_rate, weight_decay=weight_decay,
+                self.parameters(),
+                lr=self.learning_rate,
+                weight_decay=weight_decay,
             )
 
         factor = self.hparams.get("scheduler_factor", 0.5)
         patience = self.hparams.get("scheduler_patience", 5)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=factor, patience=patience, min_lr=1e-6,
+            optimizer,
+            mode="max",
+            factor=factor,
+            patience=patience,
+            min_lr=1e-6,
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_precision_up", "interval": "epoch"},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_precision_up",
+                "interval": "epoch",
+            },
         }

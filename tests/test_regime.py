@@ -2,7 +2,6 @@
 
 import numpy as np
 import polars as pl
-import pytest
 
 
 def _make_price_series(trend: str, n_days: int = 300) -> pl.DataFrame:
@@ -32,10 +31,12 @@ def _make_price_series(trend: str, n_days: int = 300) -> pl.DataFrame:
         eager=True,
     )
 
-    return pl.DataFrame({
-        "date": dates,
-        "close": prices,
-    })
+    return pl.DataFrame(
+        {
+            "date": dates,
+            "close": prices,
+        }
+    )
 
 
 def test_bull_regime_detection() -> None:

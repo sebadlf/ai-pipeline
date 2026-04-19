@@ -132,26 +132,16 @@ def run_portfolio_backtest(
     for day in dates:
         # Check for drift-based rebalancing (event-driven)
         drift_triggered = False
-        if (
-            max_position_drift > 0
-            and day != first_day
-            and not circuit_breaker
-            and positions
-        ):
+        if max_position_drift > 0 and day != first_day and not circuit_breaker and positions:
             total_value = cash + sum(
-                pos.shares * prices.filter(
-                    (pl.col("date") == day) & (pl.col("symbol") == sym)
-                )["close"][0]
+                pos.shares
+                * prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym))["close"][0]
                 for sym, pos in positions.items()
-                if not prices.filter(
-                    (pl.col("date") == day) & (pl.col("symbol") == sym)
-                ).is_empty()
+                if not prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym)).is_empty()
             )
             if total_value > 0:
                 for sym, pos in positions.items():
-                    price_row = prices.filter(
-                        (pl.col("date") == day) & (pl.col("symbol") == sym)
-                    )
+                    price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym))
                     if price_row.is_empty():
                         continue
                     actual_weight = (pos.shares * price_row["close"][0]) / total_value
@@ -165,17 +155,12 @@ def run_portfolio_backtest(
             not circuit_breaker
             and positions
             and day != first_day
-            and (
-                (rebalance_days > 0 and days_since_rebalance >= rebalance_days)
-                or drift_triggered
-            )
+            and ((rebalance_days > 0 and days_since_rebalance >= rebalance_days) or drift_triggered)
         )
         if should_rebalance:
             # Close all positions
             for sym, pos in list(positions.items()):
-                price_row = prices.filter(
-                    (pl.col("date") == day) & (pl.col("symbol") == sym)
-                )
+                price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym))
                 if not price_row.is_empty():
                     slp = _get_slippage(sym, pos.shares * price_row["close"][0])
                     proceeds = _close_position(pos, price_row["close"][0], commission_pct, slp)
@@ -186,9 +171,7 @@ def run_portfolio_backtest(
             # Re-open with target weights using current equity
             current_equity = cash
             for symbol, weight in alloc_map.items():
-                price_row = prices.filter(
-                    (pl.col("date") == day) & (pl.col("symbol") == symbol)
-                )
+                price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == symbol))
                 if price_row.is_empty() or weight <= 0:
                     continue
                 price = price_row["close"][0]
@@ -211,9 +194,7 @@ def run_portfolio_backtest(
         # Open initial positions on first day
         if day == first_day and not circuit_breaker:
             for symbol, weight in alloc_map.items():
-                price_row = prices.filter(
-                    (pl.col("date") == day) & (pl.col("symbol") == symbol)
-                )
+                price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == symbol))
                 if price_row.is_empty() or weight <= 0:
                     continue
 
@@ -237,9 +218,7 @@ def run_portfolio_backtest(
         # Risk checks on existing positions
         closed_symbols = []
         for sym, pos in positions.items():
-            price_row = prices.filter(
-                (pl.col("date") == day) & (pl.col("symbol") == sym)
-            )
+            price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym))
             if price_row.is_empty():
                 continue
             current_price = price_row["close"][0]
@@ -269,9 +248,7 @@ def run_portfolio_backtest(
         # Compute portfolio equity
         portfolio_value = cash
         for sym, pos in positions.items():
-            price_row = prices.filter(
-                (pl.col("date") == day) & (pl.col("symbol") == sym)
-            )
+            price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym))
             if not price_row.is_empty():
                 current_price = price_row["close"][0]
                 portfolio_value += pos.shares * current_price
@@ -291,9 +268,7 @@ def run_portfolio_backtest(
             circuit_breaker = True
             cooldown_until = day + dt.timedelta(days=cooldown_days)
             for sym, pos in list(positions.items()):
-                price_row = prices.filter(
-                    (pl.col("date") == day) & (pl.col("symbol") == sym)
-                )
+                price_row = prices.filter((pl.col("date") == day) & (pl.col("symbol") == sym))
                 if not price_row.is_empty():
                     slp = _get_slippage(sym, pos.shares * price_row["close"][0])
                     proceeds = _close_position(pos, price_row["close"][0], commission_pct, slp)
@@ -312,9 +287,7 @@ def run_portfolio_backtest(
     # Close remaining positions at last price
     last_date = dates[-1] if dates else None
     for sym, pos in list(positions.items()):
-        price_row = prices.filter(
-            (pl.col("date") == last_date) & (pl.col("symbol") == sym)
-        )
+        price_row = prices.filter((pl.col("date") == last_date) & (pl.col("symbol") == sym))
         if not price_row.is_empty():
             slp = _get_slippage(sym, pos.shares * price_row["close"][0])
             proceeds = _close_position(pos, price_row["close"][0], commission_pct, slp)
@@ -356,7 +329,9 @@ def run_portfolio_backtest(
     )
 
 
-def _close_position(pos: Position, current_price: float, commission_pct: float, slippage_pct: float = 0.0) -> float:
+def _close_position(
+    pos: Position, current_price: float, commission_pct: float, slippage_pct: float = 0.0
+) -> float:
     """Calculate proceeds from closing a position.
 
     Args:
@@ -409,9 +384,12 @@ def load_benchmark_returns(benchmark: str, start_date: dt.date, end_date: dt.dat
         df = pl.read_database(query, conn)
     if df.is_empty():
         return np.array([0.0])
-    return df.sort("date").with_columns(
-        pl.col("close").pct_change().alias("ret")
-    ).drop_nulls(subset=["ret"])["ret"].to_numpy()
+    return (
+        df.sort("date")
+        .with_columns(pl.col("close").pct_change().alias("ret"))
+        .drop_nulls(subset=["ret"])["ret"]
+        .to_numpy()
+    )
 
 
 def run_all_backtests(config: dict) -> list[BacktestResult]:
@@ -453,7 +431,7 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
     prices = load_test_prices(all_symbols, split_dates.test_start, split_dates.today)
 
     # Load benchmark returns
-    bench_returns = load_benchmark_returns(benchmark, split_dates.test_start, split_dates.today)
+    load_benchmark_returns(benchmark, split_dates.test_start, split_dates.today)
 
     profiles = portfolios["profile"].unique().to_list()
     regime_types = ["bull", "bear", "sideways"]
@@ -490,9 +468,11 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
                 all_bench = pl.read_database(bench_query, bench_conn)
             regime_bench = all_bench.filter(pl.col("date").is_in(regime_dates)).sort("date")
             if len(regime_bench) > 1:
-                regime_bench_returns = regime_bench.with_columns(
-                    pl.col("close").pct_change().alias("ret")
-                ).drop_nulls(subset=["ret"])["ret"].to_numpy()
+                regime_bench_returns = (
+                    regime_bench.with_columns(pl.col("close").pct_change().alias("ret"))
+                    .drop_nulls(subset=["ret"])["ret"]
+                    .to_numpy()
+                )
             else:
                 regime_bench_returns = None
 
@@ -500,12 +480,8 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
             port_constraints = portfolio_cfg.get("constraints", {})
             bt_with_rebalance = {
                 **bt_cfg,
-                "rebalance_frequency_days": port_constraints.get(
-                    "rebalance_frequency_days", 21
-                ),
-                "max_position_drift": port_constraints.get(
-                    "max_position_drift", 0.0
-                ),
+                "rebalance_frequency_days": port_constraints.get("rebalance_frequency_days", 21),
+                "max_position_drift": port_constraints.get("max_position_drift", 0.0),
             }
             result = run_portfolio_backtest(
                 profile_alloc,
@@ -570,28 +546,31 @@ def save_backtest_results(
                     win_rate = EXCLUDED.win_rate,
                     num_trades = EXCLUDED.num_trades
             """)
-            conn.execute(stmt, {
-                "run_date": run_date,
-                "profile": r.profile,
-                "regime": r.regime,
-                "total_return": r.total_return,
-                "annual_return": r.annual_return,
-                "sharpe_ratio": r.sharpe_ratio,
-                "sortino_ratio": r.sortino_ratio,
-                "calmar_ratio": r.calmar_ratio,
-                "omega_ratio": r.omega_ratio,
-                "info_ratio": r.info_ratio,
-                "max_drawdown": r.max_drawdown,
-                "win_rate": r.win_rate,
-                "num_trades": r.num_trades,
-            })
+            conn.execute(
+                stmt,
+                {
+                    "run_date": run_date,
+                    "profile": r.profile,
+                    "regime": r.regime,
+                    "total_return": r.total_return,
+                    "annual_return": r.annual_return,
+                    "sharpe_ratio": r.sharpe_ratio,
+                    "sortino_ratio": r.sortino_ratio,
+                    "calmar_ratio": r.calmar_ratio,
+                    "omega_ratio": r.omega_ratio,
+                    "info_ratio": r.info_ratio,
+                    "max_drawdown": r.max_drawdown,
+                    "win_rate": r.win_rate,
+                    "num_trades": r.num_trades,
+                },
+            )
 
     # Generate markdown report
     report_path = output_dir / f"backtest_{run_date}.md"
     lines = [
         f"# Backtest Report — {run_date}\n",
-        "| Profile | Regime | Return | Sharpe | Sortino | Calmar | Omega | Info | Max DD | Win Rate | Trades |",
-        "|---------|--------|--------|--------|---------|--------|-------|------|--------|----------|--------|",
+        "| Profile | Regime | Return | Sharpe | Sortino | Calmar | Omega | Info | Max DD | Win Rate | Trades |",  # noqa: E501
+        "|---------|--------|--------|--------|---------|--------|-------|------|--------|----------|--------|",  # noqa: E501
     ]
     for r in results:
         lines.append(
