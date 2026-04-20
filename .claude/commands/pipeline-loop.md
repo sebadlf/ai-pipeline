@@ -47,19 +47,73 @@ In priority order (first matching rule wins):
 6. `open_auto_issues > 0` → phase = `implement`.
 7. Verdict is `improve` AND `open_auto_issues == 0` AND verdict is `proposed: true` → cycle is complete → reset via `uv run python -m src.pipeline_loop.state reset-cycle`, then go back to step 1 (re-detect — should land on `run` next).
 
+### Step 3b — If phase is `implement`, peek the top issue
+
+When (and only when) the decided phase is `implement`, fetch the top-priority open issue **once here** so we can pick the right model and hand the metadata to the sub-agent (which will then skip its own fetch):
+
+1. Call `mcp__linear__list_issues` with exactly these parameters:
+   - `team="Becerra"`
+   - `labels=["pipeline-auto"]`
+   - `state=["Todo","Backlog"]`
+   - `orderBy="priority"`
+   - `limit=50`
+2. Filter out any result that also carries the `auto-blocked` label.
+3. If the filtered list is empty, treat the situation as "propose returned 0" — run `uv run python -m src.pipeline_loop.state reset-cycle` and go back to step 1 (do **not** spawn `implement`).
+4. Otherwise take the first result as `top_issue`. Capture `top_issue.id` (e.g., `BEC-50`), `top_issue.title`, `top_issue.priority.value` (integer 1-4 or `None`), `top_issue.labels` (list of strings), and `top_issue.gitBranchName`.
+
 ## Step 4 — Execute the phase via Agent
 
-Read the corresponding command file from `.claude/commands/pipeline-<phase>.md`. Spawn a subagent with the **entire contents of that file** as the prompt. Use `subagent_type: general-purpose` (it has access to Bash, Edit, Write, etc. — everything the phase commands need). Example:
+Pick the model for this spawn via the `pick_model` helper. For `implement`, pass the issue metadata captured in Step 3b; for every other phase, pass only the phase name:
+
+```
+uv run python -c "from src.pipeline_loop.model_selection import pick_model; print(pick_model('<phase>'))"
+# or, for implement:
+uv run python -c "from src.pipeline_loop.model_selection import pick_model; print(pick_model('implement', <priority_or_None>, <labels_list>))"
+```
+
+Never hardcode `"opus"` / `"sonnet"` in the coordinator — always go through `pick_model`.
+
+Read the corresponding command file from `.claude/commands/pipeline-<phase>.md`. Spawn a subagent with the **entire contents of that file** as the prompt, passing the chosen model. Use `subagent_type: general-purpose` (it has access to Bash, Edit, Write, etc. — everything the phase commands need).
+
+For the `implement` phase, **prepend** a short markdown block to the prompt with the metadata captured in Step 3b so the sub-agent can skip its own Linear fetch:
+
+```
+Agent({
+  description: "Run implement phase",
+  subagent_type: "general-purpose",
+  model: "<result of pick_model('implement', priority, labels)>",
+  prompt: """> **Coordinator pre-selected issue:**
+> - id: <top_issue.id>
+> - title: <top_issue.title>
+> - priority: <top_issue.priority.value>
+> - labels: <comma-separated labels>
+> - gitBranchName: <top_issue.gitBranchName>
+
+<contents of .claude/commands/pipeline-implement.md, verbatim>
+"""
+})
+```
+
+For every other phase (`run`, `analyze`, `cleanup`, `propose`), no metadata block — just the file contents:
 
 ```
 Agent({
   description: "Run <phase> phase",
   subagent_type: "general-purpose",
+  model: "<result of pick_model('<phase>')>",
   prompt: "<contents of .claude/commands/pipeline-<phase>.md, verbatim>"
 })
 ```
 
 Isolated context per phase is deliberate — keeps the coordinator light and matches the "Ralph Wiggum per fase" design. **Wait for the agent to return** before continuing (foreground, not background — you need its result to decide the next step).
+
+Immediately after spawning (before waiting, or just after the Agent call returns — either is fine, as long as it happens on every spawn), log the spawn with the model and — for `implement` — the issue:
+
+```
+uv run python -m src.pipeline_loop.state append-log "spawn phase=<phase> cycle=<N> model=<opus|sonnet>"
+# or, for implement:
+uv run python -m src.pipeline_loop.state append-log "spawn phase=implement cycle=<N> model=<opus|sonnet> issue=<BEC-NN> priority=<P>"
+```
 
 ## Step 5 — Process the phase result
 

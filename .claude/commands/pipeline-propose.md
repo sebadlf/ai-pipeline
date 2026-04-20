@@ -30,6 +30,7 @@ For each remaining candidate, call `mcp__linear__save_issue` with:
 - `description=<candidate.description>` — preserve the markdown body exactly as the analyzer wrote it. Do **not** escape newlines.
 - `priority=<candidate.priority>` (default 3 if missing)
 - `labels=["pipeline-auto", <existing label per stage when obvious: "tech-debt" / "feature" / "infra">]` — pick one tag based on the nature of the change. `pipeline-auto` is mandatory; the second is optional but recommended.
+- When the proposed change involves a large refactor, a new abstraction, or an architectural decision, also attach the label `model=Opus` so the `implement` phase uses the stronger model for it. Skip the label for bug fixes, parameter tuning, or trivial changes — Sonnet handles those.
 - `project="AI Pipeline"`
 - `assignee="sebadlf"` (or `"me"` — same user)
 

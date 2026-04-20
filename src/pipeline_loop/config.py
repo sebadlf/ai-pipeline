@@ -19,6 +19,18 @@ LABEL_AUTO = "pipeline-auto"
 LABEL_BLOCKED = "auto-blocked"
 LABEL_STOP = "loop-stop"
 
+# --- Model selection (per phase) ---
+PHASE_MODEL_DEFAULTS = {
+    "run": "sonnet",
+    "analyze": "opus",
+    "cleanup": "sonnet",
+    "propose": "opus",
+    "implement": "sonnet",
+}
+
+# --- Label that forces Opus for the implement phase ---
+LABEL_FORCE_OPUS = "model=Opus"
+
 # --- Vault paths (relative to repo root) ---
 VAULT_ROOT = Path("ai-pipeline-vault")
 LOOP_DIR = VAULT_ROOT / "projects" / "ai-pipeline" / "pipeline-loop"
