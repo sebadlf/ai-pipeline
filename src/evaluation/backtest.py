@@ -41,6 +41,10 @@ class Position:
 # Keep in sync with docs and report legend.
 MIN_TRADES_FOR_METRICS = 30
 MIN_DRAWDOWN_PCT_FOR_METRICS = 0.005  # 0.5% expressed as fraction
+# Minimum number of trading days required to safely annualize benchmark returns.
+# Below this threshold (e.g., a 15-25-day bear window), naive (1+r)^(252/n)-1
+# explodes a small positive period return into thousands-of-percent annual figures.
+MIN_ANNUALIZATION_WINDOW = 63  # ~3 months
 
 
 @dataclass
@@ -340,6 +344,21 @@ def run_portfolio_backtest(
         calmar_val = all_metrics["calmar"]
         omega_val = all_metrics["omega"]
 
+    # Suppress benchmark annualization metrics when the window is too short.
+    # A naive (1+r_period)^(252/n)-1 over 15-25 trading days explodes a small
+    # positive period return into thousands-of-percent annual figures, making
+    # bear-regime rows misleading. Apply this guard whenever the sample is
+    # insufficient OR the number of trading days is below MIN_ANNUALIZATION_WINDOW.
+    short_window = n_days < MIN_ANNUALIZATION_WINDOW
+    if insufficient or short_window:
+        bench_ann_ret = float("nan")
+        tracking_err = float("nan")
+        info_ratio_val = float("nan")
+    else:
+        bench_ann_ret = all_metrics.get("benchmark_annual_return", 0.0)
+        tracking_err = all_metrics.get("tracking_error", 0.0)
+        info_ratio_val = all_metrics["information"]
+
     return BacktestResult(
         total_return=total_return,
         annual_return=annual_return,
@@ -347,7 +366,7 @@ def run_portfolio_backtest(
         sortino_ratio=sortino_val,
         calmar_ratio=calmar_val,
         omega_ratio=omega_val,
-        info_ratio=all_metrics["information"],
+        info_ratio=info_ratio_val,
         max_drawdown=max_dd,
         win_rate=win_rate,
         num_trades=num_trades,
@@ -355,8 +374,8 @@ def run_portfolio_backtest(
         final_value=final_value,
         circuit_breaker_triggered=circuit_breaker or (cooldown_until is not None),
         equity_curve=equity_curve,
-        benchmark_annual_return=all_metrics.get("benchmark_annual_return", 0.0),
-        tracking_error=all_metrics.get("tracking_error", 0.0),
+        benchmark_annual_return=bench_ann_ret,
+        tracking_error=tracking_err,
         insufficient_sample=insufficient,
     )
 
@@ -530,11 +549,18 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
             print(f"  Return: {result.total_return:+.2%}")
             print(f"  Sharpe: {_p(result.sharpe_ratio)}  Sortino: {_p(result.sortino_ratio)}")
             print(f"  Calmar: {_p(result.calmar_ratio)}  Omega: {_p(result.omega_ratio)}")
-            print(f"  Info Ratio: {result.info_ratio:.3f}")
-            print(
-                f"  Bench Ann Ret: {result.benchmark_annual_return:+.2%}  "
-                f"Tracking Err: {result.tracking_error:.2%}"
+            print(f"  Info Ratio: {_p(result.info_ratio)}")
+            bench_ann_str = (
+                "n/a (short window)"
+                if not np.isfinite(result.benchmark_annual_return)
+                else f"{result.benchmark_annual_return:+.2%}"
             )
+            tracking_err_str = (
+                "n/a (short window)"
+                if not np.isfinite(result.tracking_error)
+                else f"{result.tracking_error:.2%}"
+            )
+            print(f"  Bench Ann Ret: {bench_ann_str}  Tracking Err: {tracking_err_str}")
             print(f"  Max DD: {result.max_drawdown:.2%}  Win Rate: {result.win_rate:.2%}")
             print(f"  Trades: {result.num_trades}  Final: ${result.final_value:,.2f}")
             if result.insufficient_sample:
@@ -621,18 +647,28 @@ def save_backtest_results(
         "Rows flagged `insufficient_sample` (n_trades < "
         f"{MIN_TRADES_FOR_METRICS} or max_dd < "
         f"{MIN_DRAWDOWN_PCT_FOR_METRICS:.1%}) report `n/a (insufficient data)` for "
-        "Sharpe/Sortino/Calmar/Omega.\n",
+        "Sharpe/Sortino/Calmar/Omega. "
+        f"Rows with fewer than {MIN_ANNUALIZATION_WINDOW} trading days report "
+        "`n/a (short window)` for Bench Ann Ret / Tracking Err / Info to avoid "
+        "annualization artifacts.\n",
         "| Profile | Regime | Return | Sharpe | Sortino | Calmar | Omega | Info | Bench Ann Ret | Tracking Err | Max DD | Win Rate | Trades | Flag |",  # noqa: E501
         "|---------|--------|--------|--------|---------|--------|-------|------|---------------|--------------|--------|----------|--------|------|",  # noqa: E501
     ]
+
+    def _fmt_pct(value: float, sign: bool = False) -> str:
+        """Format a float as a percentage, or 'n/a (short window)' if not finite."""
+        if not np.isfinite(value):
+            return "n/a (short window)"
+        return f"{value:+.2%}" if sign else f"{value:.2%}"
+
     for r in results:
         flag = "insufficient_sample" if r.insufficient_sample else ""
         lines.append(
             f"| {r.profile} | {r.regime} | {r.total_return:+.2%} | "
             f"{_fmt_ratio(r.sharpe_ratio)} | {_fmt_ratio(r.sortino_ratio)} | "
             f"{_fmt_ratio(r.calmar_ratio)} | {_fmt_ratio(r.omega_ratio)} | "
-            f"{r.info_ratio:.3f} | {r.benchmark_annual_return:+.2%} | "
-            f"{r.tracking_error:.2%} | {r.max_drawdown:.2%} | "
+            f"{_fmt_ratio(r.info_ratio)} | {_fmt_pct(r.benchmark_annual_return, sign=True)} | "
+            f"{_fmt_pct(r.tracking_error)} | {r.max_drawdown:.2%} | "
             f"{r.win_rate:.2%} | {r.num_trades} | {flag} |"
         )
     lines.append("")
