@@ -126,33 +126,47 @@ def cascading_compare(
     cand_calibrated = _is_calibrated(cand_metrics)
     champ_calibrated = _is_calibrated(champ_metrics)
     if cand_calibrated and not champ_calibrated:
-        return True, (
-            f"candidate is isotonic-calibrated and champion is not "
+        reason = (
+            f"tiebreaker=iso_calibration: candidate is isotonic-calibrated and champion is not "
             f"(cand_score={cand_score:.4f}, champ_score={champ_score:.4f})"
         )
+        logger.info("cascading_compare tiebreaker fired: %s", reason)
+        return True, reason
 
     # Compare stability scores
     margin = eval_config.tiebreak_margin
     if cand_score > champ_score + margin:
-        return True, f"candidate score {cand_score:.4f} > champion {champ_score:.4f}"
+        reason = (
+            f"tiebreaker=stability_score: candidate {cand_score:.4f} > champion {champ_score:.4f}"
+        )
+        logger.info("cascading_compare tiebreaker fired: %s", reason)
+        return True, reason
 
     if cand_score < champ_score - margin:
-        return False, f"candidate score {cand_score:.4f} <= champion {champ_score:.4f}"
+        reason = (
+            f"tiebreaker=stability_score: candidate {cand_score:.4f} <= champion {champ_score:.4f}"
+        )
+        logger.info("cascading_compare tiebreaker fired: %s", reason)
+        return False, reason
 
     # Within tiebreak margin — prefer lower FP severity
     cand_fp_sev = float(cand_metrics.get("val_fp_severity", float("inf")))
     champ_fp_sev = float(champ_metrics.get("val_fp_severity", float("inf")))
 
     if cand_fp_sev < champ_fp_sev:
-        return True, (
-            f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
+        reason = (
+            f"tiebreaker=fp_severity: candidate {cand_fp_sev:.4f} "
             f"< champion {champ_fp_sev:.4f} (scores within {margin})"
         )
+        logger.info("cascading_compare tiebreaker fired: %s", reason)
+        return True, reason
 
-    return False, (
-        f"tiebreak: candidate fp_severity {cand_fp_sev:.4f} "
+    reason = (
+        f"tiebreaker=fp_severity: candidate {cand_fp_sev:.4f} "
         f">= champion {champ_fp_sev:.4f} (scores within {margin})"
     )
+    logger.info("cascading_compare tiebreaker fired: %s", reason)
+    return False, reason
 
 
 # --------------------------------------------------------------------------- #
