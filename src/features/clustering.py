@@ -24,7 +24,7 @@ import numpy as np
 import polars as pl
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_samples, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
 
@@ -537,7 +537,14 @@ def run_clustering(
         symbols = feat_df["symbol"].to_list()
         sectors = feat_df["sector"].to_list()
         results = [
-            {"symbol": s, "sector": sec, "cluster_id": "Miscellaneous", "silhouette_score": None}
+            {
+                "symbol": s,
+                "sector": sec,
+                "cluster_id": "Miscellaneous",
+                "silhouette_score": None,
+                "silhouette_mean_cluster": None,
+                "silhouette_std_cluster": None,
+            }
             for s, sec in zip(symbols, sectors)
         ]
         cluster_stats = {
@@ -583,8 +590,19 @@ def run_clustering(
     n_unique = len(unique_labels)
     if n_unique > 1 and n_stocks > n_unique:
         sil_score = float(silhouette_score(X_reduced, labels))
+        sample_scores = silhouette_samples(X_reduced, labels)
     else:
         sil_score = 0.0
+        sample_scores = np.zeros(n_stocks)
+
+    # Compute per-cluster silhouette mean and std
+    cluster_sil_mean: dict[int, float] = {}
+    cluster_sil_std: dict[int, float] = {}
+    for label in unique_labels:
+        mask = labels == label
+        scores_for_cluster = sample_scores[mask]
+        cluster_sil_mean[label] = float(np.mean(scores_for_cluster))
+        cluster_sil_std[label] = float(np.std(scores_for_cluster))
 
     # Build descriptive cluster names based on sector composition
     cluster_sectors: dict[int, set[str]] = {}
@@ -610,14 +628,30 @@ def run_clustering(
         if base in single_names:
             label_to_name[label] = base
 
+    # Warn for degenerate clusters (low silhouette)
+    _SILHOUETTE_WARN_THRESHOLD = 0.15
+    for label in unique_labels:
+        cluster_name = label_to_name[label]
+        mean_sil = cluster_sil_mean[label]
+        if mean_sil < _SILHOUETTE_WARN_THRESHOLD:
+            logger.warning(
+                "Cluster %s has low mean silhouette score %.3f (< %.2f) — may be degenerate",
+                cluster_name,
+                mean_sil,
+                _SILHOUETTE_WARN_THRESHOLD,
+            )
+
     results = []
     for idx, symbol in enumerate(symbols):
+        label = labels[idx]
         results.append(
             {
                 "symbol": symbol,
                 "sector": sectors[idx],
-                "cluster_id": label_to_name[labels[idx]],
+                "cluster_id": label_to_name[label],
                 "silhouette_score": sil_score,
+                "silhouette_mean_cluster": cluster_sil_mean[label],
+                "silhouette_std_cluster": cluster_sil_std[label],
             }
         )
 
@@ -627,6 +661,8 @@ def run_clustering(
         "silhouette": sil_score,
         "pca_components": n_components_after,
         "pca_variance": variance_explained,
+        "cluster_sil_mean": {label_to_name[lbl]: cluster_sil_mean[lbl] for lbl in unique_labels},
+        "cluster_sil_std": {label_to_name[lbl]: cluster_sil_std[lbl] for lbl in unique_labels},
     }
     print(
         f"  Global: K={len(unique_labels)}, silhouette={sil_score:.3f}, "
@@ -673,6 +709,8 @@ def run_sector_clustering(
     result_df = sectors_df.select(["symbol", "sector"]).with_columns(
         pl.col("sector").alias("cluster_id"),
         pl.lit(0.0).alias("silhouette_score"),
+        pl.lit(0.0).alias("silhouette_mean_cluster"),
+        pl.lit(0.0).alias("silhouette_std_cluster"),
     )
 
     cluster_stats = {
@@ -721,12 +759,16 @@ def save_clusters(
         for row in result_df.iter_rows(named=True):
             stmt = text("""
                 INSERT INTO cluster_assignments
-                    (run_date, symbol, sector, cluster_id, silhouette_score)
-                VALUES (:run_date, :symbol, :sector, :cluster_id, :silhouette_score)
+                    (run_date, symbol, sector, cluster_id, silhouette_score,
+                     silhouette_mean_cluster, silhouette_std_cluster)
+                VALUES (:run_date, :symbol, :sector, :cluster_id, :silhouette_score,
+                        :silhouette_mean_cluster, :silhouette_std_cluster)
                 ON CONFLICT (run_date, symbol) DO UPDATE SET
                     sector = EXCLUDED.sector,
                     cluster_id = EXCLUDED.cluster_id,
-                    silhouette_score = EXCLUDED.silhouette_score
+                    silhouette_score = EXCLUDED.silhouette_score,
+                    silhouette_mean_cluster = EXCLUDED.silhouette_mean_cluster,
+                    silhouette_std_cluster = EXCLUDED.silhouette_std_cluster
             """)
             conn.execute(
                 stmt,
@@ -736,6 +778,8 @@ def save_clusters(
                     "sector": row["sector"],
                     "cluster_id": row["cluster_id"],
                     "silhouette_score": row["silhouette_score"],
+                    "silhouette_mean_cluster": row.get("silhouette_mean_cluster"),
+                    "silhouette_std_cluster": row.get("silhouette_std_cluster"),
                 },
             )
     print(f"Saved {len(result_df)} cluster assignments to database")
@@ -834,6 +878,14 @@ def main() -> None:
                 "pca_variance": cluster_stats["pca_variance"],
             }
         )
+
+        # Log per-cluster silhouette metrics
+        for cluster_name, mean_val in cluster_stats.get("cluster_sil_mean", {}).items():
+            safe_name = cluster_name.replace("-", "_").replace(" ", "_")
+            mlflow.log_metric(f"sil_mean_{safe_name}", mean_val)
+        for cluster_name, std_val in cluster_stats.get("cluster_sil_std", {}).items():
+            safe_name = cluster_name.replace("-", "_").replace(" ", "_")
+            mlflow.log_metric(f"sil_std_{safe_name}", std_val)
 
         mlflow.log_artifact(cluster_cfg.get("output_parquet", "data/clusters.parquet"))
     print("Logged clustering results to MLflow")
