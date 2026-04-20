@@ -7,6 +7,13 @@ You are executing the **implement** phase. One issue, one PR, one merge. Then re
 
 ## Pick the next issue
 
+> **Note**: when the coordinator spawns you, it may already include a
+> block at the top of this prompt with the chosen issue's metadata
+> (id, title, priority, labels, gitBranchName). If that block is present,
+> use those values and skip the `mcp__linear__list_issues` call in step 1.
+> If the block is absent (e.g., you were invoked manually via
+> `/pipeline-implement`), fetch the issue as described below.
+
 1. List open issues: `mcp__linear__list_issues` with `team="Becerra"`, `labels=["pipeline-auto"]`, `state=["Todo","Backlog"]`, `orderBy=priority`. Exclude anything with label `auto-blocked`.
 2. Pick the first one. If the list is empty, return immediately — the coordinator will reset the cycle.
 3. Fetch full detail via `mcp__linear__get_issue` to get `gitBranchName`.
