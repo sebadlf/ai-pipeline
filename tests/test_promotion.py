@@ -227,7 +227,7 @@ class TestCascadingCompare:
         }
         beats, reason = cascading_compare(cand, champ, cascading_cfg)
         assert beats is True
-        assert "tiebreak" in reason
+        assert "tiebreaker" in reason
 
     def test_tiebreak_champion_wins(self, cascading_cfg: dict) -> None:
         """Within margin, champion has better FP severity."""
@@ -316,6 +316,27 @@ class TestCascadingCompare:
         beats, reason = cascading_compare(cand, champ, cascading_cfg)
         assert beats is True
         assert "isotonic-calibrated" in reason
+        assert "tiebreaker=iso_calibration" in reason
+
+    def test_iso_preference_with_equal_stability_scores(self, cascading_cfg: dict) -> None:
+        """BEC-50: with equal stability scores, iso-calibrated candidate beats non-calibrated.
+
+        Verifies BEC-39 iso preference fires deterministically when no score difference
+        would otherwise decide the comparison.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.65,
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.65,  # identical score
+            # No isotonic_fitted → legacy pre-calibration run
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "tiebreaker=iso_calibration" in reason
 
     def test_calibrated_champion_vs_calibrated_candidate_uses_score(
         self, cascading_cfg: dict
