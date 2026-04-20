@@ -5,7 +5,7 @@ import numpy as np
 import polars as pl
 import pytest
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_samples, silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 
@@ -190,3 +190,98 @@ def test_cluster_id_format(sample_clustering_features: pl.DataFrame) -> None:
         # With 2 sectors (Technology, Healthcare) and 2 clusters,
         # names should contain sector names or Miscellaneous
         assert any(s in cluster_id for s in ["Technology", "Healthcare", "Miscellaneous"])
+
+
+def test_per_cluster_silhouette_aggregation(sample_clustering_features: pl.DataFrame) -> None:
+    """Per-cluster silhouette mean and std should be computed per cluster."""
+    feature_cols = [
+        "return_20d_mean",
+        "volatility_60d",
+        "volume_profile",
+        "rsi_14_mean",
+        "beta_60d",
+    ]
+
+    X = sample_clustering_features.select(feature_cols).to_numpy()
+    X_scaled = StandardScaler().fit_transform(X)
+
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X_scaled)
+    unique_labels = sorted(set(labels))
+
+    sample_scores = silhouette_samples(X_scaled, labels)
+
+    cluster_sil_mean: dict[int, float] = {}
+    cluster_sil_std: dict[int, float] = {}
+    for label in unique_labels:
+        mask = labels == label
+        scores_for_cluster = sample_scores[mask]
+        cluster_sil_mean[label] = float(np.mean(scores_for_cluster))
+        cluster_sil_std[label] = float(np.std(scores_for_cluster))
+
+    # Each cluster should have a mean silhouette and std
+    assert len(cluster_sil_mean) == 2
+    assert len(cluster_sil_std) == 2
+
+    # For clearly separable clusters, mean silhouette should be positive
+    for label, mean_val in cluster_sil_mean.items():
+        assert mean_val > 0, f"Cluster {label} mean silhouette {mean_val} should be > 0"
+
+    # Std should be non-negative
+    for label, std_val in cluster_sil_std.items():
+        assert std_val >= 0, f"Cluster {label} std silhouette {std_val} should be >= 0"
+
+
+def test_per_cluster_silhouette_columns_in_output(sample_clustering_features: pl.DataFrame) -> None:
+    """Result rows should contain silhouette_mean_cluster and silhouette_std_cluster columns."""
+    feature_cols = [
+        "return_20d_mean",
+        "volatility_60d",
+        "volume_profile",
+        "rsi_14_mean",
+        "beta_60d",
+    ]
+    symbols = sample_clustering_features["symbol"].to_list()
+    sectors = sample_clustering_features["sector"].to_list()
+
+    X = sample_clustering_features.select(feature_cols).to_numpy()
+    X_scaled = StandardScaler().fit_transform(X)
+
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X_scaled)
+    unique_labels = sorted(set(labels))
+
+    sample_scores = silhouette_samples(X_scaled, labels)
+    cluster_sil_mean = {lbl: float(np.mean(sample_scores[labels == lbl])) for lbl in unique_labels}
+    cluster_sil_std = {lbl: float(np.std(sample_scores[labels == lbl])) for lbl in unique_labels}
+    sil_global = float(silhouette_score(X_scaled, labels))
+
+    results = []
+    for idx, symbol in enumerate(symbols):
+        label = labels[idx]
+        results.append(
+            {
+                "symbol": symbol,
+                "sector": sectors[idx],
+                "cluster_id": f"cluster_{label}",
+                "silhouette_score": sil_global,
+                "silhouette_mean_cluster": cluster_sil_mean[label],
+                "silhouette_std_cluster": cluster_sil_std[label],
+            }
+        )
+
+    result_df = pl.DataFrame(results)
+
+    # Verify the new columns are present
+    assert "silhouette_mean_cluster" in result_df.columns
+    assert "silhouette_std_cluster" in result_df.columns
+
+    # Each stock should have non-null per-cluster silhouette values
+    assert result_df["silhouette_mean_cluster"].null_count() == 0
+    assert result_df["silhouette_std_cluster"].null_count() == 0
+
+    # Stocks in the same cluster should have the same mean silhouette
+    for cluster_id in result_df["cluster_id"].unique().to_list():
+        cluster_rows = result_df.filter(pl.col("cluster_id") == cluster_id)
+        means = cluster_rows["silhouette_mean_cluster"].unique()
+        assert len(means) == 1, f"All rows in cluster {cluster_id} should have identical mean"

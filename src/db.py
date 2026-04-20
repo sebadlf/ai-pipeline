@@ -141,6 +141,8 @@ cluster_assignments = Table(
     Column("sector", String(100), nullable=False),
     Column("cluster_id", String(50), nullable=False),
     Column("silhouette_score", Float),
+    Column("silhouette_mean_cluster", Float),
+    Column("silhouette_std_cluster", Float),
     UniqueConstraint("run_date", "symbol", name="uq_cluster_run_symbol"),
 )
 
