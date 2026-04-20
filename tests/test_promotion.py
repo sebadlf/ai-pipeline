@@ -298,6 +298,58 @@ class TestCascadingCompare:
         assert beats is False
         assert "failed filters" in reason
 
+    def test_calibrated_candidate_beats_uncalibrated_champion(self, cascading_cfg: dict) -> None:
+        """BEC-39: an isotonic-calibrated candidate wins over a pre-calibration champion
+
+        even when the legacy champion has a higher raw stability score.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.55,
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.70,
+            # No isotonic_fitted metric → legacy pre-BEC-37 run
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "isotonic-calibrated" in reason
+
+    def test_calibrated_champion_vs_calibrated_candidate_uses_score(
+        self, cascading_cfg: dict
+    ) -> None:
+        """When both are calibrated, comparison falls back to stability score."""
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.55,
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.70,
+            "isotonic_fitted": 1.0,
+        }
+        beats, _ = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+
+    def test_uncalibrated_candidate_does_not_beat_calibrated_champion(
+        self, cascading_cfg: dict
+    ) -> None:
+        """An uncalibrated candidate does not get special preference."""
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.55,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.70,
+            "isotonic_fitted": 1.0,
+        }
+        beats, _ = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+
 
 # --------------------------------------------------------------------------- #
 # _find_best_candidate tier fallback                                           #
@@ -333,6 +385,60 @@ def _make_client_with_checkpoints(run_ids_with_ckpt: set[str]):
 
 
 class TestFindBestCandidateTierFallback:
+    def test_tier1_prefers_calibrated_run_within_tier(self) -> None:
+        """BEC-39: within tier 1, a calibrated run beats a non-calibrated run
+
+        even if the non-calibrated run has a higher stability score.
+        """
+        cfg = {"evaluation": {"primary_threshold": 0.60}}
+        non_calibrated_higher_score = _make_run(
+            "legacy",
+            metrics={
+                "val_stability_score": 0.85,
+                "val_precision_up": 0.70,
+            },
+            params={"val_passed_all_filters": "true"},
+            end_time=100,
+        )
+        calibrated_lower_score = _make_run(
+            "calibrated",
+            metrics={
+                "val_stability_score": 0.80,
+                "val_precision_up": 0.70,
+                "isotonic_fitted": 1.0,
+            },
+            params={"val_passed_all_filters": "true"},
+            end_time=200,
+        )
+        client = _make_client_with_checkpoints({"legacy", "calibrated"})
+        run, ckpt = _find_best_candidate(
+            client,
+            [non_calibrated_higher_score, calibrated_lower_score],
+            cfg,
+            cluster_id="C",
+        )
+        assert run is calibrated_lower_score
+        assert ckpt == "model.ckpt"
+
+    def test_tier1_picks_best_score_when_both_calibrated(self) -> None:
+        """When both runs are calibrated, stability score still decides within tier."""
+        cfg = {"evaluation": {"primary_threshold": 0.60}}
+        lower_score = _make_run(
+            "low",
+            metrics={"val_stability_score": 0.70, "isotonic_fitted": 1.0},
+            params={"val_passed_all_filters": "true"},
+            end_time=100,
+        )
+        higher_score = _make_run(
+            "high",
+            metrics={"val_stability_score": 0.80, "isotonic_fitted": 1.0},
+            params={"val_passed_all_filters": "true"},
+            end_time=50,
+        )
+        client = _make_client_with_checkpoints({"low", "high"})
+        run, _ = _find_best_candidate(client, [lower_score, higher_score], cfg, cluster_id="C")
+        assert run is higher_score
+
     def test_tier1_selects_passed_filter_run(self) -> None:
         cfg = {"evaluation": {"primary_threshold": 0.60}}
         tier1_run = _make_run(
