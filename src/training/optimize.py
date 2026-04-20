@@ -38,6 +38,7 @@ from src.config import (
     SplitDates,
     compute_cv_fold_splits,
     compute_split_dates,
+    effective_config_for_cluster,
     get_cluster_buy_threshold,
     get_normalized_parquet_path,
     load_config,
@@ -969,6 +970,10 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
         config: Full config dict.
         cluster_id: Cluster identifier (e.g. "Technology_0").
     """
+    # Apply per-cluster Optuna overrides (e.g., tighter max_overfit_gap for
+    # clusters prone to val-test gaps) before reading the optuna sub-config.
+    config = effective_config_for_cluster(config, cluster_id)
+
     split_dates = compute_split_dates(config)
     buy_thresh = get_cluster_buy_threshold(config, cluster_id)
     cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))

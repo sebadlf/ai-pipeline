@@ -164,6 +164,36 @@ training:
       num_attention_heads: 0
       activation: "gelu"
       feature_mask_rate: 0.10
+    # Per-cluster overrides for Optuna search/fixed params and scalar settings.
+    # Values here are merged on top of the base `optuna` section for the
+    # specified cluster_id (see src.config.get_cluster_optuna_config).
+    # Use this to tighten controls for clusters with known val-to-test precision
+    # gaps without regressing the baseline for other clusters.
+    per_cluster_overrides:
+      # Clusters with largest val→test precision gap in cycle 1 (BEC-38):
+      #   Utilities: 0.59 → 0.44 (-15pp)
+      #   FinancialServices: 0.50 → 0.39 (-11pp)
+      #   RealEstate: 0.46 → 0.36 (-10pp)
+      # Override rationale: tighter overfit gap, reduced model capacity,
+      # stronger feature masking to shrink val-test gap to <0.08.
+      Utilities:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      FinancialServices:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      RealEstate:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation
