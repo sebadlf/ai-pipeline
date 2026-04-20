@@ -121,6 +121,11 @@ def _summarize_experiment(
     latest: LatestRunInfo | None = None
 
     for r in runs:
+        # Skip runs tagged by mlflow_housekeeping as error archives so they
+        # don't inflate run counts or pollute best-metric aggregations.
+        if r.data.tags.get("housekeeping") == "error_archive":
+            continue
+
         status_counts[r.info.status] += 1
         if latest is None:
             latest = LatestRunInfo(
