@@ -1,8 +1,18 @@
 """Tests for promotion score comparison logic."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import mlflow.exceptions
 import pytest
 
-from src.evaluation.promote import build_score_tuple, candidate_beats_champion, cascading_compare
+from src.evaluation.promote import (
+    _count_registered_champions,
+    _find_best_candidate,
+    build_score_tuple,
+    candidate_beats_champion,
+    cascading_compare,
+)
 
 # --------------------------------------------------------------------------- #
 # Default promotion config for tests                                           #
@@ -155,12 +165,14 @@ class TestCascadingCompare:
         assert "no existing champion" in reason
 
     def test_candidate_fails_filters(self, cascading_cfg: dict) -> None:
+        """With an existing champion, a filter-failing candidate is rejected."""
         cand = {
             "val_passed_all_filters": "false",
             "val_elimination_stage": "failed_stability",
             "val_stability_score": 0.80,
         }
-        beats, reason = cascading_compare(cand, None, cascading_cfg)
+        champ = {"val_passed_all_filters": "true", "val_stability_score": 0.60}
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
         assert beats is False
         assert "failed filters" in reason
 
@@ -248,3 +260,161 @@ class TestCascadingCompare:
         beats, reason = candidate_beats_champion(cand, None, cascading_cfg)
         assert beats is True
         assert "no existing champion" in reason
+
+    def test_cascading_no_champion_cold_start_promotes_failed_filters(
+        self, cascading_cfg: dict
+    ) -> None:
+        """Cold-start: when no champion exists, promote even if filters failed.
+
+        Guarantees every cluster ends up with at least one registered version.
+        """
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_stability",
+            "val_stability_score": 0.40,
+        }
+        beats, reason = cascading_compare(cand, None, cascading_cfg)
+        assert beats is True
+        assert "fallback" in reason
+        assert "failed_stability" in reason
+
+    def test_cascading_no_champion_cold_start_missing_score(self, cascading_cfg: dict) -> None:
+        """Cold-start path handles a missing stability_score gracefully."""
+        cand = {"val_passed_all_filters": "false", "val_elimination_stage": "unknown"}
+        beats, reason = cascading_compare(cand, None, cascading_cfg)
+        assert beats is True
+        assert "no existing champion" in reason
+
+    def test_cascading_existing_champion_still_rejects_failed_filters(
+        self, cascading_cfg: dict
+    ) -> None:
+        """With an existing champion, filter-failing candidate is rejected."""
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_stability",
+        }
+        champ = {"val_passed_all_filters": "true", "val_stability_score": 0.60}
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "failed filters" in reason
+
+
+# --------------------------------------------------------------------------- #
+# _find_best_candidate tier fallback                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _make_run(
+    run_id: str,
+    metrics: dict | None = None,
+    params: dict | None = None,
+    end_time: int = 0,
+):
+    """Build a minimal MLflow-run-like object for tier selection tests."""
+    return SimpleNamespace(
+        info=SimpleNamespace(run_id=run_id, end_time=end_time),
+        data=SimpleNamespace(metrics=metrics or {}, params=params or {}, tags={}),
+    )
+
+
+def _make_client_with_checkpoints(run_ids_with_ckpt: set[str]):
+    """Build a MlflowClient stub whose list_artifacts returns a .ckpt for specific runs."""
+
+    client = MagicMock()
+
+    def list_artifacts(run_id, path=None):
+        if run_id in run_ids_with_ckpt and path is None:
+            return [SimpleNamespace(path="model.ckpt", is_dir=False)]
+        return []
+
+    client.list_artifacts.side_effect = list_artifacts
+    client.set_tag.return_value = None
+    return client
+
+
+class TestFindBestCandidateTierFallback:
+    def test_tier1_selects_passed_filter_run(self) -> None:
+        cfg = {"evaluation": {"primary_threshold": 0.60}}
+        tier1_run = _make_run(
+            "tier1",
+            metrics={"val_stability_score": 0.80, "val_precision_up": 0.70},
+            params={"val_passed_all_filters": "true"},
+            end_time=100,
+        )
+        tier4_only_run = _make_run(
+            "tier4only",
+            metrics={"val_precision_up": 0.55},
+            params={
+                "val_passed_all_filters": "false",
+                "val_elimination_stage": "unknown",
+            },
+            end_time=200,
+        )
+        client = _make_client_with_checkpoints({"tier1", "tier4only"})
+        run, ckpt = _find_best_candidate(client, [tier1_run, tier4_only_run], cfg, cluster_id="C")
+        assert run is tier1_run
+        assert ckpt == "model.ckpt"
+
+    def test_tier4_fallback_when_all_filters_fail(self) -> None:
+        """Every run failed filters with 'unknown' stage → tier 4 still fires."""
+        cfg = {"evaluation": {"primary_threshold": 0.60}}
+        older = _make_run(
+            "older",
+            metrics={"val_precision_up": 0.45},
+            params={"val_passed_all_filters": "false"},
+            end_time=100,
+        )
+        newer = _make_run(
+            "newer",
+            metrics={"val_precision_up": 0.40},
+            params={"val_passed_all_filters": "false"},
+            end_time=500,  # more recent, should win tier-4 sort
+        )
+        client = _make_client_with_checkpoints({"older", "newer"})
+        run, ckpt = _find_best_candidate(client, [older, newer], cfg, cluster_id="C")
+        assert run is newer
+        assert ckpt == "model.ckpt"
+
+    def test_returns_none_when_no_checkpoint(self) -> None:
+        cfg = {"evaluation": {"primary_threshold": 0.60}}
+        run_no_ckpt = _make_run("nockpt", params={"val_passed_all_filters": "true"})
+        client = _make_client_with_checkpoints(set())
+        run, ckpt = _find_best_candidate(client, [run_no_ckpt], cfg, cluster_id="C")
+        assert run is None
+        assert ckpt is None
+
+    def test_legacy_mode_returns_first_run_with_checkpoint(self) -> None:
+        """Legacy mode (no 'evaluation' key) returns the most recent run with ckpt."""
+        cfg = {"primary_metric": "val_acc"}
+        first = _make_run("first", end_time=200)
+        second = _make_run("second", end_time=100)
+        client = _make_client_with_checkpoints({"first", "second"})
+        run, ckpt = _find_best_candidate(client, [first, second], cfg, cluster_id="C")
+        assert run is first
+        assert ckpt == "model.ckpt"
+
+
+# --------------------------------------------------------------------------- #
+# _count_registered_champions                                                  #
+# --------------------------------------------------------------------------- #
+
+
+class TestCountRegisteredChampions:
+    def test_returns_only_clusters_with_champion_alias(self) -> None:
+        client = MagicMock()
+
+        def get_alias(name, alias):
+            if name == "trading-forecaster-A":
+                return SimpleNamespace(version="1")
+            raise mlflow.exceptions.MlflowException(f"no champion for {name}")
+
+        client.get_model_version_by_alias.side_effect = get_alias
+
+        registered = _count_registered_champions(client, ["A", "B", "C"])
+        assert registered == ["A"]
+
+    def test_all_missing_returns_empty(self) -> None:
+        client = MagicMock()
+        client.get_model_version_by_alias.side_effect = mlflow.exceptions.MlflowException("missing")
+        registered = _count_registered_champions(client, ["A", "B"])
+        assert registered == []
