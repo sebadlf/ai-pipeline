@@ -90,6 +90,10 @@ training:
     max_temp: 2.5               # upper bound — T>2.5 is pathological for threshold-based systems
     min_signal_rate: 0.03       # at least 3% of predictions should exceed primary_threshold
     signal_penalty_alpha: 5.0   # weight of signal-preservation penalty in composite objective
+    isotonic:
+      enabled: true             # post-hoc isotonic regression on val set (after temperature)
+      min_samples: 200          # minimum val predictions required to fit (skip otherwise)
+      max_knots: 64             # compact piecewise-linear representation stored in checkpoint
   max_workers:
     dev: 4                    # parallel cluster training workers
     prod: 4
