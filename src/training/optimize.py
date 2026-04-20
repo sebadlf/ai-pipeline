@@ -910,6 +910,120 @@ def _purge_old_trials(study: optuna.Study, max_history_days: int) -> int:
     return len(recent)
 
 
+def _categorical_search_space(search_space: dict) -> dict[str, list]:
+    """Return only the categorical (list-valued) entries of the search space.
+
+    Optuna's `CategoricalDistribution` is immutable — once a value has been
+    suggested in a study, that value must remain in the categorical choices
+    for every subsequent trial. Continuous ranges (`{low, high}` dicts) can
+    be widened/narrowed without breaking the study.
+    """
+    return {
+        name: list(choices) for name, choices in search_space.items() if isinstance(choices, list)
+    }
+
+
+def _study_has_incompatible_categorical_values(
+    study: optuna.Study, search_space: dict
+) -> tuple[bool, str | None]:
+    """Check whether any persisted trial used a categorical value outside the
+    current search space.
+
+    Returns (is_incompatible, diagnostic_message). A positive result means the
+    study must be rebuilt under a new name — Optuna raises
+    `CategoricalDistribution does not support dynamic value space` (or
+    `ValueError: '<v>' not in (...)`) on the next `suggest_categorical` call
+    otherwise.
+    """
+    categorical = _categorical_search_space(search_space)
+    if not categorical:
+        return False, None
+
+    for trial in study.trials:
+        for param_name, allowed in categorical.items():
+            if param_name not in trial.params:
+                continue
+            value = trial.params[param_name]
+            if value not in allowed:
+                return True, (
+                    f"trial #{trial.number} used {param_name}={value!r}, "
+                    f"not in current choices {allowed}"
+                )
+    return False, None
+
+
+def _categorical_space_signature(search_space: dict) -> str:
+    """Stable short signature of the categorical search space.
+
+    Used to derive a deterministic study-name suffix so that shrinking any
+    categorical range produces a fresh study while keeping the same shape
+    across runs (deterministic warm-starting). Continuous params are
+    intentionally excluded — they can be resized in-place without breaking
+    Optuna.
+    """
+    import hashlib
+
+    categorical = _categorical_search_space(search_space)
+    if not categorical:
+        return ""
+    # Sorted tuples keep the hash stable across dict ordering and order of
+    # the choice list itself.
+    payload = json.dumps(
+        {k: sorted(map(str, v)) for k, v in sorted(categorical.items())},
+        sort_keys=True,
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def _resolve_cluster_study_name(
+    cluster_id: str,
+    optuna_cfg: dict,
+    storage: str | None,
+) -> str:
+    """Return the study name to use for a cluster, bumping to a fresh study
+    when the persisted categorical search space is incompatible with the
+    current config.
+
+    The base name is ``cluster-v2/{cluster_id}``. If trials persisted under
+    that name used a categorical value that is no longer in the search space
+    (see BEC-46), a suffix derived from the current categorical space hash
+    is appended: ``cluster-v2/{cluster_id}#<sig>``. This keeps per-cluster
+    overrides (e.g., narrowing ``hidden_size`` from [64,96,128] to [64,96]
+    for a subset of clusters) from poisoning sibling clusters' warm-start
+    history while guaranteeing that running the same config twice hits the
+    same study.
+
+    NOTE: whenever a categorical search-space entry shrinks, the signature
+    changes and a new study is created automatically. Continuous params do
+    not require this — Optuna accepts range edits in place.
+    """
+    base = f"cluster-v2/{cluster_id}"
+    search_space = optuna_cfg.get("search_space", {}) or {}
+
+    if not storage:
+        return base
+
+    # Peek at the existing study without creating a fresh one. If it doesn't
+    # exist yet, nothing to fix up.
+    try:
+        existing = optuna.load_study(study_name=base, storage=storage)
+    except (KeyError, ValueError):
+        return base
+
+    incompatible, diagnostic = _study_has_incompatible_categorical_values(existing, search_space)
+    if not incompatible:
+        return base
+
+    signature = _categorical_space_signature(search_space)
+    new_name = f"{base}#{signature}" if signature else base
+    print(
+        f"  Optuna: persisted study {base!r} has incompatible categorical "
+        f"values ({diagnostic}). Using fresh study {new_name!r} to avoid "
+        f"CategoricalDistribution dynamic-value-space crash (see BEC-46)."
+    )
+    return new_name
+
+
 def _tag_champion(run_ids: list[str], cluster_id: str) -> None:
     """Tag the best ensemble run as 'champion' based on generalization-adjusted score.
 
@@ -1003,10 +1117,16 @@ def optimize_cluster(config: dict, cluster_id: str) -> None:
     else:
         print("  Optuna storage: in-memory (no persistence)")
 
-    # Create or load existing study (v2 = per-cluster with CV + ensemble)
+    # Create or load existing study (v2 = per-cluster with CV + ensemble).
+    # NOTE: whenever the categorical search space shrinks (e.g., per-cluster
+    # override removes a `hidden_size` option), we transparently bump to a
+    # fresh study name derived from the current categorical-space hash to
+    # avoid Optuna's "CategoricalDistribution does not support dynamic value
+    # space" crash (BEC-46).
+    study_name = _resolve_cluster_study_name(cluster_id, optuna_cfg, storage)
     study = optuna.create_study(
         direction="maximize",
-        study_name=f"cluster-v2/{cluster_id}",
+        study_name=study_name,
         storage=storage,
         load_if_exists=True,
         pruner=optuna.pruners.MedianPruner(
