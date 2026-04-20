@@ -113,6 +113,24 @@ def cascading_compare(
         return True, f"champion missing stability_score, candidate has {cand_score:.4f}"
     champ_score = float(champ_score)
 
+    # Calibration preference (BEC-39): a calibrated candidate (isotonic_fitted == 1.0)
+    # strictly beats a non-calibrated champion, even if the candidate's stability
+    # score is lower. This ensures BEC-37/BEC-38 fixes take effect on clusters
+    # whose legacy (pre-calibration) champion still wins on raw score.
+    def _is_calibrated(metrics: dict[str, Any]) -> bool:
+        try:
+            return float(metrics.get("isotonic_fitted", 0)) >= 1.0
+        except (TypeError, ValueError):
+            return False
+
+    cand_calibrated = _is_calibrated(cand_metrics)
+    champ_calibrated = _is_calibrated(champ_metrics)
+    if cand_calibrated and not champ_calibrated:
+        return True, (
+            f"candidate is isotonic-calibrated and champion is not "
+            f"(cand_score={cand_score:.4f}, champ_score={champ_score:.4f})"
+        )
+
     # Compare stability scores
     margin = eval_config.tiebreak_margin
     if cand_score > champ_score + margin:
@@ -247,7 +265,11 @@ def _find_best_candidate(
         )
         return None, None
 
-    # Cascading: collect all runs with checkpoints and classify into tiers
+    # Cascading: collect all runs with checkpoints and classify into tiers.
+    # Each tier entry is (run, ckpt, is_calibrated, score) where is_calibrated is 1
+    # for runs with isotonic_fitted == 1.0 (BEC-37 post-calibration), 0 otherwise.
+    # Calibrated runs are preferred within a tier so BEC-37/BEC-38 fixes applied in
+    # newer runs actually win against legacy pre-calibration champions.
     tier1 = []  # Passed all filters, ranked by stability_score
     tier2 = []  # Failed signals/coverage only, ranked by val_precision_up * gen_ratio
     tier3 = []  # Failed any single filter, ranked by val_precision_up * gen_ratio
@@ -268,6 +290,12 @@ def _find_best_candidate(
         val_prec = float(all_metrics.get("val_precision_up", 0.0))
         test_prec = float(all_metrics.get("test_precision_up", 0.0))
 
+        # Calibration flag (BEC-37): prefer runs that logged isotonic_fitted == 1.0.
+        try:
+            is_calibrated = 1 if float(all_metrics.get("isotonic_fitted", 0)) >= 1.0 else 0
+        except (TypeError, ValueError):
+            is_calibrated = 0
+
         # Generalization ratio for ranking
         gen_ratio = min(test_prec / val_prec, 1.0) if val_prec > 0 and test_prec > 0 else 0.5
         adjusted_score = val_prec * (1.0 + gen_ratio) / 2.0
@@ -275,20 +303,20 @@ def _find_best_candidate(
         # Tier 4 is the final fallback: every run with a checkpoint qualifies,
         # ranked by end_time so the most recent wins if nothing else does.
         tier4_score = float(run.info.end_time or 0)
-        tier4.append((run, ckpt, tier4_score))
+        tier4.append((run, ckpt, is_calibrated, tier4_score))
 
         if passed == "true" and score is not None:
-            tier1.append((run, ckpt, float(score)))
+            tier1.append((run, ckpt, is_calibrated, float(score)))
         elif elim_stage in ("failed_signals", "failed_coverage"):
-            tier2.append((run, ckpt, adjusted_score))
+            tier2.append((run, ckpt, is_calibrated, adjusted_score))
         elif elim_stage != "unknown":
-            tier3.append((run, ckpt, adjusted_score))
+            tier3.append((run, ckpt, is_calibrated, adjusted_score))
 
-    # Try tiers in order
+    # Try tiers in order; within a tier, prefer calibrated runs, then by score.
     for tier_num, tier in [(1, tier1), (2, tier2), (3, tier3), (4, tier4)]:
         if tier:
-            tier.sort(key=lambda x: x[2], reverse=True)
-            best_run, best_ckpt, _best_score = tier[0]
+            tier.sort(key=lambda x: (x[2], x[3]), reverse=True)
+            best_run, best_ckpt, _best_cal, _best_score = tier[0]
             # Log the promotion tier; if MLflow tagging fails, continue promoting.
             try:
                 client.set_tag(best_run.info.run_id, "promotion_tier", str(tier_num))
