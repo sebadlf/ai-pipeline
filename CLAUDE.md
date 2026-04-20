@@ -463,6 +463,16 @@ make mlflow-report
 make mlflow-runs-report
 ```
 
+## Autonomous improvement loop
+
+Slash commands under `.claude/commands/pipeline-*.md` implement an autonomous loop that runs the pipeline, analyzes results across all 7 stages, proposes improvements as Linear issues (label `pipeline-auto`), implements them serially (one PR per issue with active CI/merge recovery), and exits when the analysis phase declares `plateau`/`unclear`, the 20-cycle budget is exhausted, or 3 consecutive PR abandons trip the circuit breaker. On clean exit the coordinator hands off to `make pipeline-loop`.
+
+- **Entry point**: `/pipeline-loop` — coordinator. Detects state, delegates each phase to an isolated subagent, reschedules itself via `ScheduleWakeup` until an exit condition fires.
+- **Phase commands**: `/pipeline-run`, `/pipeline-analyze`, `/pipeline-propose`, `/pipeline-implement`, `/pipeline-cleanup` — each runnable standalone for manual use or by the coordinator.
+- **Deterministic helpers**: `src/pipeline_loop/` — `state` (JSON state + verdict + loop log), `mlflow_helpers` (run count / days since cleanup), `merge` (PR polling + terminal classification). Invocable via `uv run python -m src.pipeline_loop.<module>`.
+- **Artifacts**: `ai-pipeline-vault/projects/ai-pipeline/pipeline-loop/` holds `state.json`, `verdict.json`, `loop-log.md`, and `reports/YYYY-MM-DD-cycle-N.md`.
+- **Stop flag**: create `data/.loop-stop` to force-exit at the next iteration; the Linear label `loop-stop` on any open issue does the same.
+
 ## External References
 
 - **Linear team**: `Becerra` (prefix `BEC`). Use the Linear MCP (`mcp__linear__*`) to read/create/update issues. Issues de este repo van con label o sub-project `ai-pipeline`.
