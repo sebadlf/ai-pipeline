@@ -136,3 +136,60 @@ def test_effective_config_for_cluster_no_override(base_config):
     # Shallow-copied: top-level dict is a new object
     assert effective is not base_config
     assert effective["training"] is not base_config["training"]
+
+
+@pytest.mark.parametrize(
+    "cluster_id",
+    [
+        # BEC-38 original trio
+        "Utilities",
+        "FinancialServices",
+        "RealEstate",
+        # BEC-42 extended set (train-val gap > 0.15 in cycle 2)
+        "Miscellaneous",
+        "ConsumerCyclical",
+        "CommunicationServices-Industrials",
+        "BasicMaterials",
+        "Healthcare",
+    ],
+)
+def test_default_yaml_applies_overfit_overrides(cluster_id):
+    """Every overfitting-prone cluster listed in CLAUDE.md gets tightened overrides.
+
+    Guards against accidental removal/typo in configs/default.yaml. The override
+    contract (BEC-38, BEC-42) is:
+    - max_overfit_gap <= 0.15
+    - hidden_size restricted to [64, 96]
+    - feature_mask_rate >= 0.15
+    """
+    from src.config import get_cluster_optuna_config, load_config
+
+    config = load_config()
+    resolved = get_cluster_optuna_config(config, cluster_id)
+
+    assert resolved["max_overfit_gap"] == 0.15, f"{cluster_id} should have max_overfit_gap=0.15"
+    assert resolved["search_space"]["hidden_size"] == [64, 96], (
+        f"{cluster_id} should cap hidden_size at [64, 96]"
+    )
+    assert resolved["fixed_params"]["feature_mask_rate"] == 0.15, (
+        f"{cluster_id} should use feature_mask_rate=0.15"
+    )
+
+
+def test_default_yaml_leaves_unlisted_clusters_on_base():
+    """Clusters not in the override list keep the base Optuna settings.
+
+    Sanity check: we shouldn't accidentally be tightening every cluster.
+    """
+    from src.config import get_cluster_optuna_config, load_config
+
+    config = load_config()
+    base_gap = config["training"]["optuna"]["max_overfit_gap"]
+
+    # Technology and Energy were explicitly called out in BEC-42 as clusters
+    # whose val-test gap is already small; they should NOT be overridden.
+    for cluster_id in ("Technology", "Energy"):
+        resolved = get_cluster_optuna_config(config, cluster_id)
+        assert resolved["max_overfit_gap"] == base_gap, (
+            f"{cluster_id} should inherit base max_overfit_gap"
+        )

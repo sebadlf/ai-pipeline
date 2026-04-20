@@ -176,6 +176,17 @@ training:
       #   RealEstate: 0.46 → 0.36 (-10pp)
       # Override rationale: tighter overfit gap, reduced model capacity,
       # stronger feature masking to shrink val-test gap to <0.08.
+      #
+      # BEC-42 extended overrides to all clusters with cycle-2
+      # train_acc - val_acc > 0.15:
+      #   Miscellaneous: +0.31
+      #   ConsumerCyclical: +0.20
+      #   CommunicationServices-Industrials: +0.17
+      #   BasicMaterials: +0.16
+      #   Healthcare: +0.14 (rounded-up boundary; reports showed a
+      #     widening trend worth pre-empting)
+      # Same rationale as the BEC-38 trio: tighter overfit gap,
+      # reduced capacity, stronger feature masking.
       Utilities:
         max_overfit_gap: 0.15
         search_space:
@@ -189,6 +200,36 @@ training:
         fixed_params:
           feature_mask_rate: 0.15
       RealEstate:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      Miscellaneous:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      ConsumerCyclical:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      CommunicationServices-Industrials:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      BasicMaterials:
+        max_overfit_gap: 0.15
+        search_space:
+          hidden_size: [64, 96]
+        fixed_params:
+          feature_mask_rate: 0.15
+      Healthcare:
         max_overfit_gap: 0.15
         search_space:
           hidden_size: [64, 96]
