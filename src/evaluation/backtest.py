@@ -37,6 +37,12 @@ class Position:
     cost_basis: float
 
 
+# Minimum sample thresholds below which risk-adjusted metrics are unreliable.
+# Keep in sync with docs and report legend.
+MIN_TRADES_FOR_METRICS = 30
+MIN_DRAWDOWN_PCT_FOR_METRICS = 0.005  # 0.5% expressed as fraction
+
+
 @dataclass
 class BacktestResult:
     """Container for backtest metrics."""
@@ -57,6 +63,9 @@ class BacktestResult:
     equity_curve: list[float] = field(default_factory=list)
     profile: str = ""
     regime: str = ""
+    benchmark_annual_return: float = 0.0
+    tracking_error: float = 0.0
+    insufficient_sample: bool = False
 
 
 def run_portfolio_backtest(
@@ -311,21 +320,44 @@ def run_portfolio_backtest(
     win_rate = winning / len(trade_returns) if trade_returns else 0.0
     avg_trade = float(np.mean(trade_returns)) if trade_returns else 0.0
 
+    num_trades = len(trade_returns)
+    max_dd = all_metrics["max_drawdown"]
+
+    # Guard against divide-by-zero / small-sample metrics. When the sample is too
+    # small (few trades) or the drawdown denominator is too tight, Sharpe/Sortino/
+    # Calmar explode into meaningless ranges. Surface them as NaN so downstream
+    # reports can flag the row as insufficient data instead of treating the
+    # artifact as a real signal.
+    insufficient = num_trades < MIN_TRADES_FOR_METRICS or max_dd < MIN_DRAWDOWN_PCT_FOR_METRICS
+    if insufficient:
+        sharpe_val = float("nan")
+        sortino_val = float("nan")
+        calmar_val = float("nan")
+        omega_val = float("nan")
+    else:
+        sharpe_val = all_metrics["sharpe"]
+        sortino_val = all_metrics["sortino"]
+        calmar_val = all_metrics["calmar"]
+        omega_val = all_metrics["omega"]
+
     return BacktestResult(
         total_return=total_return,
         annual_return=annual_return,
-        sharpe_ratio=all_metrics["sharpe"],
-        sortino_ratio=all_metrics["sortino"],
-        calmar_ratio=all_metrics["calmar"],
-        omega_ratio=all_metrics["omega"],
+        sharpe_ratio=sharpe_val,
+        sortino_ratio=sortino_val,
+        calmar_ratio=calmar_val,
+        omega_ratio=omega_val,
         info_ratio=all_metrics["information"],
-        max_drawdown=all_metrics["max_drawdown"],
+        max_drawdown=max_dd,
         win_rate=win_rate,
-        num_trades=len(trade_returns),
+        num_trades=num_trades,
         avg_trade_return=avg_trade,
         final_value=final_value,
         circuit_breaker_triggered=circuit_breaker or (cooldown_until is not None),
         equity_curve=equity_curve,
+        benchmark_annual_return=all_metrics.get("benchmark_annual_return", 0.0),
+        tracking_error=all_metrics.get("tracking_error", 0.0),
+        insufficient_sample=insufficient,
     )
 
 
@@ -492,12 +524,21 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
             result.profile = profile
             result.regime = regime_type
 
+            def _p(v: float) -> str:
+                return "n/a" if not np.isfinite(v) else f"{v:.3f}"
+
             print(f"  Return: {result.total_return:+.2%}")
-            print(f"  Sharpe: {result.sharpe_ratio:.3f}  Sortino: {result.sortino_ratio:.3f}")
-            print(f"  Calmar: {result.calmar_ratio:.3f}  Omega: {result.omega_ratio:.3f}")
+            print(f"  Sharpe: {_p(result.sharpe_ratio)}  Sortino: {_p(result.sortino_ratio)}")
+            print(f"  Calmar: {_p(result.calmar_ratio)}  Omega: {_p(result.omega_ratio)}")
             print(f"  Info Ratio: {result.info_ratio:.3f}")
+            print(
+                f"  Bench Ann Ret: {result.benchmark_annual_return:+.2%}  "
+                f"Tracking Err: {result.tracking_error:.2%}"
+            )
             print(f"  Max DD: {result.max_drawdown:.2%}  Win Rate: {result.win_rate:.2%}")
             print(f"  Trades: {result.num_trades}  Final: ${result.final_value:,.2f}")
+            if result.insufficient_sample:
+                print("  [flag] insufficient_sample -- risk ratios suppressed")
 
             results.append(result)
 
@@ -522,6 +563,11 @@ def save_backtest_results(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save to database
+    def _nan_to_none(value: float) -> float | None:
+        """Convert non-finite floats to None so Postgres stores SQL NULL
+        instead of 'NaN' / 'Infinity' which complicates downstream queries."""
+        return None if not np.isfinite(value) else float(value)
+
     engine = get_engine()
     with engine.begin() as conn:
         for r in results:
@@ -552,32 +598,42 @@ def save_backtest_results(
                     "run_date": run_date,
                     "profile": r.profile,
                     "regime": r.regime,
-                    "total_return": r.total_return,
-                    "annual_return": r.annual_return,
-                    "sharpe_ratio": r.sharpe_ratio,
-                    "sortino_ratio": r.sortino_ratio,
-                    "calmar_ratio": r.calmar_ratio,
-                    "omega_ratio": r.omega_ratio,
-                    "info_ratio": r.info_ratio,
-                    "max_drawdown": r.max_drawdown,
-                    "win_rate": r.win_rate,
+                    "total_return": _nan_to_none(r.total_return),
+                    "annual_return": _nan_to_none(r.annual_return),
+                    "sharpe_ratio": _nan_to_none(r.sharpe_ratio),
+                    "sortino_ratio": _nan_to_none(r.sortino_ratio),
+                    "calmar_ratio": _nan_to_none(r.calmar_ratio),
+                    "omega_ratio": _nan_to_none(r.omega_ratio),
+                    "info_ratio": _nan_to_none(r.info_ratio),
+                    "max_drawdown": _nan_to_none(r.max_drawdown),
+                    "win_rate": _nan_to_none(r.win_rate),
                     "num_trades": r.num_trades,
                 },
             )
 
     # Generate markdown report
+    def _fmt_ratio(value: float) -> str:
+        return "n/a (insufficient data)" if not np.isfinite(value) else f"{value:.3f}"
+
     report_path = output_dir / f"backtest_{run_date}.md"
     lines = [
         f"# Backtest Report — {run_date}\n",
-        "| Profile | Regime | Return | Sharpe | Sortino | Calmar | Omega | Info | Max DD | Win Rate | Trades |",  # noqa: E501
-        "|---------|--------|--------|--------|---------|--------|-------|------|--------|----------|--------|",  # noqa: E501
+        "Rows flagged `insufficient_sample` (n_trades < "
+        f"{MIN_TRADES_FOR_METRICS} or max_dd < "
+        f"{MIN_DRAWDOWN_PCT_FOR_METRICS:.1%}) report `n/a (insufficient data)` for "
+        "Sharpe/Sortino/Calmar/Omega.\n",
+        "| Profile | Regime | Return | Sharpe | Sortino | Calmar | Omega | Info | Bench Ann Ret | Tracking Err | Max DD | Win Rate | Trades | Flag |",  # noqa: E501
+        "|---------|--------|--------|--------|---------|--------|-------|------|---------------|--------------|--------|----------|--------|------|",  # noqa: E501
     ]
     for r in results:
+        flag = "insufficient_sample" if r.insufficient_sample else ""
         lines.append(
             f"| {r.profile} | {r.regime} | {r.total_return:+.2%} | "
-            f"{r.sharpe_ratio:.3f} | {r.sortino_ratio:.3f} | {r.calmar_ratio:.3f} | "
-            f"{r.omega_ratio:.3f} | {r.info_ratio:.3f} | {r.max_drawdown:.2%} | "
-            f"{r.win_rate:.2%} | {r.num_trades} |"
+            f"{_fmt_ratio(r.sharpe_ratio)} | {_fmt_ratio(r.sortino_ratio)} | "
+            f"{_fmt_ratio(r.calmar_ratio)} | {_fmt_ratio(r.omega_ratio)} | "
+            f"{r.info_ratio:.3f} | {r.benchmark_annual_return:+.2%} | "
+            f"{r.tracking_error:.2%} | {r.max_drawdown:.2%} | "
+            f"{r.win_rate:.2%} | {r.num_trades} | {flag} |"
         )
     lines.append("")
 
@@ -602,18 +658,23 @@ def main() -> None:
     save_backtest_results(results, config)
 
     # Log to MLflow
+    def _log_finite(name: str, value: float) -> None:
+        if np.isfinite(value):
+            mlflow.log_metric(name, value)
+
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment("backtesting")
     with mlflow.start_run(run_name="regime-backtest"):
         for r in results:
             prefix = f"{r.profile}_{r.regime}"
-            mlflow.log_metric(f"{prefix}_return", r.total_return)
-            mlflow.log_metric(f"{prefix}_sharpe", r.sharpe_ratio)
-            mlflow.log_metric(f"{prefix}_sortino", r.sortino_ratio)
-            mlflow.log_metric(f"{prefix}_calmar", r.calmar_ratio)
-            mlflow.log_metric(f"{prefix}_omega", r.omega_ratio)
-            mlflow.log_metric(f"{prefix}_info", r.info_ratio)
-            mlflow.log_metric(f"{prefix}_max_dd", r.max_drawdown)
+            _log_finite(f"{prefix}_return", r.total_return)
+            _log_finite(f"{prefix}_sharpe", r.sharpe_ratio)
+            _log_finite(f"{prefix}_sortino", r.sortino_ratio)
+            _log_finite(f"{prefix}_calmar", r.calmar_ratio)
+            _log_finite(f"{prefix}_omega", r.omega_ratio)
+            _log_finite(f"{prefix}_info", r.info_ratio)
+            _log_finite(f"{prefix}_max_dd", r.max_drawdown)
+            mlflow.set_tag(f"{prefix}_insufficient_sample", str(r.insufficient_sample))
 
         bt_cfg = config.get("backtest", {})
         output_dir = bt_cfg.get("output_dir", "data/backtest_reports")
