@@ -84,18 +84,24 @@ def cascading_compare(
 
     # Check candidate passed all filters
     cand_passed = cand_metrics.get("val_passed_all_filters")
+    cand_stage = cand_metrics.get("val_elimination_stage", "unknown")
+
+    # No champion exists → always promote (cold-start fallback) even if filters failed,
+    # so every cluster ends up with at least one registered champion version.
+    if champ_metrics is None:
+        if cand_passed == "true":
+            score = cand_metrics.get("val_stability_score")
+            score_str = f"score={float(score):.4f}" if score is not None else "no score"
+            return True, f"no existing champion ({score_str})"
+        return True, f"no existing champion (fallback, stage={cand_stage})"
+
     if cand_passed != "true":
-        cand_stage = cand_metrics.get("val_elimination_stage", "unknown")
         return False, f"candidate failed filters ({cand_stage})"
 
     cand_score = cand_metrics.get("val_stability_score")
     if cand_score is None:
         return False, "candidate missing val_stability_score"
     cand_score = float(cand_score)
-
-    # No champion → promote
-    if champ_metrics is None:
-        return True, f"no existing champion (score={cand_score:.4f})"
 
     # Check if champion passed filters
     champ_passed = champ_metrics.get("val_passed_all_filters")
@@ -206,18 +212,27 @@ def _find_best_candidate(
     client: MlflowClient,
     runs: list,
     promotion_cfg: dict,
+    cluster_id: str | None = None,
 ) -> tuple[Any | None, str | None]:
     """Find the best candidate run among recent runs.
 
     For cascading mode: finds the run with highest val_stability_score
-    that passed all filters and has a checkpoint.
+    that passed all filters and has a checkpoint. Falls back through tiers 2-4
+    so every cluster with at least one run-with-checkpoint yields a candidate.
 
     For legacy mode: finds the most recent run with a checkpoint.
 
+    Args:
+        client: MLflow client.
+        runs: Candidate runs ordered by recency (descending).
+        promotion_cfg: Promotion config section.
+        cluster_id: Optional cluster identifier used in log messages.
+
     Returns:
-        (run, checkpoint_path) or (None, None).
+        (run, checkpoint_path) or (None, None) if no run has a checkpoint.
     """
     use_cascading = "evaluation" in promotion_cfg
+    cluster_label = cluster_id or "<unknown>"
 
     if not use_cascading:
         # Legacy: first run with checkpoint
@@ -225,6 +240,11 @@ def _find_best_candidate(
             ckpt = _find_run_checkpoint(client, run.info.run_id)
             if ckpt is not None:
                 return run, ckpt
+        logger.warning(
+            "[%s] legacy mode: no run has a checkpoint (evaluated %d runs)",
+            cluster_label,
+            len(runs),
+        )
         return None, None
 
     # Cascading: collect all runs with checkpoints and classify into tiers
@@ -233,9 +253,12 @@ def _find_best_candidate(
     tier3 = []  # Failed any single filter, ranked by val_precision_up * gen_ratio
     tier4 = []  # Any run with checkpoint (fallback)
 
+    runs_without_ckpt = 0
+
     for run in runs:
         ckpt = _find_run_checkpoint(client, run.info.run_id)
         if ckpt is None:
+            runs_without_ckpt += 1
             continue
 
         all_metrics = {**run.data.metrics, **run.data.params}
@@ -249,7 +272,10 @@ def _find_best_candidate(
         gen_ratio = min(test_prec / val_prec, 1.0) if val_prec > 0 and test_prec > 0 else 0.5
         adjusted_score = val_prec * (1.0 + gen_ratio) / 2.0
 
-        tier4.append((run, ckpt, adjusted_score))
+        # Tier 4 is the final fallback: every run with a checkpoint qualifies,
+        # ranked by end_time so the most recent wins if nothing else does.
+        tier4_score = float(run.info.end_time or 0)
+        tier4.append((run, ckpt, tier4_score))
 
         if passed == "true" and score is not None:
             tier1.append((run, ckpt, float(score)))
@@ -262,14 +288,36 @@ def _find_best_candidate(
     for tier_num, tier in [(1, tier1), (2, tier2), (3, tier3), (4, tier4)]:
         if tier:
             tier.sort(key=lambda x: x[2], reverse=True)
-            best_run, best_ckpt, best_score = tier[0]
-            # Log the promotion tier
+            best_run, best_ckpt, _best_score = tier[0]
+            # Log the promotion tier; if MLflow tagging fails, continue promoting.
             try:
                 client.set_tag(best_run.info.run_id, "promotion_tier", str(tier_num))
-            except Exception:
-                pass
+            except Exception as exc:  # pragma: no cover - non-critical telemetry
+                logger.warning(
+                    "[%s] failed to set promotion_tier tag on run %s: %s",
+                    cluster_label,
+                    best_run.info.run_id,
+                    exc,
+                )
+            if tier_num >= 2:
+                logger.info(
+                    "[%s] selected tier-%d candidate run %s (tiers: t1=%d, t2=%d, t3=%d, t4=%d)",
+                    cluster_label,
+                    tier_num,
+                    best_run.info.run_id[:12],
+                    len(tier1),
+                    len(tier2),
+                    len(tier3),
+                    len(tier4),
+                )
             return best_run, best_ckpt
 
+    logger.error(
+        "[%s] NO CANDIDATE: evaluated %d runs, %d without checkpoint, all tiers empty",
+        cluster_label,
+        len(runs),
+        runs_without_ckpt,
+    )
     return None, None
 
 
@@ -294,6 +342,7 @@ def promote_cluster_model(
     experiment = client.get_experiment_by_name(experiment_name)
 
     if experiment is None:
+        logger.warning("[%s] no MLflow experiment found at %s", cluster_id, experiment_name)
         print(f"  No experiment found for {cluster_id}")
         return False
 
@@ -306,11 +355,14 @@ def promote_cluster_model(
     )
 
     if not runs:
+        logger.warning("[%s] experiment %s has no runs", cluster_id, experiment_name)
         print(f"  No runs found for {cluster_id}")
         return False
 
     # Find best candidate
-    candidate_run, best_ckpt = _find_best_candidate(client, runs, promotion_cfg)
+    candidate_run, best_ckpt = _find_best_candidate(
+        client, runs, promotion_cfg, cluster_id=cluster_id
+    )
 
     if candidate_run is None:
         print(f"  No checkpoint found for {cluster_id}")
@@ -346,7 +398,8 @@ def promote_cluster_model(
             primary = promotion_cfg.get("primary_metric", "val_acc")
             champ_primary = champion_metrics.get(primary, "N/A")
             print(f"    current champion: run {mv.run_id[:12]} ({primary}={champ_primary})")
-    except mlflow.exceptions.MlflowException:
+    except mlflow.exceptions.MlflowException as exc:
+        logger.debug("[%s] no existing champion alias: %s", cluster_id, exc)
         print(f"    no existing champion for {model_name}")
 
     # Compare
@@ -363,15 +416,26 @@ def promote_cluster_model(
     # Register and set champion alias
     try:
         client.create_registered_model(model_name)
-    except mlflow.exceptions.MlflowException:
-        logger.debug("Model %s already registered", model_name)
+    except mlflow.exceptions.MlflowException as exc:
+        logger.debug("[%s] model %s already registered: %s", cluster_id, model_name, exc)
 
     artifact_uri = f"runs:/{run_id}/{best_ckpt}"
-    mv = client.create_model_version(
-        name=model_name,
-        source=artifact_uri,
-        run_id=run_id,
-    )
+    try:
+        mv = client.create_model_version(
+            name=model_name,
+            source=artifact_uri,
+            run_id=run_id,
+        )
+    except mlflow.exceptions.MlflowException as exc:
+        logger.error(
+            "[%s] failed to create model version for %s (source=%s): %s",
+            cluster_id,
+            model_name,
+            artifact_uri,
+            exc,
+        )
+        print(f"    ERROR: failed to register {model_name}: {exc}")
+        return False
 
     # Set tags for audit
     if use_cascading:
@@ -387,8 +451,20 @@ def promote_cluster_model(
         client.set_model_version_tag(model_name, mv.version, "promotion_score", str(primary_val))
     client.set_model_version_tag(model_name, mv.version, "promotion_reason", reason)
 
-    client.set_registered_model_alias(model_name, "champion", mv.version)
-    client.set_registered_model_alias(model_name, "champion-1", mv.version)
+    try:
+        client.set_registered_model_alias(model_name, "champion", mv.version)
+        client.set_registered_model_alias(model_name, "champion-1", mv.version)
+    except mlflow.exceptions.MlflowException as exc:
+        logger.error(
+            "[%s] failed to set champion alias on %s v%s: %s",
+            cluster_id,
+            model_name,
+            mv.version,
+            exc,
+        )
+        print(f"    ERROR: failed to set champion alias for {model_name}: {exc}")
+        return False
+
     print(f"    PROMOTED {model_name} v{mv.version} as champion ({reason})")
 
     # Promote ensemble members (rank 2, 3, ...) from the same optimization cycle
@@ -453,11 +529,37 @@ def _promote_ensemble_members(
         print(f"    PROMOTED {model_name} v{mv.version} as {alias}")
 
 
-def promote_all_clusters(config: dict) -> None:
+def _count_registered_champions(client: MlflowClient, cluster_ids: list[str]) -> list[str]:
+    """Return the cluster ids that have a registered model with a `champion` alias.
+
+    Uses MlflowException as the signal that a model/alias is missing rather than
+    listing the full registry, to stay robust against unrelated models.
+    """
+    registered: list[str] = []
+    for cluster_id in cluster_ids:
+        model_name = f"{MODEL_NAME_PREFIX}-{cluster_id}"
+        try:
+            client.get_model_version_by_alias(model_name, "champion")
+            registered.append(cluster_id)
+        except mlflow.exceptions.MlflowException as exc:
+            logger.warning(
+                "[%s] no champion alias on %s after promotion: %s",
+                cluster_id,
+                model_name,
+                exc,
+            )
+    return registered
+
+
+def promote_all_clusters(config: dict, *, strict: bool = True) -> None:
     """Promote the best model for each cluster.
 
     Args:
         config: Full config dict.
+        strict: If True (default), raise AssertionError when any cluster is
+            left without a registered `champion` alias. The autonomous loop
+            expects this signal so downstream stages don't silently operate
+            on a partial model registry.
     """
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     client = MlflowClient()
@@ -476,6 +578,25 @@ def promote_all_clusters(config: dict) -> None:
             promoted += 1
 
     print(f"\nPromoted {promoted}/{len(cluster_ids)} cluster models")
+
+    # Post-promotion assertion: every cluster must have a champion alias in the
+    # registry, otherwise aggregation/portfolio/backtesting silently operate on
+    # a partial universe.
+    registered = _count_registered_champions(client, cluster_ids)
+    missing = [cid for cid in cluster_ids if cid not in registered]
+    print(
+        f"Registered champions: {len(registered)}/{len(cluster_ids)}"
+        + (f" (missing: {missing})" if missing else "")
+    )
+
+    if missing:
+        message = (
+            f"Promotion did not register a champion for {len(missing)}/{len(cluster_ids)} "
+            f"clusters: {missing}. Check MLflow experiments and checkpoints."
+        )
+        logger.error(message)
+        if strict:
+            raise AssertionError(message)
 
 
 def main() -> None:
