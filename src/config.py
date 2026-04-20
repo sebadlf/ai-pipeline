@@ -437,3 +437,81 @@ def get_cluster_buy_threshold(config: dict, cluster_id: str) -> float:
         return overrides[cluster_id].get("buy_threshold", default_buy)
 
     return default_buy
+
+
+def get_cluster_optuna_config(config: dict, cluster_id: str) -> dict:
+    """Return the Optuna config section with per-cluster overrides applied.
+
+    Reads overrides from `training.optuna.per_cluster_overrides.<cluster_id>`
+    and merges them into a copy of the base `training.optuna` config. Supported
+    override keys at the cluster level:
+
+    * Scalars such as ``max_overfit_gap``, ``n_trials`` — replace the base value.
+    * ``search_space`` — per-parameter shallow merge. For dict specs
+      (``{low, high, log}``) individual fields replace the base values; for list
+      specs (categorical choices) the list is replaced wholesale.
+    * ``fixed_params`` — shallow merge; overridden keys replace base values.
+
+    Args:
+        config: Full config dict.
+        cluster_id: Cluster identifier (e.g. "Utilities", "Technology_0").
+
+    Returns:
+        A new dict representing the effective Optuna config for this cluster.
+        The original config is left untouched.
+    """
+    import copy
+
+    base_optuna = config.get("training", {}).get("optuna", {}) or {}
+    overrides_all = base_optuna.get("per_cluster_overrides", {}) or {}
+    overrides = overrides_all.get(cluster_id)
+    if not overrides:
+        return copy.deepcopy(base_optuna)
+
+    merged = copy.deepcopy(base_optuna)
+
+    # search_space: shallow merge per parameter; dict specs get field-level merge
+    base_ss = merged.get("search_space", {}) or {}
+    over_ss = overrides.get("search_space", {}) or {}
+    for param, spec in over_ss.items():
+        base_spec = base_ss.get(param)
+        if isinstance(spec, dict) and isinstance(base_spec, dict):
+            merged_spec = dict(base_spec)
+            merged_spec.update(spec)
+            base_ss[param] = merged_spec
+        else:
+            base_ss[param] = spec
+    merged["search_space"] = base_ss
+
+    # fixed_params: shallow merge (overridden keys replace base)
+    base_fixed = merged.get("fixed_params", {}) or {}
+    over_fixed = overrides.get("fixed_params", {}) or {}
+    base_fixed.update(over_fixed)
+    merged["fixed_params"] = base_fixed
+
+    # Scalars and everything else: top-level replace
+    for key, value in overrides.items():
+        if key in ("search_space", "fixed_params"):
+            continue
+        merged[key] = value
+
+    return merged
+
+
+def effective_config_for_cluster(config: dict, cluster_id: str) -> dict:
+    """Return a shallow-copy config with per-cluster Optuna overrides applied.
+
+    The returned dict shares references with the input except for
+    ``config["training"]["optuna"]``, which is replaced with the merged
+    per-cluster config from :func:`get_cluster_optuna_config`.
+
+    This avoids threading a separate `optuna_cfg` argument through every
+    helper: callers can keep reading ``config["training"]["optuna"]`` and
+    get cluster-specific values automatically.
+    """
+    merged_optuna = get_cluster_optuna_config(config, cluster_id)
+    new_config = dict(config)
+    new_training = dict(config.get("training", {}))
+    new_training["optuna"] = merged_optuna
+    new_config["training"] = new_training
+    return new_config
