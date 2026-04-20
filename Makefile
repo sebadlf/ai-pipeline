@@ -95,13 +95,17 @@ signals:
 # =============================================================================
 
 # Pipeline for dev - skips ingestion by default
+# Always re-runs normalization (cheap vs training, and required so that
+# changes to src/features/normalize.py take effect on the next training
+# pass — see BEC-41).
 pipeline:
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
 		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features normalize cluster; \
 		rm -f data/.new_data; \
 	else \
-		echo "No new data and clusters exist, skipping features/selection/normalization/clustering."; \
+		echo "No new data and clusters exist, refreshing normalization only."; \
+		$(MAKE) normalize; \
 	fi
 	$(MAKE) train-clusters promote aggregate portfolio backtest
 
@@ -113,7 +117,8 @@ pipeline-prod:
 		$(MAKE) features select-features normalize cluster; \
 		rm -f data/.new_data; \
 	else \
-		echo "No new data and clusters exist, skipping features/selection/normalization/clustering."; \
+		echo "No new data and clusters exist, refreshing normalization only."; \
+		$(MAKE) normalize; \
 	fi
 	$(MAKE) train-clusters promote aggregate portfolio backtest
 

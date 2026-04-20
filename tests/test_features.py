@@ -4,6 +4,10 @@ import numpy as np
 import polars as pl
 import pytest
 
+from src.features.normalize import (
+    _apply_quantile_normal,
+    _fit_quantile_knots,
+)
 from src.features.technical import (
     add_atr,
     add_binary_target,
@@ -138,3 +142,36 @@ def test_binary_target_thresholds() -> None:
     assert targets[1] == 0
     # Row 2: +1% < +5% -> NOT_UP (0)
     assert targets[2] == 0
+
+
+def test_quantile_normal_normalizes_heavy_tailed_distribution() -> None:
+    """Rank-based quantile-normal transform yields ~unit variance even on
+    distributions where linear z-score (with percentile clipping) does not.
+
+    Acceptance criterion for BEC-41: normalization produces std ≈ 1 on a
+    synthetic distribution whose bulk is concentrated so tightly that
+    clipping at [p01, p99] would collapse it to near-zero variance.
+    """
+    rng = np.random.default_rng(11)
+    # Heavy-tailed fundamental-like distribution: 99% of mass in a narrow
+    # band with small std, 1% split across large positive/negative tails.
+    # Clipping at p01/p99 trims the tails, leaving the narrow bulk — whose
+    # inter-sample variance is tiny relative to the raw tail scale, so the
+    # effective post-clip z-score std collapses well below 1.
+    n = 5000
+    bulk = rng.normal(loc=0.25, scale=0.01, size=int(0.99 * n))
+    tail_pos = rng.uniform(low=50.0, high=100.0, size=int(0.005 * n))
+    tail_neg = rng.uniform(low=-100.0, high=-50.0, size=int(0.005 * n))
+    heavy = np.concatenate([bulk, tail_pos, tail_neg])
+    rng.shuffle(heavy)
+
+    # Fit knots on the same data (as the normalize step would on training
+    # rows) and apply to the full series.
+    knots = _fit_quantile_knots(heavy, n_knots=256)
+    transformed = _apply_quantile_normal(heavy, knots)
+
+    std = float(np.std(transformed))
+    assert 0.7 <= std <= 1.3, (
+        f"quantile-normal transform yielded std={std:.3f} on a heavy-tailed "
+        "distribution; expected ~1.0 (BEC-41)."
+    )

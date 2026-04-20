@@ -148,3 +148,144 @@ def test_apply_normalization_to_array_matches_clipped_stats() -> None:
     assert out[0, 0] == pytest.approx(-2.0)
     assert out[1, 0] == pytest.approx(0.0)
     assert out[2, 0] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# BEC-41: rank-transform fallback for degenerate features
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def degenerate_parquet(tmp_path: Path) -> Path:
+    """Create a parquet with a feature whose post-clipping std is tiny.
+
+    Simulates a fundamental ratio where most mass sits in a narrow band
+    but a few tail samples are orders of magnitude larger. Clipping at
+    [p01, p99] trims the tails, and the remaining bulk's std is so small
+    relative to the original scale that z-score normalization on the full
+    (train+val+test) window yields std much less than 1.
+    """
+    rng = np.random.default_rng(7)
+    n = 5000
+    # 99% narrow bulk, 1% extreme tails. Clipping at p01/p99 keeps only a
+    # razor-thin band from the bulk (std << 1% of raw magnitude), so the
+    # z-score output on the full window collapses to near-zero variance.
+    bulk = rng.normal(loc=0.25, scale=0.01, size=int(0.99 * n))
+    tail_pos = rng.uniform(low=50.0, high=100.0, size=int(0.005 * n))
+    tail_neg = rng.uniform(low=-100.0, high=-50.0, size=int(0.005 * n))
+    feature = np.concatenate([bulk, tail_pos, tail_neg])
+    rng.shuffle(feature)
+
+    dates = [dt.date(2020, 1, 1) + dt.timedelta(days=i) for i in range(n)]
+    df = pl.DataFrame(
+        {
+            "symbol": ["AAA"] * n,
+            "date": dates,
+            "target": [0] * n,
+            "adj_close": [100.0] * n,
+            "feat_degenerate": feature,
+            # A well-behaved companion so the parquet has >1 feature column
+            "feat_normal": rng.normal(size=n),
+        }
+    )
+    path = tmp_path / "features_selected.parquet"
+    df.write_parquet(path)
+    return path
+
+
+def test_degenerate_feature_uses_quantile_transform(
+    degenerate_parquet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Degenerate features should be flagged and routed through quantile-normal.
+
+    Acceptance criterion (BEC-41): normalization_stats records which
+    features use z-score vs quantile transform.
+    """
+    import src.features.normalize as norm_mod
+
+    monkeypatch.setattr(norm_mod, "get_features_parquet_path", lambda _cfg: str(degenerate_parquet))
+    monkeypatch.setattr(
+        norm_mod,
+        "compute_split_dates",
+        lambda _cfg: type("S", (), {"train_end": dt.date(2099, 1, 1)})(),
+    )
+
+    config = _config_for_parquet(degenerate_parquet)
+    stats = compute_normalization_stats(config)
+
+    assert stats["features"]["feat_degenerate"]["transform"] == "quantile"
+    assert "quantiles" in stats["features"]["feat_degenerate"]
+    # The well-behaved companion must stay on z-score
+    assert stats["features"]["feat_normal"]["transform"] == "zscore"
+    # Top-level counters
+    assert stats["n_quantile"] >= 1
+    assert stats["n_zscore"] >= 1
+
+
+def test_quantile_transform_produces_unit_variance(
+    degenerate_parquet: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a near-degenerate distribution, the quantile fallback lifts std to ~1.
+
+    Acceptance criterion (BEC-41): normalization produces std ≈ 1 on a
+    synthetic degenerate-distribution input.
+    """
+    import src.features.normalize as norm_mod
+
+    monkeypatch.setattr(norm_mod, "get_features_parquet_path", lambda _cfg: str(degenerate_parquet))
+    monkeypatch.setattr(
+        norm_mod,
+        "compute_split_dates",
+        lambda _cfg: type("S", (), {"train_end": dt.date(2099, 1, 1)})(),
+    )
+
+    config = _config_for_parquet(degenerate_parquet)
+    stats = compute_normalization_stats(config)
+    normalized = normalize_features(config, stats)
+
+    norm_std = float(normalized["feat_degenerate"].std())
+    # Without the quantile fallback this feature's std collapses to well
+    # under 0.1. With the quantile-normal transform it should recover to
+    # approximately unit variance.
+    assert 0.7 <= norm_std <= 1.3, (
+        f"post-normalization std of degenerate feature = {norm_std:.3f}, "
+        f"expected ~1.0 (BEC-41 quantile-normal fallback)."
+    )
+
+
+def test_apply_normalization_to_array_handles_quantile_transform() -> None:
+    """Inference path (numpy) must dispatch to quantile transform when stored."""
+    # Build a minimal quantile knot set covering [0, 1] so inputs map to
+    # roughly uniform ranks. Inverse normal CDF of {0.1, 0.5, 0.9} ≈
+    # {-1.28, 0.0, +1.28}.
+    knots = list(np.linspace(0.0, 1.0, 256))
+    stats = {
+        "features": {
+            "f_deg": {
+                "transform": "quantile",
+                "mean": 0.5,
+                "std": 1.0,
+                "p_low": 0.0,
+                "p_high": 1.0,
+                "quantiles": knots,
+            },
+            "f_normal": {
+                "transform": "zscore",
+                "mean": 0.0,
+                "std": 1.0,
+                "p_low": -2.0,
+                "p_high": 2.0,
+            },
+        }
+    }
+    x = np.array([[0.1, -10.0], [0.5, 0.0], [0.9, 10.0]])
+    out = apply_normalization_to_array(x, ["f_deg", "f_normal"], stats)
+
+    # Quantile transform on uniform knots should preserve order and
+    # produce symmetric values around 0 for 0.1 / 0.9.
+    assert out[0, 0] < out[1, 0] < out[2, 0]
+    assert out[1, 0] == pytest.approx(0.0, abs=0.05)
+    assert out[0, 0] == pytest.approx(-out[2, 0], abs=0.1)
+    # Z-score column still clips + scales linearly
+    assert out[0, 1] == pytest.approx(-2.0)
+    assert out[2, 1] == pytest.approx(2.0)
