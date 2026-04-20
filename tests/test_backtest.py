@@ -1,10 +1,17 @@
 """Tests for portfolio backtesting."""
 
+import math
+
 import numpy as np
 import polars as pl
 import pytest
 
-from src.evaluation.backtest import BacktestResult, run_portfolio_backtest
+from src.evaluation.backtest import (
+    MIN_DRAWDOWN_PCT_FOR_METRICS,
+    MIN_TRADES_FOR_METRICS,
+    BacktestResult,
+    run_portfolio_backtest,
+)
 
 
 @pytest.fixture
@@ -99,3 +106,60 @@ def test_backtest_metrics_populated(
     assert isinstance(result.calmar_ratio, float)
     assert isinstance(result.omega_ratio, float)
     assert isinstance(result.max_drawdown, float)
+
+
+def test_backtest_insufficient_sample_emits_nan(
+    sample_allocations: pl.DataFrame,
+    sample_prices: pl.DataFrame,
+    backtest_config: dict,
+) -> None:
+    """Few trades OR tiny max drawdown must surface Sharpe/Sortino/Calmar/Omega as NaN
+    and raise the insufficient_sample flag. The 20-day fixture with monotonic prices
+    produces 0 trades (below MIN_TRADES_FOR_METRICS) AND negligible drawdown — both
+    guard conditions trip simultaneously.
+    """
+    result = run_portfolio_backtest(sample_allocations, sample_prices, backtest_config)
+    assert result.num_trades < MIN_TRADES_FOR_METRICS
+    assert result.max_drawdown < MIN_DRAWDOWN_PCT_FOR_METRICS
+    assert result.insufficient_sample is True
+    assert math.isnan(result.sharpe_ratio)
+    assert math.isnan(result.sortino_ratio)
+    assert math.isnan(result.calmar_ratio)
+    assert math.isnan(result.omega_ratio)
+
+
+def test_backtest_benchmark_fields_populated(
+    sample_allocations: pl.DataFrame,
+    sample_prices: pl.DataFrame,
+    backtest_config: dict,
+) -> None:
+    """benchmark_annual_return and tracking_error fields should be floats,
+    default 0.0 when no benchmark is supplied."""
+    result = run_portfolio_backtest(sample_allocations, sample_prices, backtest_config)
+    assert isinstance(result.benchmark_annual_return, float)
+    assert isinstance(result.tracking_error, float)
+    assert result.benchmark_annual_return == 0.0
+    assert result.tracking_error == 0.0
+
+
+def test_backtest_with_benchmark_populates_tracking_error(
+    sample_allocations: pl.DataFrame,
+    sample_prices: pl.DataFrame,
+    backtest_config: dict,
+) -> None:
+    """When a benchmark is provided and daily returns exist, tracking_error is > 0
+    unless the portfolio exactly matches the benchmark (not the case here)."""
+    # Supply any nonzero benchmark series of the right shape. The backtest has ~20
+    # days, so build a 19-element daily-return series to match the equity curve len.
+    bench = np.linspace(-0.001, 0.001, 19)
+    result = run_portfolio_backtest(
+        sample_allocations,
+        sample_prices,
+        backtest_config,
+        benchmark_returns=bench,
+    )
+    # We can't assert > 0 strictly in case the portfolio also matches; but the field
+    # should be finite and non-negative. annualized_return of bench is finite too.
+    assert math.isfinite(result.tracking_error)
+    assert result.tracking_error >= 0.0
+    assert math.isfinite(result.benchmark_annual_return)

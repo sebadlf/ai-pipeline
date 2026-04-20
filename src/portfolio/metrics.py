@@ -80,8 +80,29 @@ def calmar_ratio(returns: np.ndarray, equity_curve: np.ndarray) -> float:
     return float(annual_return / max_dd)
 
 
+def tracking_error(returns: np.ndarray, benchmark_returns: np.ndarray) -> float:
+    """Annualized tracking error — std of daily active returns, annualized.
+
+    Args:
+        returns: Array of portfolio daily returns.
+        benchmark_returns: Array of benchmark daily returns (same length).
+
+    Returns:
+        Annualized tracking error. Zero if arrays mismatch or are too short.
+    """
+    if len(returns) != len(benchmark_returns) or len(returns) < 2:
+        return 0.0
+    active_returns = returns - benchmark_returns
+    # ddof=0 matches numpy default used elsewhere in this module
+    return float(np.sqrt(252) * active_returns.std())
+
+
 def information_ratio(returns: np.ndarray, benchmark_returns: np.ndarray) -> float:
-    """Annualized Information ratio — excess return / tracking error.
+    """Annualized Information ratio — annualized excess return / annualized tracking error.
+
+    Both numerator and denominator are annualized consistently:
+        IR = (mean_active * 252) / (std_active * sqrt(252))
+           = sqrt(252) * mean_active / std_active
 
     Args:
         returns: Array of portfolio daily returns.
@@ -90,10 +111,10 @@ def information_ratio(returns: np.ndarray, benchmark_returns: np.ndarray) -> flo
     if len(returns) != len(benchmark_returns) or len(returns) < 2:
         return 0.0
     active_returns = returns - benchmark_returns
-    tracking_error = active_returns.std()
-    if tracking_error == 0:
+    te_daily = active_returns.std()
+    if te_daily == 0:
         return 0.0
-    return float(np.sqrt(252) * active_returns.mean() / tracking_error)
+    return float(np.sqrt(252) * active_returns.mean() / te_daily)
 
 
 def max_drawdown(equity_curve: np.ndarray) -> float:
@@ -109,6 +130,24 @@ def max_drawdown(equity_curve: np.ndarray) -> float:
     return float(abs(drawdowns.min()))
 
 
+def annualized_return(returns: np.ndarray) -> float:
+    """Geometric annualized return from a daily return series.
+
+    Args:
+        returns: Array of daily returns.
+
+    Returns:
+        Annualized return (0.0 if the series is empty).
+    """
+    if len(returns) < 1:
+        return 0.0
+    total_return = float(np.prod(1.0 + returns) - 1.0)
+    n_years = len(returns) / 252
+    if n_years <= 0:
+        return 0.0
+    return float((1.0 + total_return) ** (1.0 / n_years) - 1.0)
+
+
 def compute_all_metrics(
     returns: np.ndarray,
     equity_curve: np.ndarray,
@@ -122,7 +161,8 @@ def compute_all_metrics(
         benchmark_returns: Optional benchmark daily returns for Information ratio.
 
     Returns:
-        Dict with keys: sharpe, sortino, omega, calmar, information, max_drawdown.
+        Dict with keys: sharpe, sortino, omega, calmar, information, max_drawdown,
+        tracking_error, benchmark_annual_return.
     """
     metrics = {
         "sharpe": sharpe_ratio(returns),
@@ -133,6 +173,10 @@ def compute_all_metrics(
     }
     if benchmark_returns is not None and len(benchmark_returns) == len(returns):
         metrics["information"] = information_ratio(returns, benchmark_returns)
+        metrics["tracking_error"] = tracking_error(returns, benchmark_returns)
+        metrics["benchmark_annual_return"] = annualized_return(benchmark_returns)
     else:
         metrics["information"] = 0.0
+        metrics["tracking_error"] = 0.0
+        metrics["benchmark_annual_return"] = 0.0
     return metrics
