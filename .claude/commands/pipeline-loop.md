@@ -12,15 +12,14 @@ You are the **coordinator** for the autonomous pipeline improvement loop. Your j
   → update state as needed → (exit OR ScheduleWakeup(60s, "/pipeline-loop"))
 ```
 
-Phases: `run` → `analyze` → `propose` → `implement` (possibly many) → `reset-cycle` → `run` → ...
-Plus the transverse `cleanup` phase inserted when MLflow accumulates runs.
+Phases: `run` → `analyze` → (optional `cleanup` if verdict asks for it) → `propose` → `implement` (possibly many) → `reset-cycle` → `run` → ...
+When `analyze` emits `insufficient_evidence`, the loop skips `propose`/`implement`, runs `cleanup` only if requested, and resets the cycle to collect another pipeline run.
 
 ## Step 1 — Load state
 
 Run these and capture the output:
 
 - `uv run python -m src.pipeline_loop.state show`
-- `uv run python -m src.pipeline_loop.mlflow_helpers`
 - `mcp__linear__list_issues` with `team="Becerra"`, `labels=["pipeline-auto"]`, `state=["Todo","Backlog","In Progress"]`, `limit=50`. Filter out issues that also have the `auto-blocked` label. Count the remaining as `open_auto_issues`.
 
 ## Step 2 — Check exit conditions (in order)
@@ -30,8 +29,9 @@ Exit the loop (do **not** reschedule) if any of these holds. For each exit, appe
 1. **Stop flag**: `stop_flag_present` is `true` in state output.
 2. **Budget exhausted**: `cycle_number > 20`.
 3. **Consecutive abandons**: `consecutive_abandons >= 3`. This is a circuit breaker — write `EXIT reason=circuit_breaker` with `--level ERROR`. Do **not** hand off to `make pipeline-loop` in this case; the loop is paused for human review.
-4. **Plateau or unclear verdict**: current verdict is `plateau` or `unclear` AND `open_auto_issues == 0`. This is the happy "done for now" exit — hand off to `make pipeline-loop`.
-5. **Loop-stop label in Linear**: any open issue in the team carries the `loop-stop` label.
+4. **Insufficient-evidence exhausted**: `consecutive_insufficient_evidence >= 3`. The analyst has asked for "one more cycle" too many times in a row — write `EXIT reason=insufficient_data_exhausted` with `--level ERROR`. Do **not** hand off; a human should look at why evidence isn't accumulating.
+5. **Plateau or unclear verdict**: current verdict is `plateau` or `unclear` AND `open_auto_issues == 0`. This is the happy "done for now" exit — hand off to `make pipeline-loop`.
+6. **Loop-stop label in Linear**: any open issue in the team carries the `loop-stop` label.
 
 If none of these hold, continue.
 
@@ -39,12 +39,13 @@ If none of these hold, continue.
 
 In priority order (first matching rule wins):
 
-1. MLflow `cleanup_needed == true` → phase = `cleanup`.
-2. `state.pipeline_run_completed_at` is `null` → phase = `run`.
-3. No `verdict.json` yet this cycle → phase = `analyze`.
-4. Verdict is `improve` AND `open_auto_issues == 0` AND verdict is **not** marked `proposed: true` → phase = `propose`.
-5. `open_auto_issues > 0` → phase = `implement`.
-6. Verdict is `improve` AND `open_auto_issues == 0` AND verdict is `proposed: true` → cycle is complete → reset via `uv run python -m src.pipeline_loop.state reset-cycle`, then go back to step 1 (re-detect — should land on `run` next).
+1. `state.pipeline_run_completed_at` is `null` → phase = `run`.
+2. No `verdict.json` yet this cycle → phase = `analyze`.
+3. Verdict has `cleanup_recommended: true` AND `cleanup_done: false` AND verdict is **not** `plateau`/`unclear` → phase = `cleanup`. (Runs after analyze, before anything else the verdict triggers — applies whether the verdict is `improve` or `insufficient_evidence`.)
+4. Verdict is `insufficient_evidence` → record the streak via `uv run python -m src.pipeline_loop.state record-insufficient-evidence`, append a log line (`analyze-wait cycle=N consecutive=<M>`), then run `uv run python -m src.pipeline_loop.state reset-cycle` (this clears the verdict and `pipeline_run_completed_at` for the next cycle) and go back to step 1 — next iteration should land on `run`.
+5. Verdict is `improve` AND `open_auto_issues == 0` AND verdict is **not** marked `proposed: true` → phase = `propose`.
+6. `open_auto_issues > 0` → phase = `implement`.
+7. Verdict is `improve` AND `open_auto_issues == 0` AND verdict is `proposed: true` → cycle is complete → reset via `uv run python -m src.pipeline_loop.state reset-cycle`, then go back to step 1 (re-detect — should land on `run` next).
 
 ## Step 4 — Execute the phase via Agent
 
@@ -63,13 +64,14 @@ Isolated context per phase is deliberate — keeps the coordinator light and mat
 ## Step 5 — Process the phase result
 
 - **`run` returned success** → continue (state file already updated). If failed after retry, exit with `EXIT reason=pipeline_failed` (`--level ERROR`) and do not hand off.
-- **`analyze` returned verdict `plateau`/`unclear`** → the coordinator will detect this on the next iteration and exit per step 2.4. No special handling here; just reschedule.
-- **`analyze` returned verdict `improve`** → reschedule; next iteration will pick `propose`.
+- **`analyze` returned verdict `plateau`/`unclear`** → call `uv run python -m src.pipeline_loop.state reset-insufficient-streak` (safety: any non-insufficient verdict zeroes the counter). The coordinator will detect plateau/unclear on the next iteration and exit per step 2.5.
+- **`analyze` returned verdict `improve`** → call `reset-insufficient-streak`, then reschedule; next iteration will pick `cleanup` (if recommended) or `propose`.
+- **`analyze` returned verdict `insufficient_evidence`** → do **not** call `reset-insufficient-streak` (we want the streak to build). Reschedule; next iteration handles it via step 3 rule 3 (cleanup if asked) and then rule 4 (reset-cycle + re-run).
+- **`cleanup` returned success** → reschedule; next iteration picks the next applicable phase (verdict determines what comes next).
 - **`propose` returned with K issues created** → reschedule; next iteration will pick `implement`.
 - **`propose` returned with 0 issues created** (all dedup'd) → treat the cycle as complete: `reset-cycle` and reschedule.
 - **`implement` returned MERGED** → reschedule; next iteration picks another issue or resets cycle if empty.
 - **`implement` returned ABANDON** → state file already has the abandon recorded; reschedule. The circuit breaker in step 2.3 will catch runaway abandons.
-- **`cleanup` returned success** → reschedule.
 
 ## Step 6 — Reschedule
 
@@ -92,7 +94,7 @@ The 60-second gap is nominal; most phases take minutes to hours themselves, so t
 Print a short status (under 80 words) summarizing:
 
 - Current cycle number and phase that just ran
-- Key outcome (e.g., "3 issues created", "BEC-42 merged", "verdict=improve")
+- Key outcome (e.g., "3 issues created", "BEC-42 merged", "verdict=improve", "verdict=insufficient_evidence — rerunning pipeline")
 - Whether we rescheduled or exited (and exit reason if exited)
 - Link to `ai-pipeline-vault/projects/ai-pipeline/pipeline-loop/loop-log.md` for audit
 
@@ -101,5 +103,6 @@ Print a short status (under 80 words) summarizing:
 - Do not inline phase logic — always delegate via Agent. This keeps the coordinator's context small and reusable across iterations.
 - Do not touch Linear issues yourself — that's `pipeline-propose` and `pipeline-implement`'s job.
 - Do not run `make pipeline` or `make cleanup` yourself — same reason.
+- Do not decide on your own whether cleanup is needed — that decision lives in `pipeline-analyze` and is communicated via `verdict.cleanup_recommended`.
 - If state files are corrupt or missing in surprising ways, exit with `EXIT reason=state_corruption` (`--level ERROR`) and do not hand off. The user investigates manually.
 - If Linear MCP is unavailable (tool error), treat `open_auto_issues` as unknown and exit with `EXIT reason=linear_unavailable` (`--level ERROR`).

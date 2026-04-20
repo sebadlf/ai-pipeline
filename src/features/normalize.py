@@ -435,6 +435,16 @@ def main() -> None:
     print("\nNormalizing features...")
     df_normalized = normalize_features(config, stats)
 
+    # Stock-preservation audit (BEC-44): normalization is a row-wise
+    # transform and must not drop any symbol that reached this stage.
+    from src.features.stock_audit import audit_symbols
+
+    input_symbols = set(
+        pl.read_parquet(get_features_parquet_path(config))["symbol"].unique().to_list()
+    )
+    output_symbols = set(df_normalized["symbol"].unique().to_list())
+    audit_symbols("normalize", input_symbols, output_symbols)
+
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df_normalized.write_parquet(output_path)
     print(f"  Saved normalized features to {output_path} ({len(df_normalized):,} rows)")

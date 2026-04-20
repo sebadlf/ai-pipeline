@@ -176,6 +176,28 @@ def _run_inference_core(
         sym_df = sym_df.drop_nulls(subset=feature_cols)
 
         if len(sym_df) < seq_len:
+            # BEC-44: Never drop stocks silently. Symbols with insufficient
+            # usable history still get an entry, padded with zeros at the
+            # front of the window so the model can score them (prob_up will
+            # typically land near the prior; downstream filters apply normal
+            # min_prob_up thresholds).
+            if len(sym_df) == 0:
+                pad = np.zeros((seq_len, len(feature_cols)), dtype=np.float64)
+            else:
+                available = sym_df.select(feature_cols).to_numpy()
+                np.nan_to_num(available, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                pad = np.zeros((seq_len - len(sym_df), len(feature_cols)), dtype=np.float64)
+                pad = np.vstack([pad, available])
+            x = torch.tensor(pad, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                probs = model.predict_proba(x).squeeze(0).numpy()
+            predictions.append(
+                {
+                    "symbol": symbol,
+                    "cluster_id": cluster_id,
+                    "prob_up": float(probs[1]),
+                }
+            )
             continue
 
         recent = sym_df.tail(seq_len)
@@ -407,6 +429,31 @@ def aggregate_predictions(config: dict) -> pl.DataFrame:
         for cid, err in skipped_clusters:
             print(f"    - {cid}: {err[:100]}...")
 
+    # BEC-44 invariant: every symbol in clusters.parquet must appear in the
+    # predictions output. If a cluster was skipped (missing model / feature
+    # mismatch) its symbols still get a neutral prob_up=0.5 row so the
+    # downstream audit does not see them disappear.
+    all_cluster_symbols = set(clusters_df["symbol"].to_list())
+    predicted_symbols = {p["symbol"] for p in all_predictions}
+    missing = all_cluster_symbols - predicted_symbols
+    if missing:
+        sym_to_cluster = {
+            row["symbol"]: row["cluster_id"] for row in clusters_df.iter_rows(named=True)
+        }
+        for symbol in sorted(missing):
+            all_predictions.append(
+                {
+                    "symbol": symbol,
+                    "cluster_id": sym_to_cluster.get(symbol, "Miscellaneous"),
+                    "prob_up": 0.5,
+                    "model_run_id": None,
+                }
+            )
+        print(
+            f"  [stock-audit] aggregation: {len(missing)} symbols had no ensemble prediction "
+            "(skipped clusters); filled with neutral prob_up=0.5"
+        )
+
     result_df = pl.DataFrame(all_predictions, infer_schema_length=None)
 
     # Summary
@@ -472,6 +519,18 @@ def main() -> None:
     if result_df.is_empty():
         print("No predictions generated. Ensure models are trained first.")
         return
+
+    # Stock-preservation audit (BEC-44): every symbol in clusters.parquet
+    # must appear in predictions.parquet — aggregate_predictions already
+    # fills missing-cluster symbols with neutral prob_up=0.5, so this call
+    # documents the invariant and raises loudly if that logic regresses.
+    from src.features.stock_audit import audit_symbols
+
+    cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
+    clusters_df = pl.read_parquet(cluster_cfg.output_parquet)
+    expected_symbols = set(clusters_df["symbol"].to_list())
+    predicted_symbols = set(result_df["symbol"].to_list())
+    audit_symbols("aggregation", expected_symbols, predicted_symbols)
 
     save_predictions(result_df, config)
 

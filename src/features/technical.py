@@ -825,7 +825,10 @@ def fill_nulls(df: pl.DataFrame, *, train_end: dt.date | None = None) -> pl.Data
             to prevent leaking val/test information into training features.
 
     Returns:
-        DataFrame with nulls filled. Rows with null critical columns are dropped.
+        DataFrame with nulls filled. Rows that still have nulls in critical
+        columns are dropped **only if doing so does not remove the last
+        surviving row of a symbol** — the stock-preservation invariant
+        (BEC-44) forbids silent drops of whole symbols.
     """
     meta_cols = {"id", "symbol", "date"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
@@ -861,12 +864,41 @@ def fill_nulls(df: pl.DataFrame, *, train_end: dt.date | None = None) -> pl.Data
         if median_fills:
             df = df.with_columns(median_fills)
 
-    # Step 3: Drop rows that still have nulls in critical columns only
+    # Step 3: Drop rows that still have nulls in critical columns — but guard
+    # the stock-preservation invariant: a stock whose rows all have null
+    # critical columns (e.g. freshly ingested symbol with < horizon days of
+    # history) must still get at least one row with imputed zeros in the
+    # output, so downstream stages see it.
     critical_cols = [
         c for c in ["return_1d", "return_5d", "return_20d", "target"] if c in df.columns
     ]
     if critical_cols:
-        df = df.drop_nulls(subset=critical_cols)
+        before_symbols = set(df["symbol"].unique().to_list()) if "symbol" in df.columns else set()
+        dropped = df.drop_nulls(subset=critical_cols)
+        after_symbols = (
+            set(dropped["symbol"].unique().to_list()) if "symbol" in dropped.columns else set()
+        )
+        missing_symbols = before_symbols - after_symbols
+        if missing_symbols:
+            # Recover the most recent row per dropped symbol with the
+            # critical columns filled to 0 so the stock is still represented
+            # in features.parquet.
+            recovered = (
+                df.filter(pl.col("symbol").is_in(list(missing_symbols)))
+                .sort(["symbol", "date"])
+                .group_by("symbol")
+                .tail(1)
+                .with_columns(
+                    [pl.col(c).fill_null(0.0).fill_nan(0.0) for c in critical_cols],
+                )
+            )
+            print(
+                f"  [stock-audit] fill_nulls: preserved {len(missing_symbols)} symbols "
+                f"with all-null critical cols (imputed to 0)"
+            )
+            df = pl.concat([dropped, recovered], how="vertical_relaxed")
+        else:
+            df = dropped
 
     return df
 
@@ -888,6 +920,8 @@ def main() -> None:
     df = load_ohlcv(symbols)
     print(f"  Loaded {len(df)} rows")
 
+    ingested_symbols = set(df["symbol"].unique().to_list()) if "symbol" in df.columns else set()
+
     print("Building features...")
     df = build_features(df, config)
 
@@ -903,6 +937,13 @@ def main() -> None:
 
     dropped = initial_len - len(df)
     print(f"  Dropped {dropped:,} rows with critical nulls ({dropped / max(initial_len, 1):.1%})")
+
+    # Stock-preservation audit (BEC-44): every symbol that entered features
+    # generation must survive to features.parquet.
+    from src.features.stock_audit import audit_symbols
+
+    output_symbols = set(df["symbol"].unique().to_list()) if "symbol" in df.columns else set()
+    audit_symbols("features", ingested_symbols, output_symbols)
 
     # Save to parquet
     from pathlib import Path

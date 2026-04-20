@@ -283,12 +283,23 @@ def main() -> None:
     df = pl.read_parquet(args.input)
     print(f"  {len(df):,} rows, {len(df.columns)} columns")
 
+    input_symbols = set(df["symbol"].unique().to_list()) if "symbol" in df.columns else set()
+
     # Use only training data for computing selection statistics (avoid data leakage)
     split_dates = compute_split_dates(config)
     train_end = split_dates.train_end
 
     print("Running feature selection...")
     df_selected, selected_cols = select_features(df, config, train_end=train_end)
+
+    # Stock-preservation audit (BEC-44): feature selection must only drop
+    # features, never entire symbols.
+    from src.features.stock_audit import audit_symbols
+
+    output_symbols = (
+        set(df_selected["symbol"].unique().to_list()) if "symbol" in df_selected.columns else set()
+    )
+    audit_symbols("feature-selection", input_symbols, output_symbols)
 
     # Detect changes from previous manifest
     manifest_path = Path(args.manifest)

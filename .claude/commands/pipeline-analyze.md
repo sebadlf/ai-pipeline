@@ -1,9 +1,9 @@
 ---
-description: Analyze pipeline outputs across ALL 7 stages, write a report to the vault, and emit a structured verdict (improve/plateau/unclear).
+description: Analyze pipeline outputs across ALL 7 stages, write a report to the vault, and emit a structured verdict (improve/plateau/unclear/insufficient_evidence) plus a cleanup recommendation.
 allowed-tools: Bash, Read, Write, Grep, Glob
 ---
 
-You are executing the **analyze** phase. Your job is a rigorous, explicit review of the last pipeline run so the coordinator knows whether to propose improvements or exit.
+You are executing the **analyze** phase. Your job is a rigorous, explicit review of the last pipeline run so the coordinator knows whether to propose improvements, wait for more evidence, run a cleanup, or exit.
 
 ## Inputs to review
 
@@ -48,13 +48,42 @@ Which clusters have a champion alias registered? Any that failed promotion (`fai
 
 - Just note whether `make signals` has been wired into the pipeline yet; this stage may be empty.
 
+## Evidence sufficiency check
+
+Before picking `improve` / `plateau`, ask yourself: **do I actually have enough runs to judge whether the changes merged in previous cycles worked?**
+
+Check `git log --oneline --since='7 days ago'` (or compare the most recent merged `pipeline-auto` PRs in Linear) against the MLflow runs for the affected clusters / stages. Emit **`insufficient_evidence`** if **any** of these holds for PRs merged since the previous cycle's verdict:
+
+- **Too few runs**: fewer than 2 completed MLflow runs exist for the cluster(s) / stage(s) the change targets. One data point is not evidence.
+- **High run-to-run variance**: `val_precision_up` or `test_precision_up` oscillate by more than ±0.05 between the last two runs without a clear trend, and one more run would break the tie.
+- **First post-merge run**: a change affecting `make pipeline` end-to-end merged between the previous cycle's run and this one, and this is the first pipeline run after the merge.
+- **Qualitative doubt**: you cannot honestly tell, from the runs available, whether a recent change helped — propose waiting.
+
+When emitting `insufficient_evidence`, the report's "Verdict & reasoning" section **must** name the specific merged PR(s) / issue(s) whose impact is still unclear, and say what one more pipeline run would resolve.
+
+Do **not** emit `insufficient_evidence` if there are no recent merged changes to evaluate (e.g., cycle 1, or a cycle with all PRs abandoned). In that case decide normally between `improve` / `plateau` / `unclear`.
+
+## Cleanup recommendation
+
+Independently of the verdict, decide whether MLflow needs a `make cleanup` before the next phase. Set `cleanup_recommended: true` in the verdict JSON when **any** of these qualitative signals is present:
+
+- Many runs marked `FAILED` / `KILLED` clutter the reports and make it hard to judge signal vs. noise.
+- Old or obsolete experiments (from architecture changes, renamed clusters, abandoned branches) are still registered and get in the way.
+- The output of `scripts/mlflow_report.py` has grown so large it's hard to read end-to-end.
+- Disk / tracking-server performance is visibly degraded in stage 2 logs.
+
+You may consult `uv run python -m src.pipeline_loop.mlflow_helpers` to see the current `total_runs` and `days_since_last_cleanup` as **context** — but there are no hard thresholds. The decision is yours, based on whether a clean slate would make the next cycle easier to reason about. Don't recommend cleanup reflexively; only when it would improve the analysis.
+
+If `cleanup_recommended: true`, add a short justification inline in the report (e.g., "Cleanup: 340 runs, ~120 of them FAILED from BEC-33's iteration — reports noisy").
+
 ## Verdict rules
 
-After reviewing all 7 stages, emit one of:
+After reviewing all 7 stages and running the evidence-sufficiency check, emit one of:
 
 - **`improve`** — you identified at least one concrete, implementable change with a plausible story for why it would help. Attach 1-5 suggested issues (see format below).
 - **`plateau`** — you reviewed every stage and cannot identify a change that is (a) concrete, (b) implementable, and (c) has a plausible mechanism of improvement. The pipeline is "done for now".
 - **`unclear`** — data required to decide is missing/unreadable (e.g., MLflow server down, reports dir empty). Treat this like a transient block — the coordinator will exit and the user can investigate.
+- **`insufficient_evidence`** — see the "Evidence sufficiency check" section above. Pipeline ran ok but the impact of recent merged changes can't yet be judged; one more cycle would help. **Do not** attach suggested issues in this case (`suggested_issues: []`).
 
 You may only emit `plateau` if your reasoning explicitly mentions **each** of the 7 stages and why no change is warranted there. If you cannot do that, fall back to `unclear`.
 
@@ -66,7 +95,8 @@ You may only emit `plateau` if your reasoning explicitly mentions **each** of th
    ---
    date: YYYY-MM-DD
    cycle: N
-   verdict: improve|plateau|unclear
+   verdict: improve|plateau|unclear|insufficient_evidence
+   cleanup_recommended: true|false
    tags: [pipeline-loop, report]
    ---
 
@@ -84,7 +114,10 @@ You may only emit `plateau` if your reasoning explicitly mentions **each** of th
    (all 7)
 
    ## Verdict & reasoning
-   ...
+   <if insufficient_evidence, name the PRs/issues whose impact is unresolved>
+
+   ## Cleanup recommendation
+   <one line: true/false + justification if true>
 
    ## Suggested improvements (if verdict=improve)
    1. **<short title>** — <one paragraph: what to change, why, which stage, expected impact>
@@ -105,20 +138,24 @@ You may only emit `plateau` if your reasoning explicitly mentions **each** of th
          "stage": "Stage 2 — Training"
        }
      ],
+     "cleanup_recommended": false,
+     "cleanup_done": false,
      "written_at": ""
    }
    ```
 
-   Leave `written_at` empty; the Python writer stamps it. Prefer writing via the helper:
+   Leave `written_at` empty and `cleanup_done` false; both are written/flipped by the loop itself. Prefer writing via the helper:
    `uv run python -c "import json; from src.pipeline_loop import state; state.save_verdict(state.Verdict(**json.load(open('/tmp/verdict.json'))))"` after dumping your candidate to `/tmp/verdict.json`.
 
-3. Append to the loop log: `uv run python -m src.pipeline_loop.state append-log "analyze cycle=N verdict=<X> suggested=<K>"`.
+3. Append to the loop log: `uv run python -m src.pipeline_loop.state append-log "analyze cycle=N verdict=<X> suggested=<K> cleanup_recommended=<true|false>"`.
 
-4. Report back in under 120 words: verdict, one-line rationale, number of suggested issues, path to the report.
+4. Report back in under 120 words: verdict, one-line rationale, cleanup_recommended yes/no, number of suggested issues, path to the report.
 
 ## Constraints
 
 - Cap suggestions at 5. If you have more ideas, keep only the top 5 by expected impact.
 - Each suggested issue must name which of the 7 stages it touches.
+- When verdict is `insufficient_evidence` or `unclear`, `suggested_issues` must be empty.
 - Do not invoke other pipeline-* commands.
 - Do not create Linear issues in this phase — only write the JSON; the `pipeline-propose` phase reads it and files them.
+- Do not run `make cleanup` yourself — only set the flag; the coordinator dispatches the cleanup phase.

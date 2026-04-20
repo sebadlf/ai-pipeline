@@ -3,9 +3,12 @@
 State lives in two JSON files under the vault:
 
 - ``state.json`` — persistent across cycles. Tracks cycle_number, consecutive
-  abandons, and the timestamp when the last pipeline run completed.
+  abandons/insufficient-evidence streaks, and the timestamp when the last
+  pipeline run completed.
 - ``verdict.json`` — ephemeral per-cycle. Written by ``pipeline-analyze``,
-  consumed by ``pipeline-propose``, deleted on cycle reset.
+  consumed by ``pipeline-propose``, deleted on cycle reset. Carries the
+  ``cleanup_recommended`` / ``cleanup_done`` flags the coordinator uses to
+  schedule the cleanup phase.
 
 Appending to ``loop-log.md`` is how the coordinator audits what happened.
 """
@@ -27,6 +30,7 @@ class LoopState:
 
     cycle_number: int = 1
     consecutive_abandons: int = 0
+    consecutive_insufficient_evidence: int = 0
     abandoned_issue_ids: list[str] = field(default_factory=list)
     pipeline_run_completed_at: str | None = None
     last_cleanup_at: str | None = None
@@ -39,6 +43,8 @@ class Verdict:
     verdict: str  # one of config.VALID_VERDICTS
     reasoning: str
     suggested_issues: list[dict[str, Any]] = field(default_factory=list)
+    cleanup_recommended: bool = False
+    cleanup_done: bool = False
     written_at: str = ""
 
     def __post_init__(self) -> None:
@@ -67,6 +73,7 @@ def load_state() -> LoopState:
     return LoopState(
         cycle_number=data.get("cycle_number", 1),
         consecutive_abandons=data.get("consecutive_abandons", 0),
+        consecutive_insufficient_evidence=data.get("consecutive_insufficient_evidence", 0),
         abandoned_issue_ids=data.get("abandoned_issue_ids", []),
         pipeline_run_completed_at=data.get("pipeline_run_completed_at"),
         last_cleanup_at=data.get("last_cleanup_at"),
@@ -118,6 +125,34 @@ def reset_abandon_streak(state: LoopState | None = None) -> LoopState:
     return state
 
 
+def record_insufficient_evidence(state: LoopState | None = None) -> LoopState:
+    state = state or load_state()
+    state.consecutive_insufficient_evidence += 1
+    save_state(state)
+    return state
+
+
+def reset_insufficient_evidence_streak(state: LoopState | None = None) -> LoopState:
+    state = state or load_state()
+    state.consecutive_insufficient_evidence = 0
+    save_state(state)
+    return state
+
+
+def mark_cleanup_done() -> Verdict:
+    """Flip ``cleanup_done`` on the current verdict and persist it.
+
+    Raises ``FileNotFoundError`` if no verdict.json exists — the caller
+    (cleanup phase) only runs when the coordinator already saw one.
+    """
+    current = load_verdict()
+    if current is None:
+        raise FileNotFoundError("no verdict.json to mark cleanup_done on")
+    current.cleanup_done = True
+    save_verdict(current)
+    return current
+
+
 def load_verdict() -> Verdict | None:
     """Read current-cycle verdict, or None if no analysis has been written."""
     if not config.VERDICT_FILE.exists():
@@ -127,6 +162,8 @@ def load_verdict() -> Verdict | None:
         verdict=data["verdict"],
         reasoning=data.get("reasoning", ""),
         suggested_issues=data.get("suggested_issues", []),
+        cleanup_recommended=data.get("cleanup_recommended", False),
+        cleanup_done=data.get("cleanup_done", False),
         written_at=data.get("written_at", ""),
     )
 
@@ -165,16 +202,28 @@ def _main() -> None:
     abandon = sub.add_parser("record-abandon", help="Record an abandoned issue.")
     abandon.add_argument("issue_id", help="Linear issue ID, e.g. BEC-42")
     sub.add_parser("reset-abandon-streak", help="Clear consecutive abandon counter after a merge.")
+    sub.add_parser(
+        "record-insufficient-evidence",
+        help="Increment consecutive insufficient_evidence counter.",
+    )
+    sub.add_parser(
+        "reset-insufficient-streak",
+        help="Clear consecutive insufficient_evidence counter after any other verdict.",
+    )
+    sub.add_parser(
+        "mark-cleanup-done",
+        help="Flip cleanup_done=true on the current verdict.json.",
+    )
     append = sub.add_parser("append-log", help="Append a line to loop-log.md.")
     append.add_argument("message")
     append.add_argument("--level", default="INFO")
 
     args = parser.parse_args()
     if args.cmd == "show":
-        state = load_state()
+        st = load_state()
         verdict = load_verdict()
         out = {
-            "state": asdict(state),
+            "state": asdict(st),
             "verdict": asdict(verdict) if verdict else None,
             "stop_flag_present": stop_flag_present(),
         }
@@ -193,6 +242,15 @@ def _main() -> None:
         print(json.dumps(asdict(new), indent=2))
     elif args.cmd == "reset-abandon-streak":
         new = reset_abandon_streak()
+        print(json.dumps(asdict(new), indent=2))
+    elif args.cmd == "record-insufficient-evidence":
+        new = record_insufficient_evidence()
+        print(json.dumps(asdict(new), indent=2))
+    elif args.cmd == "reset-insufficient-streak":
+        new = reset_insufficient_evidence_streak()
+        print(json.dumps(asdict(new), indent=2))
+    elif args.cmd == "mark-cleanup-done":
+        new = mark_cleanup_done()
         print(json.dumps(asdict(new), indent=2))
     elif args.cmd == "append-log":
         append_log(args.message, level=args.level)
