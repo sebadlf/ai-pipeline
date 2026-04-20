@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from src.evaluation.backtest import (
+    MIN_ANNUALIZATION_WINDOW,
     MIN_DRAWDOWN_PCT_FOR_METRICS,
     MIN_TRADES_FOR_METRICS,
     BacktestResult,
@@ -133,33 +134,120 @@ def test_backtest_benchmark_fields_populated(
     sample_prices: pl.DataFrame,
     backtest_config: dict,
 ) -> None:
-    """benchmark_annual_return and tracking_error fields should be floats,
-    default 0.0 when no benchmark is supplied."""
+    """benchmark_annual_return and tracking_error fields should be floats.
+    When no benchmark is supplied AND the window is short (<MIN_ANNUALIZATION_WINDOW),
+    both fields are NaN (short window guard fires before the no-benchmark path).
+    """
     result = run_portfolio_backtest(sample_allocations, sample_prices, backtest_config)
     assert isinstance(result.benchmark_annual_return, float)
     assert isinstance(result.tracking_error, float)
-    assert result.benchmark_annual_return == 0.0
-    assert result.tracking_error == 0.0
+    # The 20-day fixture is below MIN_ANNUALIZATION_WINDOW so both are NaN
+    assert math.isnan(result.benchmark_annual_return)
+    assert math.isnan(result.tracking_error)
 
 
-def test_backtest_with_benchmark_populates_tracking_error(
-    sample_allocations: pl.DataFrame,
-    sample_prices: pl.DataFrame,
-    backtest_config: dict,
-) -> None:
-    """When a benchmark is provided and daily returns exist, tracking_error is > 0
-    unless the portfolio exactly matches the benchmark (not the case here)."""
-    # Supply any nonzero benchmark series of the right shape. The backtest has ~20
-    # days, so build a 19-element daily-return series to match the equity curve len.
-    bench = np.linspace(-0.001, 0.001, 19)
-    result = run_portfolio_backtest(
-        sample_allocations,
-        sample_prices,
-        backtest_config,
-        benchmark_returns=bench,
+def test_backtest_with_benchmark_suppressed_on_short_window() -> None:
+    """Benchmark metrics are NaN on short windows regardless of benchmark presence.
+    With a window < MIN_ANNUALIZATION_WINDOW, benchmark_annual_return and
+    tracking_error must always be NaN — the short window guard fires before
+    any annualization calculation.
+    """
+    import datetime as dt
+
+    # Use a window just under the threshold
+    n_days = MIN_ANNUALIZATION_WINDOW - 10
+    assert n_days > 5, "fixture must be long enough to run"
+    start = dt.date(2024, 1, 3)
+    dates = [start + dt.timedelta(days=i) for i in range(n_days)]
+
+    prices_list = []
+    spy_prices = np.linspace(450.0, 460.0, n_days)
+    for d, p in zip(dates, spy_prices):
+        prices_list.append({"date": d, "symbol": "SPY", "close": float(p)})
+    prices = pl.DataFrame(prices_list)
+
+    allocations = pl.DataFrame(
+        [{"symbol": "SPY", "weight": 1.0, "cluster_id": "ETF_0", "prob_up": 0.80}]
     )
-    # We can't assert > 0 strictly in case the portfolio also matches; but the field
-    # should be finite and non-negative. annualized_return of bench is finite too.
-    assert math.isfinite(result.tracking_error)
-    assert result.tracking_error >= 0.0
-    assert math.isfinite(result.benchmark_annual_return)
+    config = {
+        "initial_capital": 100000,
+        "commission_pct": 0.001,
+        "risk": {
+            "position_stop_loss": 0.08,
+            "position_take_profit": 0.50,
+            "max_drawdown_limit": 0.25,
+            "cooldown_days": 2,
+        },
+    }
+    bench = np.diff(spy_prices) / spy_prices[:-1]
+    result = run_portfolio_backtest(allocations, prices, config, benchmark_returns=bench)
+
+    # Regardless of whether insufficient_sample also fires, the short window means NaN
+    assert math.isnan(result.benchmark_annual_return), (
+        f"Expected NaN for benchmark_annual_return on short window, "
+        f"got {result.benchmark_annual_return}"
+    )
+    assert math.isnan(result.tracking_error), (
+        f"Expected NaN for tracking_error on short window, got {result.tracking_error}"
+    )
+    assert math.isnan(result.info_ratio), (
+        f"Expected NaN for info_ratio on short window, got {result.info_ratio}"
+    )
+
+
+def test_short_window_benchmark_annualization_suppressed() -> None:
+    """A 20-trading-day bear regime with a small positive SPY return must NOT produce
+    a pathological Bench Ann Ret > 500%.
+
+    Without the MIN_ANNUALIZATION_WINDOW guard, (1+r)^(252/20)-1 over a small r can
+    explode to thousands-of-percent. With the guard, all three benchmark metrics
+    (bench_ann_ret, tracking_err, info_ratio) should be NaN.
+    """
+    assert 20 < MIN_ANNUALIZATION_WINDOW, "fixture is only meaningful below the threshold"
+
+    dates = pl.date_range(pl.date(2024, 1, 1), pl.date(2024, 1, 20), eager=True).to_list()
+
+    # Single stock with a small positive drift (mimics SPY in a short bear window)
+    prices_list = []
+    spy_prices = np.linspace(450.0, 453.0, len(dates))  # ~+0.7% period return
+    for d, p in zip(dates, spy_prices):
+        prices_list.append({"date": d, "symbol": "SPY", "close": float(p)})
+    prices = pl.DataFrame(prices_list)
+
+    allocations = pl.DataFrame(
+        [{"symbol": "SPY", "weight": 1.0, "cluster_id": "ETF_0", "prob_up": 0.80}]
+    )
+
+    config = {
+        "initial_capital": 100000,
+        "commission_pct": 0.001,
+        "risk": {
+            "position_stop_loss": 0.08,
+            "position_take_profit": 0.50,
+            "max_drawdown_limit": 0.25,
+            "cooldown_days": 2,
+        },
+    }
+
+    # Build a benchmark series with a small positive total return matching the window
+    # (19 daily returns for 20 equity data points)
+    bench = np.diff(spy_prices) / spy_prices[:-1]
+
+    result = run_portfolio_backtest(allocations, prices, config, benchmark_returns=bench)
+
+    # Core assertion: no pathological benchmark annualization
+    assert math.isnan(result.benchmark_annual_return), (
+        f"Expected NaN for benchmark_annual_return on short window, "
+        f"got {result.benchmark_annual_return:.2%}"
+    )
+    assert math.isnan(result.tracking_error), (
+        f"Expected NaN for tracking_error on short window, got {result.tracking_error}"
+    )
+    assert math.isnan(result.info_ratio), (
+        f"Expected NaN for info_ratio on short window, got {result.info_ratio}"
+    )
+
+    # Sanity: the raw period return should still be sensible (< 5%)
+    assert abs(result.total_return) < 0.05, (
+        f"Unexpected large total_return: {result.total_return:.2%}"
+    )
