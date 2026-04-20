@@ -79,12 +79,18 @@ def compute_normalization_stats(config: dict) -> dict:
 
     for i, col in enumerate(feature_cols):
         col_data = train_matrix[:, i]
-        std = float(np.std(col_data))
+        p_low = float(np.percentile(col_data, clip_pcts[0]))
+        p_high = float(np.percentile(col_data, clip_pcts[1]))
+        # Compute mean/std on the CLIPPED distribution so Z-score does not
+        # compress features into a tiny band when the raw distribution has
+        # heavy tails. See BEC-36.
+        clipped = np.clip(col_data, p_low, p_high)
+        std = float(np.std(clipped))
         stats["features"][col] = {
-            "mean": float(np.mean(col_data)),
+            "mean": float(np.mean(clipped)),
             "std": std if std > 0 else 1.0,
-            "p_low": float(np.percentile(col_data, clip_pcts[0])),
-            "p_high": float(np.percentile(col_data, clip_pcts[1])),
+            "p_low": p_low,
+            "p_high": p_high,
         }
 
     return stats
