@@ -127,6 +127,132 @@ def load_benchmark_returns(
     return returns
 
 
+def _enforce_sector_cap(
+    weights: np.ndarray,
+    symbols: list[str],
+    sector_map: dict[str, str],
+    max_sector_weight: float,
+    min_pos: float,
+    max_pos: float,
+    max_iterations: int = 100,
+    tol: float = 1e-9,
+) -> np.ndarray:
+    """Project weights onto the feasible set with both per-position and per-sector caps.
+
+    The feasible set enforced here:
+      * ``sum(weights) == 1``
+      * ``min_pos <= weights[i] <= max_pos`` for all i
+      * ``sum(weights[i] for i in sector) <= max_sector_weight`` for all sectors
+
+    The projection iteratively clips over-cap weights/sectors and redistributes the
+    removed mass to positions with headroom (respecting both the per-position
+    ``max_pos`` and the per-sector ``max_sector_weight``). This is a hard guarantee
+    that complements SLSQP's inequality constraints and also saves the equal-weight
+    fallback path (see BEC-40).
+
+    Infeasibility is handled gracefully: if the inputs cannot satisfy all three
+    invariants simultaneously (e.g. ``n * max_pos < 1`` or the cap is looser than
+    the floor), the function returns the closest feasible point it can reach and
+    renormalizes to sum to 1.
+
+    Args:
+        weights: Input weight vector (not modified in place).
+        symbols: Symbol list aligned with ``weights``.
+        sector_map: Mapping from symbol to sector name. Unknown symbols are bucketed.
+        max_sector_weight: Per-sector cap (e.g. 0.20).
+        min_pos: Minimum per-position weight.
+        max_pos: Maximum per-position weight.
+        max_iterations: Fixed-point iteration budget.
+        tol: Convergence / feasibility tolerance.
+
+    Returns:
+        Projected weights as a fresh ``np.ndarray``.
+    """
+    n = len(symbols)
+    if n == 0:
+        return np.array(weights, dtype=float).copy()
+
+    w = np.array(weights, dtype=float).copy()
+
+    # Group indices by sector
+    sectors: dict[str, list[int]] = {}
+    for i, s in enumerate(symbols):
+        sec = sector_map.get(s, "Unknown")
+        sectors.setdefault(sec, []).append(i)
+
+    # Effective per-position upper bound: the smaller of max_pos and the per-sector cap.
+    # If a position is the only one in its sector, the sector cap caps it directly.
+    effective_max = np.full(n, max_pos, dtype=float)
+    for sec, idx in sectors.items():
+        # Single-name sectors: the per-position cap cannot exceed the sector cap.
+        if len(idx) == 1:
+            effective_max[idx[0]] = min(effective_max[idx[0]], max_sector_weight)
+
+    # If total floor already exceeds 1, we're infeasible; just renormalize and return.
+    if n * min_pos > 1.0 + tol:
+        w = np.full(n, 1.0 / n)
+        return w
+
+    # Main projection loop: at each iteration, clamp to bounds and sector caps, then
+    # push any removed mass into positions with remaining headroom.
+    for _ in range(max_iterations):
+        # Clamp to per-position bounds
+        w = np.clip(w, min_pos, effective_max)
+
+        # Clamp over-cap sectors by scaling down the headroom-above-floor uniformly
+        for sec, idx in sectors.items():
+            sec_total = float(w[idx].sum())
+            if sec_total <= max_sector_weight + tol:
+                continue
+            floor_total = len(idx) * min_pos
+            target = max(floor_total, max_sector_weight)
+            headroom = w[idx] - min_pos
+            headroom_sum = float(headroom.sum())
+            if headroom_sum <= tol:
+                continue
+            reduction = sec_total - target
+            scale = max(0.0, 1.0 - reduction / headroom_sum)
+            w[idx] = min_pos + headroom * scale
+
+        total = float(w.sum())
+        diff = 1.0 - total
+        if abs(diff) <= tol:
+            break
+
+        if diff > 0:
+            # Need to add mass. Distribute to positions/sectors with headroom.
+            sector_room = {
+                sec: max(0.0, max_sector_weight - float(w[idx].sum()))
+                for sec, idx in sectors.items()
+            }
+            headrooms = np.zeros(n)
+            for i in range(n):
+                sec = sector_map.get(symbols[i], "Unknown")
+                headrooms[i] = min(effective_max[i] - w[i], sector_room.get(sec, 0.0))
+                if headrooms[i] < 0:
+                    headrooms[i] = 0.0
+            total_room = float(headrooms.sum())
+            if total_room <= tol:
+                # Nothing can absorb more mass — infeasible, exit.
+                break
+            w = w + headrooms / total_room * min(diff, total_room)
+        else:
+            # Need to remove mass. Scale down from headroom-above-floor globally.
+            headroom = np.maximum(0.0, w - min_pos)
+            headroom_sum = float(headroom.sum())
+            if headroom_sum <= tol:
+                break
+            reduction = min(-diff, headroom_sum)
+            scale = 1.0 - reduction / headroom_sum
+            w = min_pos + headroom * scale
+
+    # Final safety: if we still don't sum to 1, do a last renormalization.
+    total = float(w.sum())
+    if total > 0 and abs(total - 1.0) > tol:
+        w = w / total
+    return w
+
+
 def _build_returns_matrix(
     returns_df: pl.DataFrame,
     symbols: list[str],
@@ -223,6 +349,19 @@ def optimize_portfolio(
     # Build returns matrix for candidates
     returns_matrix = _build_returns_matrix(returns_df, symbols)
 
+    # Build sector map once so fallback paths can enforce the cap too.
+    sector_map: dict[str, str] = {}
+    if sectors_df is not None and not sectors_df.is_empty():
+        sector_map = dict(
+            zip(
+                sectors_df["symbol"].to_list(),
+                sectors_df["sector"].to_list(),
+            )
+        )
+
+    max_pos = constraints.get("max_single_position", 0.10)
+    min_pos = constraints.get("min_single_position", 0.01)
+
     if returns_matrix.size == 0 or returns_matrix.shape[0] < 10:
         # Not enough data — equal weight fallback
         weights = np.ones(n) / n
@@ -258,22 +397,13 @@ def optimize_portfolio(
             return obj
 
         # Constraints
-        max_pos = constraints.get("max_single_position", 0.10)
-        min_pos = constraints.get("min_single_position", 0.01)
-
         bounds = [(min_pos, max_pos) for _ in range(n)]
         constraint_list = [
             {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},  # weights sum to 1
         ]
 
         # Sector constraints
-        if sectors_df is not None:
-            sector_map = dict(
-                zip(
-                    sectors_df["symbol"].to_list(),
-                    sectors_df["sector"].to_list(),
-                )
-            )
+        if sector_map:
             sectors_in_portfolio = set(sector_map.get(s, "Unknown") for s in symbols)
             for sector in sectors_in_portfolio:
                 sector_indices = [
@@ -304,6 +434,20 @@ def optimize_portfolio(
         weights = result.x if result.success else w0
         # Normalize to sum to 1
         weights = weights / weights.sum()
+
+    # Hard invariant: enforce the per-profile sector cap even when SLSQP returned
+    # a slightly-infeasible solution, the fallback equal-weight path was taken, or
+    # the pre-selection left more symbols in one sector than the cap admits.
+    # See BEC-40.
+    if sector_map:
+        weights = _enforce_sector_cap(
+            weights=weights,
+            symbols=symbols,
+            sector_map=sector_map,
+            max_sector_weight=profile_config.max_sector_weight,
+            min_pos=min_pos,
+            max_pos=max_pos,
+        )
 
     # Build result DataFrame
     rows = []
