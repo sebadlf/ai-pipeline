@@ -1,10 +1,13 @@
 """Tests for portfolio optimizer."""
 
+import datetime as dt
+
 import numpy as np
 import polars as pl
 import pytest
 
 from src.config import PortfolioProfileConfig
+from src.portfolio.optimizer import optimize_portfolio
 
 
 @pytest.fixture
@@ -102,3 +105,165 @@ def test_different_profiles_different_candidates(sample_predictions: pl.DataFram
     conservative = sample_predictions.filter(pl.col("prob_up") >= 0.80)
     # Aggressive should have more candidates than conservative
     assert len(aggressive) >= len(conservative)
+
+
+def _build_returns_df(
+    symbols: list[str],
+    n_days: int = 60,
+    seed: int = 42,
+) -> pl.DataFrame:
+    """Build a synthetic long-format daily returns DataFrame."""
+    rng = np.random.default_rng(seed)
+    base = dt.date(2024, 1, 1)
+    rows = []
+    for sym in symbols:
+        for i in range(n_days):
+            rows.append(
+                {
+                    "date": base + dt.timedelta(days=i),
+                    "symbol": sym,
+                    "daily_return": float(rng.normal(0.0005, 0.01)),
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_sector_balanced_candidate_selection_caps_dominant_sector() -> None:
+    """One sector with 20 high prob_up stocks should not consume the entire candidate
+    pool — per-sector cap must apply BEFORE global top-K (see BEC-35)."""
+    # 20 ConsumerCyclical stocks with high prob_up + 5 from other sectors
+    rows = []
+    for i in range(20):
+        rows.append(
+            {
+                "symbol": f"CC{i:02d}",
+                "cluster_id": "ConsumerCyclical_0",
+                "prob_up": 0.95 - i * 0.001,  # all very high, slightly decreasing
+            }
+        )
+    other_sectors = [
+        ("AAPL", "Tech_0", 0.78),
+        ("JPM", "Finance_0", 0.75),
+        ("JNJ", "Health_0", 0.72),
+        ("XOM", "Energy_0", 0.70),
+        ("WMT", "Staples_0", 0.68),
+    ]
+    for sym, cid, p in other_sectors:
+        rows.append({"symbol": sym, "cluster_id": cid, "prob_up": p})
+
+    predictions = pl.DataFrame(rows)
+
+    # Sector mapping
+    sector_rows = [{"symbol": f"CC{i:02d}", "sector": "ConsumerCyclical"} for i in range(20)]
+    sector_rows.extend(
+        [
+            {"symbol": "AAPL", "sector": "Technology"},
+            {"symbol": "JPM", "sector": "FinancialServices"},
+            {"symbol": "JNJ", "sector": "Healthcare"},
+            {"symbol": "XOM", "sector": "Energy"},
+            {"symbol": "WMT", "sector": "ConsumerDefensive"},
+        ]
+    )
+    sectors_df = pl.DataFrame(sector_rows)
+
+    profile_config = PortfolioProfileConfig(
+        primary_metric="sharpe",
+        complementary_metric="calmar",
+        validation_metric="sortino",
+        max_positions=20,
+        max_sector_weight=0.25,
+        min_prob_up=0.65,
+    )
+    constraints = {"max_single_position": 0.10, "min_single_position": 0.01}
+
+    all_symbols = [r["symbol"] for r in rows]
+    returns_df = _build_returns_df(all_symbols)
+
+    allocation = optimize_portfolio(
+        predictions=predictions,
+        returns_df=returns_df,
+        profile_config=profile_config,
+        constraints=constraints,
+        benchmark_returns=None,
+        sectors_df=sectors_df,
+    )
+
+    # Per-sector cap = max(1, int(20 * 0.25)) = 5 — ConsumerCyclical can contribute at most 5
+    selected = allocation["symbol"].to_list()
+    cc_selected = [s for s in selected if s.startswith("CC")]
+    assert len(cc_selected) <= 5, (
+        f"ConsumerCyclical exceeded per-sector cap of 5: got {len(cc_selected)}"
+    )
+    # And the 5 high-prob other-sector stocks should have made it in
+    other_selected = [s for s in selected if not s.startswith("CC")]
+    assert len(other_selected) >= 5, (
+        f"Expected all 5 other-sector stocks to be selected, got {len(other_selected)}"
+    )
+
+
+def test_sector_balanced_selection_no_sectors_df_falls_back_to_global_topk() -> None:
+    """When sectors_df is None, behavior should match the previous global top-K logic."""
+    rows = [
+        {"symbol": f"S{i:02d}", "cluster_id": "C0", "prob_up": 0.90 - i * 0.01} for i in range(10)
+    ]
+    predictions = pl.DataFrame(rows)
+
+    profile_config = PortfolioProfileConfig(
+        primary_metric="sharpe",
+        complementary_metric="calmar",
+        validation_metric="sortino",
+        max_positions=5,
+        max_sector_weight=0.50,
+        min_prob_up=0.50,
+    )
+    constraints = {"max_single_position": 0.30, "min_single_position": 0.05}
+
+    returns_df = _build_returns_df([r["symbol"] for r in rows])
+
+    allocation = optimize_portfolio(
+        predictions=predictions,
+        returns_df=returns_df,
+        profile_config=profile_config,
+        constraints=constraints,
+        benchmark_returns=None,
+        sectors_df=None,
+    )
+
+    # Top 5 by prob_up
+    assert set(allocation["symbol"].to_list()) == {f"S{i:02d}" for i in range(5)}
+
+
+def test_sector_balanced_selection_preserves_output_schema() -> None:
+    """The new selection must keep [symbol, weight, cluster_id, prob_up] columns
+    (sector column is dropped after grouping)."""
+    rows = [
+        {"symbol": "AAPL", "cluster_id": "Tech_0", "prob_up": 0.85},
+        {"symbol": "JPM", "cluster_id": "Finance_0", "prob_up": 0.75},
+    ]
+    predictions = pl.DataFrame(rows)
+    sectors_df = pl.DataFrame(
+        [
+            {"symbol": "AAPL", "sector": "Technology"},
+            {"symbol": "JPM", "sector": "FinancialServices"},
+        ]
+    )
+    profile_config = PortfolioProfileConfig(
+        primary_metric="sharpe",
+        complementary_metric="calmar",
+        validation_metric="sortino",
+        max_positions=10,
+        max_sector_weight=0.50,
+        min_prob_up=0.50,
+    )
+    returns_df = _build_returns_df([r["symbol"] for r in rows])
+
+    allocation = optimize_portfolio(
+        predictions=predictions,
+        returns_df=returns_df,
+        profile_config=profile_config,
+        constraints={"max_single_position": 0.6, "min_single_position": 0.1},
+        benchmark_returns=None,
+        sectors_df=sectors_df,
+    )
+
+    assert set(allocation.columns) == {"symbol", "weight", "cluster_id", "prob_up"}

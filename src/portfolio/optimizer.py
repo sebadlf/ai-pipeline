@@ -191,8 +191,29 @@ def optimize_portfolio(
     if candidates.is_empty():
         return pl.DataFrame(schema=empty_schema)
 
-    # Limit to max_positions (sorted by prob_up)
-    candidates = candidates.sort("prob_up", descending=True).head(profile_config.max_positions)
+    # Sector-balanced selection: cap per-sector contributions BEFORE global top-K
+    # so one mis-calibrated sector can't dominate the candidate pool and make the
+    # SLSQP sector constraint trivially satisfied (see BEC-35).
+    if sectors_df is not None and not sectors_df.is_empty():
+        # per_sector_cap = max(1, floor(max_positions * max_sector_weight))
+        per_sector_cap = max(
+            1,
+            int(profile_config.max_positions * profile_config.max_sector_weight),
+        )
+        candidates = (
+            candidates.join(sectors_df, on="symbol", how="left")
+            .with_columns(pl.col("sector").fill_null("Unknown"))
+            .sort("prob_up", descending=True)
+            .group_by("sector", maintain_order=True)
+            .head(per_sector_cap)
+            .sort("prob_up", descending=True)
+            .head(profile_config.max_positions)
+            .drop("sector")
+        )
+    else:
+        # No sector info — fall back to global top-K by prob_up
+        candidates = candidates.sort("prob_up", descending=True).head(profile_config.max_positions)
+
     symbols = candidates["symbol"].to_list()
     n = len(symbols)
 
