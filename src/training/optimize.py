@@ -192,6 +192,157 @@ def calibrate_temperature(
     return optimal_temp, diagnostics
 
 
+def _expected_calibration_error(probs: np.ndarray, targets: np.ndarray, n_bins: int = 10) -> float:
+    """Compute Expected Calibration Error (ECE) with equal-width bins.
+
+    ECE = sum over bins of (|bin| / N) * |avg_prob - avg_label|. Lower is
+    better; a perfectly calibrated model has ECE = 0.
+    """
+    probs = np.asarray(probs, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.float64)
+    if len(probs) == 0:
+        return 0.0
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo = bin_edges[i]
+        hi = bin_edges[i + 1]
+        mask = (probs >= lo) & (probs < hi) if i < n_bins - 1 else (probs >= lo) & (probs <= hi)
+        if not mask.any():
+            continue
+        bin_prob = float(probs[mask].mean())
+        bin_label = float(targets[mask].mean())
+        ece += (mask.sum() / len(probs)) * abs(bin_prob - bin_label)
+    return float(ece)
+
+
+def calibrate_isotonic(
+    model: LSTMForecaster,
+    val_dataloader,
+    min_samples: int = 200,
+    max_knots: int = 64,
+) -> tuple[list[float] | None, list[float] | None, dict[str, float]]:
+    """Fit a post-hoc isotonic regression on top of the (temperature-scaled) UP probs.
+
+    This is applied AFTER ``calibrate_temperature`` — the temperature is
+    already stored on the model, so ``model.predict_proba`` returns the
+    post-temperature probabilities. Isotonic regression learns a monotone
+    1-D mapping from these probabilities to empirical UP frequencies on the
+    validation set.
+
+    Guarded by ``min_samples`` — if fewer validation samples are available
+    the isotonic step is skipped (returns None, None, diagnostics) to avoid
+    overfitting the correction to noise.
+
+    Args:
+        model: Trained model with calibration_temperature already set.
+        val_dataloader: Validation data loader.
+        min_samples: Minimum validation samples required to fit isotonic.
+        max_knots: Maximum knots kept in the final mapping (downsample the
+            IsotonicRegression step function for a compact checkpoint).
+
+    Returns:
+        (x_points, y_points, diagnostics). ``x_points`` and ``y_points``
+        define the piecewise-linear mapping; both are ``None`` when the
+        fit is skipped. ``diagnostics`` always contains ECE before/after
+        and the number of validation samples used.
+    """
+    from sklearn.isotonic import IsotonicRegression
+
+    model.eval()
+    all_probs: list[torch.Tensor] = []
+    all_targets: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for batch in val_dataloader:
+            x, y = batch[0], batch[1]
+            probs = model.predict_proba(x)
+            all_probs.append(probs[:, 1].cpu())
+            all_targets.append(y.cpu().long())
+
+    if not all_probs:
+        return (
+            None,
+            None,
+            {
+                "isotonic_fitted": 0.0,
+                "isotonic_n_samples": 0.0,
+                "isotonic_ece_pre": 0.0,
+                "isotonic_ece_post": 0.0,
+            },
+        )
+
+    probs_np = torch.cat(all_probs).numpy().astype(np.float64)
+    targets_np = torch.cat(all_targets).numpy().astype(np.float64)
+    n_samples = int(len(probs_np))
+
+    ece_pre = _expected_calibration_error(probs_np, targets_np)
+
+    diagnostics: dict[str, float] = {
+        "isotonic_fitted": 0.0,
+        "isotonic_n_samples": float(n_samples),
+        "isotonic_ece_pre": ece_pre,
+        "isotonic_ece_post": ece_pre,
+    }
+
+    if n_samples < min_samples:
+        print(
+            f"  Skipping isotonic calibration: only {n_samples} val samples "
+            f"(< {min_samples} required)"
+        )
+        return None, None, diagnostics
+
+    # Fit monotone non-decreasing mapping, clip out-of-range inputs at inference
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(probs_np, targets_np)
+
+    # Build a compact piecewise-linear representation. IsotonicRegression's
+    # internal knots may be very dense; sample on a uniform grid over the
+    # observed probability range so we keep the checkpoint small.
+    x_min = float(probs_np.min())
+    x_max = float(probs_np.max())
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+        return None, None, diagnostics
+
+    grid = np.linspace(x_min, x_max, num=max(2, min(max_knots, n_samples)))
+    y_grid = iso.transform(grid)
+
+    # Enforce strict monotonicity and valid probability range
+    y_grid = np.clip(y_grid, 0.0, 1.0)
+    y_grid = np.maximum.accumulate(y_grid)
+
+    # Remove collinear knots to shrink the stored mapping
+    x_points: list[float] = [float(grid[0])]
+    y_points: list[float] = [float(y_grid[0])]
+    for xi, yi in zip(grid[1:-1], y_grid[1:-1], strict=True):
+        # Keep a knot only when it adds a real kink (slope change)
+        if xi - x_points[-1] < 1e-6:
+            continue
+        x_points.append(float(xi))
+        y_points.append(float(yi))
+    x_points.append(float(grid[-1]))
+    y_points.append(float(y_grid[-1]))
+
+    if len(x_points) < 2:
+        return None, None, diagnostics
+
+    calibrated = np.interp(probs_np, x_points, y_points)
+    ece_post = _expected_calibration_error(calibrated, targets_np)
+
+    diagnostics.update(
+        {
+            "isotonic_fitted": 1.0,
+            "isotonic_ece_post": ece_post,
+            "isotonic_n_knots": float(len(x_points)),
+        }
+    )
+    print(
+        f"  Isotonic calibration fitted on {n_samples} val samples — "
+        f"ECE {ece_pre:.4f} -> {ece_post:.4f} ({len(x_points)} knots)"
+    )
+    return x_points, y_points, diagnostics
+
+
 def _get_random_symbols(
     cluster_id: str, clusters_parquet: str, n: int = 1, seed: int | None = None
 ) -> list[str]:
@@ -1146,7 +1297,21 @@ def train_final_model(
         model.hparams["calibration_temperature"] = optimal_temp
         print(f"  Calibration temperature: {optimal_temp:.4f}")
 
-        # Test (predict_proba now uses calibrated temperature)
+        # Post-hoc isotonic calibration (fit on top of temperature scaling)
+        iso_cfg = cal_cfg.get("isotonic", {}) or {}
+        iso_diagnostics: dict[str, float] = {}
+        if iso_cfg.get("enabled", True):
+            iso_x, iso_y, iso_diagnostics = calibrate_isotonic(
+                model,
+                dm.val_dataloader(),
+                min_samples=int(iso_cfg.get("min_samples", 200)),
+                max_knots=int(iso_cfg.get("max_knots", 64)),
+            )
+            if iso_x is not None and iso_y is not None:
+                model.hparams["calibration_isotonic_x"] = iso_x
+                model.hparams["calibration_isotonic_y"] = iso_y
+
+        # Test (predict_proba now uses calibrated temperature + isotonic map)
         test_results = trainer.test(model, dm)
         print(f"  Test results: {test_results}")
 
@@ -1202,6 +1367,9 @@ def train_final_model(
         # Log calibration temperature and diagnostics
         client.log_metric(run_id, "calibration_temperature", optimal_temp)
         for diag_key, diag_val in cal_diagnostics.items():
+            client.log_metric(run_id, diag_key, diag_val)
+        # Log isotonic calibration diagnostics (ECE pre/post + sample count)
+        for diag_key, diag_val in iso_diagnostics.items():
             client.log_metric(run_id, diag_key, diag_val)
 
         # Detect which early stopping triggered

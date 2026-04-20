@@ -191,12 +191,42 @@ class LSTMForecaster(L.LightningModule):
 
         Applies temperature scaling when calibration_temperature is set (> 0).
         Temperature > 1 softens probabilities (reduces overconfidence).
+
+        Additionally, applies a post-hoc isotonic regression mapping when
+        ``calibration_isotonic_x`` / ``calibration_isotonic_y`` are set
+        (stored in hparams as monotone piecewise-linear lookup tables). The
+        isotonic map is applied to the UP-class probability only; the
+        NOT_UP probability is recomputed as ``1 - p_up`` to preserve the
+        two-class simplex constraint.
         """
         logits = self(x)
         temp = self.hparams.get("calibration_temperature", 0.0)
         if temp > 0:
             logits = logits / temp
-        return torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+
+        iso_x = self.hparams.get("calibration_isotonic_x")
+        iso_y = self.hparams.get("calibration_isotonic_y")
+        if iso_x is not None and iso_y is not None and len(iso_x) >= 2:
+            # Apply monotone piecewise-linear mapping to the UP probability.
+            # torch interp keeps the computation on-device when x is on GPU.
+            x_tensor = torch.as_tensor(iso_x, dtype=probs.dtype, device=probs.device)
+            y_tensor = torch.as_tensor(iso_y, dtype=probs.dtype, device=probs.device)
+            p_up = probs[:, 1]
+            # Clip input to the calibrated domain (out_of_bounds="clip" parity)
+            p_up = torch.clamp(p_up, float(x_tensor[0].item()), float(x_tensor[-1].item()))
+            # Vectorised piecewise-linear interpolation.
+            idx = torch.searchsorted(x_tensor, p_up, right=False)
+            idx = torch.clamp(idx, 1, len(x_tensor) - 1)
+            x0 = x_tensor[idx - 1]
+            x1 = x_tensor[idx]
+            y0 = y_tensor[idx - 1]
+            y1 = y_tensor[idx]
+            denom = torch.clamp(x1 - x0, min=1e-12)
+            p_up_cal = y0 + (y1 - y0) * (p_up - x0) / denom
+            p_up_cal = torch.clamp(p_up_cal, 0.0, 1.0)
+            probs = torch.stack([1.0 - p_up_cal, p_up_cal], dim=-1)
+        return probs
 
     def _step(self, batch: tuple[torch.Tensor, ...], stage: str) -> torch.Tensor:
         x, y = batch[0], batch[1]
