@@ -1,8 +1,11 @@
 """MLflow introspection used by the loop coordinator.
 
-Kept deliberately thin: just ``total_runs()`` and a helper to decide if cleanup
-is due. All MLflow access goes through the tracking server URI set in
-``src/keys.py`` (``http://localhost:5000`` by default).
+Kept deliberately thin: ``total_runs()`` and ``days_since_last_cleanup()``
+expose objective signals about MLflow state. They are **informational only** —
+the decision to run ``make cleanup`` lives in the ``analyze`` phase (which sets
+``cleanup_recommended`` on the verdict). All MLflow access goes through the
+tracking server URI set in ``src/keys.py`` (``http://localhost:5000`` by
+default).
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import argparse
 import json
 from datetime import UTC, datetime
 
-from src.pipeline_loop import config, state
+from src.pipeline_loop import state
 
 
 def total_runs() -> int:
@@ -46,25 +49,14 @@ def days_since_last_cleanup() -> int | None:
     return (now - last).days
 
 
-def cleanup_needed() -> bool:
-    runs = total_runs()
-    days = days_since_last_cleanup()
-    return runs > config.MLFLOW_MAX_RUNS_BEFORE_CLEANUP or (
-        days is not None and days > config.MLFLOW_DAYS_SINCE_LAST_CLEANUP
-    )
-
-
 def _main() -> None:
-    parser = argparse.ArgumentParser(description="MLflow cleanup diagnostics.")
+    parser = argparse.ArgumentParser(description="MLflow cleanup diagnostics (informational).")
     parser.add_argument("--json", action="store_true", help="Emit as JSON (default).")
     args = parser.parse_args()
     _ = args
     out = {
         "total_runs": total_runs(),
         "days_since_last_cleanup": days_since_last_cleanup(),
-        "cleanup_needed": cleanup_needed(),
-        "threshold_runs": config.MLFLOW_MAX_RUNS_BEFORE_CLEANUP,
-        "threshold_days": config.MLFLOW_DAYS_SINCE_LAST_CLEANUP,
     }
     print(json.dumps(out, indent=2))
 

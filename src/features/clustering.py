@@ -234,9 +234,35 @@ def compute_clustering_features(
 
     # Per-symbol aggregated features
     features = []
+    # BEC-44: every symbol requested must appear in the output — symbols with
+    # insufficient history fall back to neutral feature values so they can
+    # still be clustered (rather than being silently dropped).
+    min_history = 60
+    short_history_symbols: list[str] = []
     for symbol in df["symbol"].unique().sort().to_list():
         sym_df = df.filter(pl.col("symbol") == symbol).drop_nulls(subset=["daily_return"])
-        if len(sym_df) < 60:
+        if len(sym_df) < min_history:
+            short_history_symbols.append(symbol)
+            sector = symbol_to_sector.get(symbol, "Unknown")
+            sym_fund = fund_data.get(symbol, {})
+            row_data = {
+                "symbol": symbol,
+                "return_20d_mean": 0.0,
+                "volatility_60d": 0.0,
+                "volume_profile": 1.0,
+                "rsi_14_mean": 50.0,
+                "beta_60d": 1.0,
+                "momentum_60d": 0.0,
+                "drawdown_max": 0.0,
+                "vix_beta": 0.0,
+                "yield_sensitivity": 0.0,
+                "relative_to_sector_avg": 0.0,
+            }
+            for f in _KM_FIELDS:
+                row_data[f"km_{f}"] = sym_fund.get(f"km_{f}")
+            for f in _FR_FIELDS:
+                row_data[f"fr_{f}"] = sym_fund.get(f"fr_{f}")
+            features.append(row_data)
             continue
 
         returns = sym_df["daily_return"].to_numpy()
@@ -347,6 +373,12 @@ def compute_clustering_features(
 
         features.append(row_data)
 
+    if short_history_symbols:
+        print(
+            f"  [stock-audit] clustering.compute_features: {len(short_history_symbols)} "
+            "symbols with < 60 days of history assigned neutral clustering features"
+        )
+
     return pl.DataFrame(features)
 
 
@@ -427,6 +459,39 @@ def run_clustering(
     all_symbols = sectors_df["symbol"].to_list()
     print(f"Computing clustering features for {len(all_symbols)} symbols...")
     feat_df = compute_clustering_features(engine, all_symbols, split_dates.train_end, sectors_df)
+
+    # BEC-44 invariant: compute_clustering_features must not drop symbols.
+    computed_symbols = set(feat_df["symbol"].to_list()) if "symbol" in feat_df.columns else set()
+    missing_feat = set(all_symbols) - computed_symbols
+    if missing_feat:
+        # Re-append missing symbols with neutral defaults. This is defensive:
+        # compute_clustering_features already pads short-history symbols, but
+        # if OHLCV is entirely missing for a symbol we still need a row.
+        rescued = []
+        for symbol in sorted(missing_feat):
+            row = {
+                "symbol": symbol,
+                "return_20d_mean": 0.0,
+                "volatility_60d": 0.0,
+                "volume_profile": 1.0,
+                "rsi_14_mean": 50.0,
+                "beta_60d": 1.0,
+                "momentum_60d": 0.0,
+                "drawdown_max": 0.0,
+                "vix_beta": 0.0,
+                "yield_sensitivity": 0.0,
+                "relative_to_sector_avg": 0.0,
+            }
+            for f in _KM_FIELDS:
+                row[f"km_{f}"] = None
+            for f in _FR_FIELDS:
+                row[f"fr_{f}"] = None
+            rescued.append(row)
+        feat_df = pl.concat([feat_df, pl.DataFrame(rescued)], how="vertical_relaxed")
+        print(
+            f"  [stock-audit] clustering: rescued {len(missing_feat)} symbols without OHLCV "
+            "with neutral features"
+        )
 
     feat_df = feat_df.join(sectors_df.select(["symbol", "sector"]), on="symbol", how="left")
 
@@ -686,6 +751,15 @@ def main() -> None:
 
     config = load_config(args.config)
 
+    # Determine the universe of ingested symbols for the BEC-44 audit.
+    audit_engine = get_engine()
+    try:
+        ingested_df = pl.read_database("SELECT DISTINCT symbol FROM ohlcv_daily", audit_engine)
+        ingested_symbols = set(ingested_df["symbol"].to_list())
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"  [stock-audit] warning: could not enumerate ohlcv_daily symbols ({exc})")
+        ingested_symbols = set()
+
     # In dev, use sector-based clustering (fast)
     # In prod, use full KMeans clustering
     if PIPELINE_ENV == "dev":
@@ -694,6 +768,25 @@ def main() -> None:
     else:
         print("Running in PROD mode: Using KMeans clustering")
         result_df, cluster_stats = run_clustering(config)
+
+    # Stock-preservation audit (BEC-44): every ingested symbol that has a
+    # sector assignment must end up in a cluster. Symbols without a sector
+    # row cannot be clustered today — that's a pre-existing ingestion gap,
+    # logged but not enforced here.
+    from src.features.stock_audit import audit_symbols
+
+    clustered_symbols = set(result_df["symbol"].to_list())
+    if ingested_symbols:
+        # Sectors are populated by ingestion alongside OHLCV; missing sector
+        # rows point to an ingestion-side gap, flagged (not raised) here.
+        sectors_missing = ingested_symbols - set(load_sectors(audit_engine)["symbol"].to_list())
+        if sectors_missing:
+            print(
+                f"  [stock-audit] clustering: {len(sectors_missing)} ingested symbols lack "
+                "sector rows and cannot be clustered (ingestion gap, not enforced)"
+            )
+        expected = ingested_symbols - sectors_missing
+        audit_symbols("clustering", expected, clustered_symbols)
 
     # Cluster stability check: compare with previous assignments
     cluster_cfg_obj = ClusterConfig.from_dict(config.get("clustering", {}))
