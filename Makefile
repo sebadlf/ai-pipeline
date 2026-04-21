@@ -1,4 +1,4 @@
-.PHONY: setup up down ingest ingest-force features select-features normalize cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup cleanup-keep-features cleanup-dry-run mlflow-housekeeping test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
+.PHONY: setup up down ingest ingest-force features select-features normalize cluster optimize-global train-clusters train-global promote aggregate portfolio backtest signals cleanup cleanup-keep-features cleanup-dry-run mlflow-housekeeping mlflow-orphan-sweep test mlflow-report mlflow-report-prod pipeline pipeline-prod pipeline-loop
 
 # =============================================================================
 # Infrastructure
@@ -106,7 +106,9 @@ sys.exit(0) if p.exists() and 'silhouette_mean_cluster' in __import__('polars').
 # changes to src/features/normalize.py take effect on the next training
 # pass — see BEC-41).
 # Also forces cluster rebuild when clusters.parquet schema is stale (BEC-52).
+# Runs orphan sweep at start to clean up stuck RUNNING MLflow runs (BEC-55).
 pipeline:
+	$(MAKE) mlflow-orphan-sweep
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ] || ! $(CLUSTERS_SCHEMA_OK); then \
 		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features normalize cluster; \
@@ -118,7 +120,9 @@ pipeline:
 	$(MAKE) train-clusters promote aggregate portfolio backtest
 
 # Pipeline for prod - includes ingestion
+# Runs orphan sweep at start to clean up stuck RUNNING MLflow runs (BEC-55).
 pipeline-prod:
+	$(MAKE) mlflow-orphan-sweep
 	$(MAKE) ingest-force
 	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ] || ! $(CLUSTERS_SCHEMA_OK); then \
 		echo "Rebuilding features/clusters..."; \
@@ -159,6 +163,9 @@ cleanup-dry-run:
 
 mlflow-housekeeping:
 	uv run python -m src.pipeline_loop.mlflow_housekeeping
+
+mlflow-orphan-sweep:
+	uv run python -m src.pipeline_loop.mlflow_housekeeping --stale-hours 6
 
 test:
 	uv run pytest tests/ -v

@@ -6,14 +6,17 @@ Uses unittest.mock to avoid any real MLflow / network calls.
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.pipeline_loop.mlflow_housekeeping import (
+    AUTO_CLEANUP_TAG_KEY,
+    AUTO_CLEANUP_TAG_VALUE,
     ERROR_ARCHIVE_VALUE,
     HOUSEKEEPING_TAG,
     ORPHAN_TAG_KEY,
     ORPHAN_TAG_VALUE,
     sweep_orphaned_running,
+    sweep_pipeline_orphans,
     tag_error_runs,
 )
 
@@ -214,3 +217,76 @@ class TestTagErrorRuns:
         result = tag_error_runs(client, dry_run=True)
         assert result == ["err-5"]
         client.set_tag.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# auto_cleanup tag on orphaned runs
+# ---------------------------------------------------------------------------
+
+
+class TestAutoCleanupTag:
+    def test_stale_run_gets_auto_cleanup_tag(self):
+        """Force-failed orphaned runs must receive the auto_cleanup=orphan tag."""
+        stale_ms = int(time.time() * 1000) - 2 * 3600 * 1000
+        run = _make_run("stale-ac-1", start_time_ms=stale_ms)
+        client = _make_client(runs_by_query={"attributes.status = 'RUNNING'": [run]})
+        sweep_orphaned_running(client, stale_hours=1.0)
+        tag_calls = {c.args[1]: c.args[2] for c in client.set_tag.call_args_list}
+        assert tag_calls.get(AUTO_CLEANUP_TAG_KEY) == AUTO_CLEANUP_TAG_VALUE
+
+    def test_dry_run_no_auto_cleanup_tag(self):
+        """Dry-run must not set any tags, including auto_cleanup."""
+        stale_ms = int(time.time() * 1000) - 2 * 3600 * 1000
+        run = _make_run("stale-ac-2", start_time_ms=stale_ms)
+        client = _make_client(runs_by_query={"attributes.status = 'RUNNING'": [run]})
+        sweep_orphaned_running(client, stale_hours=1.0, dry_run=True)
+        client.set_tag.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# sweep_pipeline_orphans (pipeline-start guard)
+# ---------------------------------------------------------------------------
+
+
+class TestSweepPipelineOrphans:
+    def test_returns_empty_on_mlflow_error(self):
+        """Pipeline must not fail when MLflow is unreachable."""
+        with patch(
+            "src.pipeline_loop.mlflow_housekeeping.MlflowClient",
+            side_effect=Exception("connection refused"),
+        ):
+            result = sweep_pipeline_orphans("http://localhost:9999")
+        assert result == []
+
+    def test_uses_6h_stale_threshold_by_default(self):
+        """Default threshold for pipeline guard must be 6 hours (PIPELINE_STALE_HOURS)."""
+        # A run started 5h ago should NOT be failed (< 6h threshold).
+        recent_ms = int(time.time() * 1000) - 5 * 3600 * 1000
+        stale_run = _make_run("stale-pp-1", start_time_ms=recent_ms)
+        client_mock = _make_client(runs_by_query={"attributes.status = 'RUNNING'": [stale_run]})
+        with (
+            patch("src.pipeline_loop.mlflow_housekeeping.mlflow"),
+            patch(
+                "src.pipeline_loop.mlflow_housekeeping.MlflowClient",
+                return_value=client_mock,
+            ),
+        ):
+            result = sweep_pipeline_orphans("http://localhost:5000")
+        assert result == []  # 5h < 6h threshold → not orphaned
+        client_mock.set_terminated.assert_not_called()
+
+    def test_fails_runs_older_than_6h(self):
+        """A run started 7h ago must be force-failed by the pipeline guard."""
+        old_ms = int(time.time() * 1000) - 7 * 3600 * 1000
+        stale_run = _make_run("stale-pp-2", start_time_ms=old_ms)
+        client_mock = _make_client(runs_by_query={"attributes.status = 'RUNNING'": [stale_run]})
+        with (
+            patch("src.pipeline_loop.mlflow_housekeeping.mlflow"),
+            patch(
+                "src.pipeline_loop.mlflow_housekeeping.MlflowClient",
+                return_value=client_mock,
+            ),
+        ):
+            result = sweep_pipeline_orphans("http://localhost:5000")
+        assert result == ["stale-pp-2"]
+        client_mock.set_terminated.assert_called_once_with("stale-pp-2", status="FAILED")
