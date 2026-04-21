@@ -357,6 +357,12 @@ class PromotionEvalConfig:
     max_std_ratio: float = 0.15
     stability_penalty: float = 1.5
     tiebreak_margin: float = 0.01
+    # BEC-61: guard against low-stability candidates displacing stable champions.
+    # Candidates must have stability_score >= min_stability_floor and >= 0.5 *
+    # champion.stability_score to be promotable. Prevents stability=0 models from
+    # winning the BEC-58 iso tiebreaker (cycle-6 regression root cause).
+    min_stability_floor: float = 0.15
+    min_stability_ratio: float = 0.5
 
     @classmethod
     def from_dict(cls, promotion_cfg: dict) -> PromotionEvalConfig:
@@ -375,6 +381,8 @@ class PromotionEvalConfig:
             max_std_ratio=wf_cfg.get("max_std_ratio", 0.15),
             stability_penalty=wf_cfg.get("stability_penalty", 1.5),
             tiebreak_margin=rank_cfg.get("tiebreak_margin", 0.01),
+            min_stability_floor=eval_cfg.get("min_stability_floor", 0.15),
+            min_stability_ratio=eval_cfg.get("min_stability_ratio", 0.5),
         )
 
 

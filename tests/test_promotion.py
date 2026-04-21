@@ -460,6 +460,176 @@ class TestCascadingCompare:
 
 
 # --------------------------------------------------------------------------- #
+# BEC-61 low-stability guard                                                  #
+# --------------------------------------------------------------------------- #
+
+
+class TestLowStabilityGuard:
+    """BEC-61: block stability=~0 candidates from displacing stable champions."""
+
+    def test_candidate_below_absolute_floor_rejected(self, cascading_cfg: dict) -> None:
+        """Candidate with stability < min_stability_floor never promotes,
+        even when the BEC-58 iso early-exit would otherwise fire.
+        """
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_signals",
+            "val_stability_score": 0.05,  # below 0.15 floor
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.40,
+            # No isotonic_fitted — uncalibrated, so iso early-exit would normally win
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "tiebreaker=low_stability" in reason
+        assert "min_stability_floor" in reason
+
+    def test_candidate_below_relative_floor_rejected(self, cascading_cfg: dict) -> None:
+        """Candidate stability < 0.5 * champion stability never promotes.
+
+        Acceptance criterion: champion stability=0.4, candidate stability=0.05 with
+        marginally higher primary metric → champion retained.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.18,  # above floor, but 0.18 < 0.5 * 0.40 = 0.20
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.40,
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "tiebreaker=low_stability" in reason
+        assert "champion" in reason
+
+    def test_candidate_above_both_floors_still_compared_normally(self, cascading_cfg: dict) -> None:
+        """Guards do not interfere with normal comparison when candidate is stable enough."""
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.80,  # above floor and above 0.5 * 0.40
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.40,
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "tiebreaker=stability_score" in reason
+
+    def test_acceptance_criterion_stable_champion_vs_unstable_candidate(
+        self, cascading_cfg: dict
+    ) -> None:
+        """BEC-61 acceptance criterion: seed champion stability=0.4, candidate stability=0.05
+        with slightly higher primary metric; champion is retained.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.05,
+            "val_precision_up": 0.72,  # slightly higher than champion
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.40,
+            "val_precision_up": 0.70,
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "tiebreaker=low_stability" in reason
+
+    def test_guard_fires_before_iso_early_exit_tiebreaker(self, cascading_cfg: dict) -> None:
+        """BEC-61: the low-stability guard must fire BEFORE the BEC-58 iso
+        early-exit, which was the root cause of the cycle-6 regression.
+        """
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_signals",
+            "val_stability_score": 0.08,  # below 0.15 floor
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.40,
+            # uncalibrated — BEC-58 would normally fire
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "tiebreaker=low_stability" in reason
+        # Ensure the iso tiebreaker did NOT win
+        assert "iso_calibration" not in reason
+
+    def test_guard_configurable_floor(self) -> None:
+        """The floor can be tuned via config. Setting floor=0 disables the absolute guard."""
+        cfg = {
+            "evaluation": {
+                "thresholds": [0.60],
+                "primary_threshold": 0.60,
+                "min_recall": 0.10,
+                "min_signals_per_window": 5,
+                "min_stability_floor": 0.0,
+                "min_stability_ratio": 0.0,
+            },
+            "walk_forward": {
+                "window_size": 63,
+                "step_size": 21,
+                "max_std_ratio": 0.15,
+                "stability_penalty": 1.5,
+            },
+            "ranking": {"tiebreak_margin": 0.01},
+        }
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.10,  # above default 0.15 floor when guards disabled
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.05,
+        }
+        beats, reason = cascading_compare(cand, champ, cfg)
+        # With both guards disabled, candidate wins on stability_score (outside margin)
+        assert beats is True
+        assert "low_stability" not in reason
+        assert "stability_score" in reason
+
+    def test_guard_does_not_fire_when_candidate_missing_score(self, cascading_cfg: dict) -> None:
+        """Missing stability score falls through to existing 'missing score' path,
+        not the low-stability guard.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            # No val_stability_score
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.40,
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "missing val_stability_score" in reason
+
+    def test_guard_does_not_fire_when_champion_stability_zero(self, cascading_cfg: dict) -> None:
+        """Relative guard cannot fire when champion stability is 0 (divide-by-zero safety).
+
+        The absolute floor still applies — candidate=0.20 is above 0.15 floor.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.20,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.0,
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        # Relative guard skipped, candidate wins on stability_score comparison
+        assert "low_stability" not in reason
+
+
+# --------------------------------------------------------------------------- #
 # _find_best_candidate tier fallback                                           #
 # --------------------------------------------------------------------------- #
 
