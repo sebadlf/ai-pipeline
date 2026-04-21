@@ -1,16 +1,23 @@
 """Tests for portfolio backtesting."""
 
+import datetime as dt
 import math
+from unittest.mock import MagicMock
 
 import numpy as np
 import polars as pl
 import pytest
 
 from src.evaluation.backtest import (
+    DEFAULT_REGRESSION_THRESHOLD,
     MIN_ANNUALIZATION_WINDOW,
     MIN_DRAWDOWN_PCT_FOR_METRICS,
     MIN_TRADES_FOR_METRICS,
     BacktestResult,
+    RegressionFlag,
+    RegressionGuardResult,
+    _sharpe_drop_pct,
+    check_regression_guard,
     run_portfolio_backtest,
 )
 
@@ -251,3 +258,199 @@ def test_short_window_benchmark_annualization_suppressed() -> None:
     assert abs(result.total_return) < 0.05, (
         f"Unexpected large total_return: {result.total_return:.2%}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_engine_mock(prior_date: dt.date | None, prior_rows: list[tuple]) -> MagicMock:
+    """Build a mock SQLAlchemy engine for the regression guard.
+
+    Args:
+        prior_date: The MAX(run_date) the first query returns (None = no rows).
+        prior_rows: Rows returned for the second query (profile, regime, sharpe).
+    """
+    engine = MagicMock()
+    conn_ctx = MagicMock()
+    conn = MagicMock()
+    conn_ctx.__enter__ = MagicMock(return_value=conn)
+    conn_ctx.__exit__ = MagicMock(return_value=False)
+    engine.connect.return_value = conn_ctx
+
+    # First call returns prior_date row; second call returns sharpe rows.
+    prior_date_result = MagicMock()
+    prior_date_result.fetchone.return_value = (prior_date,) if prior_date else None
+
+    prior_sharpe_result = MagicMock()
+    prior_sharpe_result.fetchall.return_value = prior_rows
+
+    conn.execute.side_effect = [prior_date_result, prior_sharpe_result]
+    return engine
+
+
+def _make_results(sharpe_map: dict[tuple[str, str], float]) -> list[BacktestResult]:
+    """Build a minimal list of BacktestResult objects for testing."""
+    results = []
+    for (profile, regime), sharpe in sharpe_map.items():
+        r = BacktestResult()
+        r.profile = profile
+        r.regime = regime
+        r.sharpe_ratio = sharpe
+        results.append(r)
+    return results
+
+
+class TestSharpeDropPct:
+    def test_no_drop(self) -> None:
+        assert _sharpe_drop_pct(1.0, 1.0) == 0.0
+
+    def test_30_pct_drop(self) -> None:
+        assert abs(_sharpe_drop_pct(1.0, 0.7) - 0.30) < 1e-9
+
+    def test_improvement(self) -> None:
+        # Current better than previous → negative drop → no flag
+        assert _sharpe_drop_pct(1.0, 1.5) < 0.0
+
+    def test_non_finite_previous(self) -> None:
+        assert _sharpe_drop_pct(float("nan"), 1.0) == 0.0
+
+    def test_non_finite_current(self) -> None:
+        assert _sharpe_drop_pct(1.0, float("nan")) == 0.0
+
+    def test_zero_previous(self) -> None:
+        # Guard against divide-by-zero
+        assert _sharpe_drop_pct(0.0, 1.0) == 0.0
+
+
+class TestCheckRegressionGuard:
+    def test_skipped_when_no_prior_run(self) -> None:
+        engine = _make_engine_mock(prior_date=None, prior_rows=[])
+        results = _make_results({("moderate", "sideways"): 1.2})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.skipped is True
+        assert guard.has_regression is False
+
+    def test_no_flag_when_sharpe_stable(self) -> None:
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.2), ("moderate", "bull", 1.5)],
+        )
+        # Current is the same — no drop
+        results = _make_results({("moderate", "sideways"): 1.2, ("moderate", "bull"): 1.5})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.skipped is False
+        assert guard.has_regression is False
+        assert guard.previous_run_date == prior
+
+    def test_flag_when_sharpe_drops_more_than_threshold(self) -> None:
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        # 50% drop — exceeds default 30% threshold
+        results = _make_results({("moderate", "sideways"): 0.5})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.has_regression is True
+        assert len(guard.flags) == 1
+        flag = guard.flags[0]
+        assert flag.profile == "moderate"
+        assert flag.regime == "sideways"
+        assert abs(flag.drop_pct - 0.50) < 1e-9
+
+    def test_no_flag_when_drop_is_below_threshold(self) -> None:
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        # 20% drop — below default 30% threshold
+        results = _make_results({("moderate", "sideways"): 0.80})
+        guard = check_regression_guard(results, engine=engine, threshold=0.30)
+        assert guard.has_regression is False
+
+    def test_custom_threshold(self) -> None:
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        # 20% drop triggers with a custom 10% threshold
+        results = _make_results({("moderate", "sideways"): 0.80})
+        guard = check_regression_guard(results, engine=engine, threshold=0.10)
+        assert guard.has_regression is True
+
+    def test_skipped_when_cell_missing_in_current(self) -> None:
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        # Current results don't contain (moderate, sideways)
+        results = _make_results({("aggressive", "bull"): 2.0})
+        guard = check_regression_guard(
+            results, engine=engine, guard_cells=[("moderate", "sideways")]
+        )
+        assert guard.has_regression is False
+
+    def test_skipped_on_db_error(self) -> None:
+        engine = MagicMock()
+        conn_ctx = MagicMock()
+        conn = MagicMock()
+        conn_ctx.__enter__ = MagicMock(return_value=conn)
+        conn_ctx.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = conn_ctx
+        conn.execute.side_effect = RuntimeError("DB down")
+        results = _make_results({("moderate", "sideways"): 1.0})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.skipped is True
+
+    def test_multiple_flags_in_one_run(self) -> None:
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[
+                ("moderate", "sideways", 2.0),
+                ("moderate", "bull", 3.0),
+                ("moderate", "bear", 0.5),
+            ],
+        )
+        # All drop by > 30%
+        results = _make_results(
+            {
+                ("moderate", "sideways"): 1.0,  # -50%
+                ("moderate", "bull"): 1.5,  # -50%
+                ("moderate", "bear"): 0.2,  # -60%
+            }
+        )
+        guard = check_regression_guard(
+            results,
+            engine=engine,
+            guard_cells=[
+                ("moderate", "sideways"),
+                ("moderate", "bull"),
+                ("moderate", "bear"),
+            ],
+        )
+        assert guard.has_regression is True
+        assert len(guard.flags) == 3
+
+    def test_regression_guard_result_dataclass(self) -> None:
+        result = RegressionGuardResult()
+        assert result.has_regression is False
+        assert result.skipped is False
+        flag = RegressionFlag(
+            profile="moderate",
+            regime="sideways",
+            previous_sharpe=1.0,
+            current_sharpe=0.5,
+            drop_pct=0.5,
+        )
+        result.flags.append(flag)
+        assert result.has_regression is True
+
+    def test_default_threshold_is_30_pct(self) -> None:
+        assert DEFAULT_REGRESSION_THRESHOLD == 0.30
