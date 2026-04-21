@@ -94,12 +94,20 @@ signals:
 # Full Pipeline
 # =============================================================================
 
+# Check if clusters.parquet has the expected schema (silhouette_mean_cluster column).
+# Returns exit code 1 (needs rebuild) if missing or schema is stale.
+CLUSTERS_SCHEMA_OK = uv run python -c "\
+import sys, pathlib; \
+p = pathlib.Path('data/clusters.parquet'); \
+sys.exit(0) if p.exists() and 'silhouette_mean_cluster' in __import__('polars').read_parquet(str(p), n_rows=0).columns else sys.exit(1)"
+
 # Pipeline for dev - skips ingestion by default
 # Always re-runs normalization (cheap vs training, and required so that
 # changes to src/features/normalize.py take effect on the next training
 # pass — see BEC-41).
+# Also forces cluster rebuild when clusters.parquet schema is stale (BEC-52).
 pipeline:
-	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
+	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ] || ! $(CLUSTERS_SCHEMA_OK); then \
 		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features normalize cluster; \
 		rm -f data/.new_data; \
@@ -112,7 +120,7 @@ pipeline:
 # Pipeline for prod - includes ingestion
 pipeline-prod:
 	$(MAKE) ingest-force
-	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ]; then \
+	@if [ -f data/.new_data ] || [ ! -f data/clusters.parquet ] || ! $(CLUSTERS_SCHEMA_OK); then \
 		echo "Rebuilding features/clusters..."; \
 		$(MAKE) features select-features normalize cluster; \
 		rm -f data/.new_data; \
