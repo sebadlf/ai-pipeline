@@ -142,7 +142,7 @@ training:
       # Training hyperparams
       learning_rate: { low: 1.0e-4, high: 1.0e-2, log: true }
       batch_size: [64, 128, 256]
-      weight_decay: { low: 1.0e-3, high: 0.2, log: true }
+      weight_decay: { low: 1.0e-2, high: 0.2, log: true }
       label_smoothing: { low: 0.02, high: 0.12 }
       focal_gamma: { low: 0.0, high: 3.0 }
       noise_std: { low: 0.01, high: 0.08 }
@@ -153,6 +153,7 @@ training:
       sequence_length: [10, 20, 30]
       input_dropout: { low: 0.05, high: 0.4 }
       head_hidden_ratio: { low: 0.25, high: 0.5 }
+      confidence_penalty_beta: { low: 0.0, high: 0.2 }
     # Fixed params — sensible defaults not searched by Optuna
     # Reduces search space dimensionality to prevent overtuning
     fixed_params:

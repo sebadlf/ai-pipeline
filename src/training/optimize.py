@@ -471,11 +471,11 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
             return trial.suggest_float(name, float(low), float(high), log=spec.get("log", False))
         return spec
 
-    # Tunable params (~12) — optimized per cluster
+    # Tunable params (~13) — optimized per cluster
     tuned = {
         "learning_rate": _suggest("learning_rate", {"low": 1e-4, "high": 1e-2, "log": True}),
         "batch_size": _suggest("batch_size", [64, 128, 256]),
-        "weight_decay": _suggest("weight_decay", {"low": 1e-3, "high": 0.2, "log": True}),
+        "weight_decay": _suggest("weight_decay", {"low": 1e-2, "high": 0.2, "log": True}),
         "label_smoothing": _suggest("label_smoothing", {"low": 0.02, "high": 0.12}),
         "focal_gamma": _suggest("focal_gamma", {"low": 0.0, "high": 3.0}),
         "noise_std": _suggest("noise_std", {"low": 0.01, "high": 0.08}),
@@ -485,6 +485,7 @@ def suggest_hyperparams(trial: optuna.Trial, config: dict) -> dict[str, Any]:
         "sequence_length": _suggest("sequence_length", [10, 20, 30]),
         "input_dropout": _suggest("input_dropout", {"low": 0.05, "high": 0.4}),
         "head_hidden_ratio": _suggest("head_hidden_ratio", {"low": 0.25, "high": 0.5}),
+        "confidence_penalty_beta": _suggest("confidence_penalty_beta", {"low": 0.0, "high": 0.2}),
     }
 
     # Fixed params (~7) — sensible defaults, not searched
@@ -538,6 +539,7 @@ def _deduplicate_trials(
         "input_dropout",
         "weight_decay",
         "batch_size",
+        "confidence_penalty_beta",
     ),
 ) -> list[optuna.trial.FrozenTrial]:
     """Select top-K trials with meaningfully different hyperparameters.
@@ -734,6 +736,7 @@ def _create_trial_objective(
             head_hidden_ratio=params["head_hidden_ratio"],
             activation=params["activation"],
             input_dropout=params["input_dropout"],
+            confidence_penalty_beta=params.get("confidence_penalty_beta", 0.0),
         )
 
         early_stop = EarlyStopping(
@@ -1347,6 +1350,7 @@ def train_final_model(
         head_hidden_ratio=best_params.get("head_hidden_ratio", 0.5),
         activation=best_params.get("activation", "gelu"),
         input_dropout=best_params.get("input_dropout", 0.0),
+        confidence_penalty_beta=best_params.get("confidence_penalty_beta", 0.0),
     )
 
     # MLflow logger
@@ -1785,6 +1789,7 @@ def _create_global_trial_objective(
             head_hidden_ratio=params["head_hidden_ratio"],
             activation=params["activation"],
             input_dropout=params["input_dropout"],
+            confidence_penalty_beta=params.get("confidence_penalty_beta", 0.0),
         )
 
         # Callbacks: early stopping + Optuna pruning

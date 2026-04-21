@@ -76,6 +76,10 @@ class LSTMForecaster(L.LightningModule):
         head_hidden_ratio: MLP head hidden layer size as fraction of hidden_size.
         activation: Activation function in MLP head ("gelu", "silu", "mish").
         input_dropout: Dropout applied to input features before LayerNorm.
+        confidence_penalty_beta: Confidence penalty strength (Pereyra et al. 2017).
+            Adds ``-beta * H(p)`` to the loss, where H is prediction entropy.
+            Penalizes low-entropy (overconfident) predictions. Range [0.0, 0.2].
+            beta=0.0 disables the penalty (default, backward-compatible).
     """
 
     def __init__(
@@ -99,6 +103,7 @@ class LSTMForecaster(L.LightningModule):
         head_hidden_ratio: float = 0.5,
         activation: str = "gelu",
         input_dropout: float = 0.0,
+        confidence_penalty_beta: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -251,11 +256,25 @@ class LSTMForecaster(L.LightningModule):
         else:
             loss = self.loss_fn(logits, y)
 
+        # Confidence penalty (Pereyra et al. 2017): -beta * H(p)
+        # Penalizes low-entropy predictions to reduce overconfidence.
+        beta = self.hparams.get("confidence_penalty_beta", 0.0)
+        probs = torch.softmax(logits, dim=-1)
+        # Entropy H(p) = -sum(p * log(p)); clamped to avoid log(0)
+        entropy = -(probs * torch.log(probs.clamp(min=1e-8))).sum(dim=-1)
+        entropy_mean = entropy.mean()
+        if beta > 0.0 and stage == "train":
+            # Add -beta * H(p) to penalize low entropy (overconfident predictions)
+            loss = loss - beta * entropy_mean
+
         preds = logits.argmax(dim=-1)
         acc = (preds == y).float().mean()
 
         self.log(f"{stage}_loss", loss, prog_bar=True)
         self.log(f"{stage}_acc", acc, prog_bar=True)
+        # Log entropy for calibration monitoring (train and val)
+        if stage in ("train", "val"):
+            self.log(f"{stage}_entropy_mean", entropy_mean, prog_bar=False)
 
         if stage in ("val", "train"):
             up_preds = preds == 1
@@ -275,7 +294,7 @@ class LSTMForecaster(L.LightningModule):
             self.log(f"{stage}_recall_up", recall_up, prog_bar=(stage == "val"))
 
         if stage == "val":
-            probs = torch.softmax(logits, dim=-1)
+            # `probs` already computed above for entropy; reuse here
             self.log("val_mean_prob_up", probs[:, 1].mean(), prog_bar=True)
 
             # Calibration diagnostics: probability distribution
