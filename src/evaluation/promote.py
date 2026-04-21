@@ -86,6 +86,12 @@ def cascading_compare(
     cand_passed = cand_metrics.get("val_passed_all_filters")
     cand_stage = cand_metrics.get("val_elimination_stage", "unknown")
 
+    def _is_calibrated(metrics: dict[str, Any]) -> bool:
+        try:
+            return float(metrics.get("isotonic_fitted", 0)) >= 1.0
+        except (TypeError, ValueError):
+            return False
+
     # No champion exists → always promote (cold-start fallback) even if filters failed,
     # so every cluster ends up with at least one registered champion version.
     if champ_metrics is None:
@@ -94,6 +100,25 @@ def cascading_compare(
             score_str = f"score={float(score):.4f}" if score is not None else "no score"
             return True, f"no existing champion ({score_str})"
         return True, f"no existing champion (fallback, stage={cand_stage})"
+
+    # BEC-58: iso-asymmetric early exit — fires BEFORE cand_passed short-circuit.
+    # When the current champion was never isotonic-calibrated (iso=0) and the
+    # candidate is calibrated (iso=1) with reasonable stability, promote regardless
+    # of non-stability filter failures. This ensures the BEC-37/BEC-38 calibration
+    # fixes take effect even when a candidate fails e.g. min_signals coverage.
+    cand_calibrated = _is_calibrated(cand_metrics)
+    champ_calibrated = _is_calibrated(champ_metrics)
+    if cand_calibrated and not champ_calibrated and cand_passed != "true":
+        cand_score = cand_metrics.get("val_stability_score")
+        if cand_score is not None:
+            cand_score_f = float(cand_score)
+            reason = (
+                f"tiebreaker=iso_calibration (early): candidate is isotonic-calibrated "
+                f"and champion is not; candidate failed non-stability filter "
+                f"({cand_stage}) but has stability score {cand_score_f:.4f}"
+            )
+            logger.info("cascading_compare iso early-exit fired: %s", reason)
+            return True, reason
 
     if cand_passed != "true":
         return False, f"candidate failed filters ({cand_stage})"
@@ -112,15 +137,6 @@ def cascading_compare(
     if champ_score is None:
         return True, f"champion missing stability_score, candidate has {cand_score:.4f}"
     champ_score = float(champ_score)
-
-    def _is_calibrated(metrics: dict[str, Any]) -> bool:
-        try:
-            return float(metrics.get("isotonic_fitted", 0)) >= 1.0
-        except (TypeError, ValueError):
-            return False
-
-    cand_calibrated = _is_calibrated(cand_metrics)
-    champ_calibrated = _is_calibrated(champ_metrics)
 
     # Compare stability scores first — if the difference is clearly outside the
     # tiebreak margin, score decides unconditionally (no iso override).

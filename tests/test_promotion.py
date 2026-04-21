@@ -397,6 +397,67 @@ class TestCascadingCompare:
         beats, _ = cascading_compare(cand, champ, cascading_cfg)
         assert beats is False
 
+    def test_iso_calibration_tiebreaker_fires_before_cand_passed_short_circuit(
+        self, cascading_cfg: dict
+    ) -> None:
+        """BEC-58: iso_calibration early-exit fires before cand_passed short-circuit.
+
+        When champion is iso=0 and candidate is iso=1 with reasonable stability,
+        candidate wins even if it failed a non-stability filter (e.g. min_signals).
+        """
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_signals",
+            "val_stability_score": 0.60,
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.65,
+            # No isotonic_fitted → champion was never calibrated
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "isotonic-calibrated" in reason
+        assert "early" in reason
+
+    def test_iso_early_exit_does_not_fire_when_candidate_missing_stability_score(
+        self, cascading_cfg: dict
+    ) -> None:
+        """BEC-58: iso early-exit requires a stability score; without one it falls through."""
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_signals",
+            # No val_stability_score
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.65,
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "failed filters" in reason
+
+    def test_iso_early_exit_does_not_fire_when_champion_also_calibrated(
+        self, cascading_cfg: dict
+    ) -> None:
+        """BEC-58: early-exit only fires when champion is NOT calibrated."""
+        cand = {
+            "val_passed_all_filters": "false",
+            "val_elimination_stage": "failed_signals",
+            "val_stability_score": 0.60,
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.65,
+            "isotonic_fitted": 1.0,  # champion also calibrated
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is False
+        assert "failed filters" in reason
+
 
 # --------------------------------------------------------------------------- #
 # _find_best_candidate tier fallback                                           #
