@@ -1,16 +1,20 @@
 """Tests for precision-focused model evaluation."""
 
 import datetime as dt
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import torch
 
 from src.config import PromotionEvalConfig
 from src.evaluation.precision_eval import (
+    compute_adaptive_threshold,
     compute_auc_pr,
     compute_fp_severity,
     compute_precision_at_thresholds,
     compute_walk_forward_precision,
+    evaluate_model,
 )
 
 # --------------------------------------------------------------------------- #
@@ -240,6 +244,218 @@ class TestAucPr:
 # --------------------------------------------------------------------------- #
 # PromotionEvalConfig                                                          #
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# compute_adaptive_threshold                                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestComputeAdaptiveThreshold:
+    def test_returns_base_when_sufficient_signals(self) -> None:
+        """When base threshold already has >=5% signal rate, return it unchanged."""
+        # 20% of samples are >=0.65 → sufficient, and precision is good
+        prob_up = np.array([0.9, 0.8, 0.7, 0.66, 0.3, 0.2, 0.1, 0.1, 0.1, 0.1])
+        targets = np.array([1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+        threshold = compute_adaptive_threshold(
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
+            min_signal_pct=0.05,
+            min_precision=0.50,
+        )
+        assert threshold == 0.65
+
+    def test_falls_back_when_no_signals_at_base(self) -> None:
+        """When zero signals at base threshold, find a lower usable one."""
+        # All probs between 0.50-0.59 — none reach 0.65
+        prob_up = np.array([0.58, 0.57, 0.56, 0.55, 0.54, 0.53, 0.52, 0.51, 0.50, 0.50])
+        targets = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+        threshold = compute_adaptive_threshold(
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
+            min_signal_pct=0.05,
+            min_precision=0.50,
+        )
+        # Should fall back below base_threshold since nothing reaches 0.65
+        assert threshold < 0.65
+        assert threshold >= 0.50
+
+    def test_returns_min_threshold_when_no_viable_threshold(self) -> None:
+        """Returns min_threshold as floor when nothing viable is found."""
+        prob_up = np.array([0.1, 0.2, 0.3])
+        targets = np.array([0, 0, 0])
+        threshold = compute_adaptive_threshold(
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
+            min_signal_pct=0.05,
+            min_precision=0.50,
+        )
+        assert threshold == 0.50
+
+    def test_returns_min_threshold_on_empty_input(self) -> None:
+        threshold = compute_adaptive_threshold(
+            np.array([]),
+            np.array([]),
+            base_threshold=0.65,
+            min_threshold=0.50,
+        )
+        assert threshold == 0.50
+
+    def test_low_signal_pct_triggers_fallback_finds_lower_threshold(self) -> None:
+        """When signal rate <5% at base, adaptive search finds a workable lower threshold.
+
+        This is the core BEC-51 scenario: post-isotonic-calibration models that compress
+        probabilities below the nominal primary threshold.
+        """
+        rng = np.random.RandomState(7)
+        # Simulate calibrated model: most probs 0.50-0.63, very few above 0.65
+        compressed = rng.uniform(0.50, 0.63, 95)  # 95 samples below threshold
+        above = rng.uniform(0.65, 0.70, 5)  # 5 samples at 0.65-0.70 (only 5%)
+        prob_up = np.concatenate([above, compressed])
+        targets = np.concatenate([np.ones(5), rng.randint(0, 2, 95)])
+
+        # At 0.65: 5/100 = 5%, exactly the boundary — stays at 0.65
+        threshold_at_boundary = compute_adaptive_threshold(
+            prob_up,
+            targets,
+            base_threshold=0.65,
+            min_threshold=0.50,
+            min_signal_pct=0.05,
+            min_precision=0.50,
+        )
+        # With exactly 5% signals at 0.65, it stays at 0.65 (meets the floor)
+        assert threshold_at_boundary == 0.65
+
+        # Now with only 1 sample above 0.65 (1%), triggers fallback
+        prob_up2 = np.concatenate([rng.uniform(0.65, 0.70, 1), rng.uniform(0.50, 0.63, 99)])
+        targets2 = np.concatenate([[1], rng.randint(0, 2, 99)])
+        threshold_below_floor = compute_adaptive_threshold(
+            prob_up2,
+            targets2,
+            base_threshold=0.65,
+            min_threshold=0.50,
+            min_signal_pct=0.05,
+            min_precision=0.50,
+        )
+        # Should search down and find a threshold with >=5% signals
+        assert threshold_below_floor < 0.65
+        assert threshold_below_floor >= 0.50
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive threshold in evaluate_model (BEC-51)                               #
+# --------------------------------------------------------------------------- #
+
+
+class TestEvaluateModelAdaptiveThreshold:
+    """Verify that evaluate_model uses adaptive threshold when signal rate <5%.
+
+    We test the internal logic by checking that _ADAPTIVE_MIN_SIGNAL_PCT = 0.05
+    is the boundary: models with <5% signal rate at primary trigger the adaptive
+    search, while models with >=5% do not.
+    """
+
+    def _make_mock_model(self, prob_up: np.ndarray):
+        """Return a lightweight mock that emits fixed prob_up values from val pass."""
+        model = MagicMock()
+        model.eval = MagicMock()
+
+        # Build a single-batch dataloader-like object
+        n = len(prob_up)
+        probs_tensor = torch.zeros(n, 2)
+        probs_tensor[:, 1] = torch.tensor(prob_up, dtype=torch.float32)
+        probs_tensor[:, 0] = 1 - probs_tensor[:, 1]
+        targets_tensor = torch.zeros(n, dtype=torch.long)
+
+        model.predict_proba = MagicMock(return_value=probs_tensor)
+
+        # A minimal iterable that yields one (x, y) batch
+        batch = (torch.zeros(n, 10, 5), targets_tensor)
+        dataloader = [batch]
+
+        return model, dataloader
+
+    def test_adaptive_threshold_fires_when_signal_pct_below_5pct(self) -> None:
+        """BEC-51: signal rate <5% at primary → adaptive threshold is used."""
+        # 100 samples, only 2 above 0.65 (2% < 5%)
+        rng = np.random.RandomState(42)
+        prob_up = np.concatenate(
+            [
+                np.array([0.67, 0.66]),  # 2 above primary (2%)
+                rng.uniform(0.50, 0.64, 98),  # 98 below primary
+            ]
+        )
+        model, dataloader = self._make_mock_model(prob_up)
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,
+            min_signals_per_window=3,
+            wf_window_size=5,
+            wf_step_size=2,
+            max_std_ratio=0.50,
+            stability_penalty=1.0,
+            tiebreak_margin=0.01,
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+        # effective_threshold should have been lowered below 0.65
+        assert result.effective_threshold < 0.65
+
+    def test_adaptive_threshold_does_not_fire_when_signal_pct_above_5pct(self) -> None:
+        """When signal rate >=5% at primary, effective_threshold stays at primary."""
+        # 100 samples, 10 above 0.65 (10% >= 5%)
+        rng = np.random.RandomState(42)
+        prob_up = np.concatenate(
+            [
+                rng.uniform(0.65, 0.90, 10),  # 10 above primary (10%)
+                rng.uniform(0.30, 0.64, 90),  # 90 below
+            ]
+        )
+        model, dataloader = self._make_mock_model(prob_up)
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,
+            min_signals_per_window=3,
+            wf_window_size=5,
+            wf_step_size=2,
+            max_std_ratio=0.50,
+            stability_penalty=1.0,
+            tiebreak_margin=0.01,
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+        # effective_threshold should remain at the primary (0.65)
+        assert result.effective_threshold == pytest.approx(0.65)
 
 
 class TestPromotionEvalConfig:
