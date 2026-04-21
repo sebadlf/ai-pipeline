@@ -363,6 +363,14 @@ class PromotionEvalConfig:
     # winning the BEC-58 iso tiebreaker (cycle-6 regression root cause).
     min_stability_floor: float = 0.15
     min_stability_ratio: float = 0.5
+    # BEC-62: recall metric robust to calibration shrinkage.
+    # Options: "top_k" | "percentile" | "absolute_threshold"
+    # "absolute_threshold" retains legacy behaviour (recall at effective_threshold).
+    # "top_k": recall of UP labels within the top k_fraction of predictions by prob.
+    # "percentile": recall of UP labels within predictions above the p90 percentile.
+    recall_metric: str = "top_k"
+    recall_top_k_fraction: float = 0.05  # fraction of predictions in the top-K set
+    recall_percentile: float = 0.90  # probability percentile for "percentile" mode
 
     @classmethod
     def from_dict(cls, promotion_cfg: dict) -> PromotionEvalConfig:
@@ -383,6 +391,9 @@ class PromotionEvalConfig:
             tiebreak_margin=rank_cfg.get("tiebreak_margin", 0.01),
             min_stability_floor=eval_cfg.get("min_stability_floor", 0.15),
             min_stability_ratio=eval_cfg.get("min_stability_ratio", 0.5),
+            recall_metric=eval_cfg.get("recall_metric", "top_k"),
+            recall_top_k_fraction=eval_cfg.get("recall_top_k_fraction", 0.05),
+            recall_percentile=eval_cfg.get("recall_percentile", 0.90),
         )
 
 

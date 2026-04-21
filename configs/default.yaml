@@ -413,12 +413,20 @@ promotion:
   evaluation:
     thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
     primary_threshold: 0.65               # threshold for stability score and recall filters
-    min_recall: 0.10                      # minimum recall at primary_threshold
+    min_recall: 0.10                      # minimum recall (semantics depend on recall_metric below)
     min_signals_per_window: 3             # minimum UP predictions per walk-forward window
     max_val_test_gap: 0.20                # max allowed val-test precision gap (Filter 5: generalization)
     # BEC-61: block low-stability candidates (root cause of cycle-6 regression)
     min_stability_floor: 0.15             # absolute floor: candidates below this never promote
     min_stability_ratio: 0.5              # relative floor: candidates < ratio * champion.stability never promote
+    # BEC-62: recall metric robust to calibration shrinkage.
+    # Options: "top_k" | "percentile" | "absolute_threshold"
+    # "top_k": recall of UP labels within top k_fraction of predictions ranked by prob.
+    # "percentile": recall of UP labels within predictions above the p90 percentile.
+    # "absolute_threshold": legacy behaviour — recall at the (adaptive) effective_threshold.
+    recall_metric: top_k
+    recall_top_k_fraction: 0.05           # fraction of predictions in top-K set (k=5% of window)
+    recall_percentile: 0.90               # probability percentile cutoff for "percentile" mode
   walk_forward:
     window_size: 63                       # 3x target horizon (trading days)
     step_size: 21                         # = target horizon (trading days)
