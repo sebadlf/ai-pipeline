@@ -39,6 +39,13 @@ ERROR_ARCHIVE_VALUE = "error_archive"
 ORPHAN_TAG_KEY = "housekeeping.orphan_reason"
 ORPHAN_TAG_VALUE = "run_exceeded_stale_threshold_force_failed"
 
+# Additional tag applied so downstream tools (reports, CI) can filter orphans.
+AUTO_CLEANUP_TAG_KEY = "auto_cleanup"
+AUTO_CLEANUP_TAG_VALUE = "orphan"
+
+# Default stale threshold for the pipeline-start guard (hours).
+PIPELINE_STALE_HOURS = 6.0
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -98,6 +105,7 @@ def sweep_orphaned_running(
         else:
             client.set_terminated(run_id, status="FAILED")
             client.set_tag(run_id, ORPHAN_TAG_KEY, ORPHAN_TAG_VALUE)
+            client.set_tag(run_id, AUTO_CLEANUP_TAG_KEY, AUTO_CLEANUP_TAG_VALUE)
             client.set_tag(
                 run_id,
                 "housekeeping.force_failed_at",
@@ -109,6 +117,49 @@ def sweep_orphaned_running(
             )
 
     return affected
+
+
+def sweep_pipeline_orphans(
+    tracking_uri: str | None = None,
+    *,
+    stale_hours: float = PIPELINE_STALE_HOURS,
+    dry_run: bool = False,
+) -> list[str]:
+    """Pipeline-start guard: fail RUNNING runs older than *stale_hours*.
+
+    Intended to be called once at the start of each pipeline run.  Uses a
+    longer stale threshold than the interactive housekeeping sweep (default
+    6 h vs 1 h) so that legitimate long-running training jobs are not
+    prematurely terminated.
+
+    Silently returns an empty list when MLflow is unreachable — pipeline
+    must not fail because of a housekeeping step.
+
+    Args:
+        tracking_uri: MLflow tracking server URI.  Defaults to
+            ``MLFLOW_TRACKING_URI`` from ``src.keys``.
+        stale_hours: Runs RUNNING for longer than this are considered
+            orphaned (default ``PIPELINE_STALE_HOURS`` = 6.0).
+        dry_run: When True, report what would be changed without modifying
+            MLflow.
+
+    Returns:
+        List of run IDs that were (or would be) transitioned.
+    """
+    try:
+        uri = tracking_uri or MLFLOW_TRACKING_URI
+        mlflow.set_tracking_uri(uri)
+        client = MlflowClient(uri)
+        affected = sweep_orphaned_running(client, stale_hours=stale_hours, dry_run=dry_run)
+        if affected:
+            print(
+                f"[pipeline-start] orphan sweep: force-failed {len(affected)} stale RUNNING "
+                f"run(s) older than {stale_hours}h"
+            )
+        return affected
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pipeline-start] orphan sweep skipped (MLflow unreachable): {exc}")
+        return []
 
 
 def tag_error_runs(
