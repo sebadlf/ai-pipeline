@@ -157,22 +157,30 @@ def test_default_yaml_applies_overfit_overrides(cluster_id):
     """Every overfitting-prone cluster listed in CLAUDE.md gets tightened overrides.
 
     Guards against accidental removal/typo in configs/default.yaml. The override
-    contract (BEC-38, BEC-42) is:
-    - max_overfit_gap <= 0.15
-    - hidden_size restricted to [64, 96]
-    - feature_mask_rate >= 0.15
+    contract (BEC-38, BEC-42, BEC-53) is:
+    - max_overfit_gap <= 0.12  (tightened from 0.15 in BEC-53)
+    - hidden_size restricted to [64] only  (tightened from [64,96] in BEC-53)
+    - feature_mask_rate >= 0.25  (raised from 0.15 in BEC-53)
+    - dropout floor >= 0.40  (added in BEC-53)
+    - num_layers capped at 1  (added in BEC-53)
     """
     from src.config import get_cluster_optuna_config, load_config
 
     config = load_config()
     resolved = get_cluster_optuna_config(config, cluster_id)
 
-    assert resolved["max_overfit_gap"] == 0.15, f"{cluster_id} should have max_overfit_gap=0.15"
-    assert resolved["search_space"]["hidden_size"] == [64, 96], (
-        f"{cluster_id} should cap hidden_size at [64, 96]"
+    assert resolved["max_overfit_gap"] <= 0.12, f"{cluster_id} should have max_overfit_gap<=0.12"
+    assert resolved["search_space"]["hidden_size"] == [64], (
+        f"{cluster_id} should cap hidden_size to [64] only"
     )
-    assert resolved["fixed_params"]["feature_mask_rate"] == 0.15, (
-        f"{cluster_id} should use feature_mask_rate=0.15"
+    assert resolved["fixed_params"]["feature_mask_rate"] >= 0.25, (
+        f"{cluster_id} should use feature_mask_rate>=0.25"
+    )
+    assert resolved["search_space"]["num_layers"]["high"] == 1, (
+        f"{cluster_id} should cap num_layers to 1"
+    )
+    assert resolved["search_space"]["dropout"]["low"] >= 0.40, (
+        f"{cluster_id} should have dropout floor >= 0.40"
     )
 
 
