@@ -187,54 +187,74 @@ training:
       #     widening trend worth pre-empting)
       # Same rationale as the BEC-38 trio: tighter overfit gap,
       # reduced capacity, stronger feature masking.
+      # BEC-53: Tightened overrides — cycle-3 data showed 7/8 overridden clusters
+      # still exceeding 0.15 train-val gap despite [64,96] hidden + mask_rate=0.15.
+      # New strategy: cap hidden to [64] only, cap num_layers to 1,
+      # raise feature_mask_rate to 0.25, add dropout floor (min 0.40).
       Utilities:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       FinancialServices:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       RealEstate:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       Miscellaneous:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       ConsumerCyclical:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       CommunicationServices-Industrials:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       BasicMaterials:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
       Healthcare:
-        max_overfit_gap: 0.15
+        max_overfit_gap: 0.12
         search_space:
-          hidden_size: [64, 96]
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
         fixed_params:
-          feature_mask_rate: 0.15
+          feature_mask_rate: 0.25
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation
