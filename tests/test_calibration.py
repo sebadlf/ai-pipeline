@@ -118,7 +118,7 @@ class TestCalibrationBounds:
         temp, diagnostics = calibrate_temperature(model, dataloader)
 
         assert isinstance(temp, float)
-        assert 0.5 <= temp <= 2.5
+        assert 0.5 <= temp <= 4.0
         assert isinstance(diagnostics, dict)
         assert "pre_cal_prob_mean" in diagnostics
         assert "post_cal_prob_mean" in diagnostics

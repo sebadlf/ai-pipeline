@@ -340,7 +340,7 @@ PIPELINE_ENV=dev       # dev or prod (see Dev/Prod differences below)
 ## Temperature calibration
 
 - **Post-training calibration**: Temperature scaling (Guo et al. 2017) with composite NLL + signal-preservation objective
-- **Temperature bounds**: [0.5, 2.5] — prevents pathological T>>1 that collapses all probabilities to ~0.50
+- **Temperature bounds**: [0.5, 4.0] — prevents pathological T>>1 that collapses all probabilities to ~0.50
 - **Signal preservation**: Penalizes calibrations where <3% of predictions exceed primary_threshold (0.65)
 - **Safety check**: Falls back to T=1.0 if post-calibration yields <1% signals above 0.60
 - **Diagnostics**: Pre/post calibration probability distribution stats logged to MLflow
