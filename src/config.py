@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,6 +12,8 @@ import yaml
 from src.keys import POSTGRES_DB, POSTGRES_HOST, POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_USER
 
 PROJECT_ROOT = Path(__file__).parent.parent
+
+logger = logging.getLogger(__name__)
 
 
 def get_db_url() -> str:
@@ -464,7 +467,22 @@ def get_cluster_optuna_config(config: dict, cluster_id: str) -> dict:
 
     base_optuna = config.get("training", {}).get("optuna", {}) or {}
     overrides_all = base_optuna.get("per_cluster_overrides", {}) or {}
+
+    # Exact match first; fall back to substring matching so that override keys
+    # defined before a cluster-name change (e.g. "Utilities" after BEC-52 emits
+    # "ConsumerDefensive-Technology-Utilities") still apply.  When multiple keys
+    # match as substrings the longest key wins (most-specific intent).
     overrides = overrides_all.get(cluster_id)
+    if not overrides:
+        candidates = [k for k in overrides_all if k in cluster_id]
+        if candidates:
+            best_key = max(candidates, key=len)
+            overrides = overrides_all[best_key]
+            logger.debug(
+                "per_cluster_overrides: no exact key for %r — using substring match %r",
+                cluster_id,
+                best_key,
+            )
     if not overrides:
         return copy.deepcopy(base_optuna)
 
