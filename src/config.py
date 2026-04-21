@@ -263,6 +263,14 @@ class ClusterConfig:
     min_cluster_size: int = 10
     output_parquet: str = "data/clusters.parquet"
     cluster_thresholds: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Degenerate cluster handling: clusters with silhouette_mean_cluster below
+    # this threshold are considered degenerate. Policy options:
+    #   "subdivide"  — attempt mini-KMeans(K=2) on the cluster; accept if it
+    #                  improves the mean silhouette, otherwise keep as-is.
+    #   "reassign"   — move each symbol to its nearest non-degenerate centroid.
+    #   "warn_only"  — log a warning but do not modify assignments.
+    degenerate_cluster_threshold: float = 0.30
+    degenerate_cluster_action: str = "subdivide"
 
     @classmethod
     def from_dict(cls, d: dict) -> ClusterConfig:
@@ -280,6 +288,8 @@ class ClusterConfig:
             min_cluster_size=d.get("min_cluster_size", 10),
             output_parquet=d.get("output_parquet", "data/clusters.parquet"),
             cluster_thresholds=d.get("cluster_thresholds", {}),
+            degenerate_cluster_threshold=d.get("degenerate_cluster_threshold", 0.30),
+            degenerate_cluster_action=d.get("degenerate_cluster_action", "subdivide"),
         )
 
 
