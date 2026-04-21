@@ -113,10 +113,6 @@ def cascading_compare(
         return True, f"champion missing stability_score, candidate has {cand_score:.4f}"
     champ_score = float(champ_score)
 
-    # Calibration preference (BEC-39): a calibrated candidate (isotonic_fitted == 1.0)
-    # strictly beats a non-calibrated champion, even if the candidate's stability
-    # score is lower. This ensures BEC-37/BEC-38 fixes take effect on clusters
-    # whose legacy (pre-calibration) champion still wins on raw score.
     def _is_calibrated(metrics: dict[str, Any]) -> bool:
         try:
             return float(metrics.get("isotonic_fitted", 0)) >= 1.0
@@ -125,15 +121,11 @@ def cascading_compare(
 
     cand_calibrated = _is_calibrated(cand_metrics)
     champ_calibrated = _is_calibrated(champ_metrics)
-    if cand_calibrated and not champ_calibrated:
-        reason = (
-            f"tiebreaker=iso_calibration: candidate is isotonic-calibrated and champion is not "
-            f"(cand_score={cand_score:.4f}, champ_score={champ_score:.4f})"
-        )
-        logger.info("cascading_compare tiebreaker fired: %s", reason)
-        return True, reason
 
-    # Compare stability scores
+    # Compare stability scores first — if the difference is clearly outside the
+    # tiebreak margin, score decides unconditionally (no iso override).
+    # BEC-54: iso_calibration is a tiebreaker for *tied* scores, not an override
+    # for clearly-better champions.
     margin = eval_config.tiebreak_margin
     if cand_score > champ_score + margin:
         reason = (
@@ -149,7 +141,19 @@ def cascading_compare(
         logger.info("cascading_compare tiebreaker fired: %s", reason)
         return False, reason
 
-    # Within tiebreak margin — prefer lower FP severity
+    # Within tiebreak margin: iso_calibration dominates (BEC-39/BEC-50).
+    # A calibrated candidate beats a non-calibrated champion when scores are tied,
+    # ensuring BEC-37/BEC-38 fixes take effect on clusters whose legacy
+    # (pre-calibration) champion would otherwise survive on tiny score advantages.
+    if cand_calibrated and not champ_calibrated:
+        reason = (
+            f"tiebreaker=iso_calibration: candidate is isotonic-calibrated and champion is not "
+            f"(cand_score={cand_score:.4f}, champ_score={champ_score:.4f}, within margin={margin})"
+        )
+        logger.info("cascading_compare tiebreaker fired: %s", reason)
+        return True, reason
+
+    # Within margin, both same calibration status — prefer lower FP severity
     cand_fp_sev = float(cand_metrics.get("val_fp_severity", float("inf")))
     champ_fp_sev = float(champ_metrics.get("val_fp_severity", float("inf")))
 
@@ -245,6 +249,7 @@ def _find_best_candidate(
     runs: list,
     promotion_cfg: dict,
     cluster_id: str | None = None,
+    champion_run_id: str | None = None,
 ) -> tuple[Any | None, str | None]:
     """Find the best candidate run among recent runs.
 
@@ -259,6 +264,10 @@ def _find_best_candidate(
         runs: Candidate runs ordered by recency (descending).
         promotion_cfg: Promotion config section.
         cluster_id: Optional cluster identifier used in log messages.
+        champion_run_id: Run ID of the current champion. When provided in
+            cascading mode, this run is excluded from the candidate pool so
+            that the champion cannot re-select itself (which would suppress
+            BEC-50/BEC-39 iso_calibration tiebreakers).
 
     Returns:
         (run, checkpoint_path) or (None, None) if no run has a checkpoint.
@@ -280,6 +289,8 @@ def _find_best_candidate(
         return None, None
 
     # Cascading: collect all runs with checkpoints and classify into tiers.
+    # Exclude the current champion run from the pool so it cannot re-select
+    # itself (which would suppress BEC-50/BEC-39 iso_calibration tiebreakers).
     # Each tier entry is (run, ckpt, is_calibrated, score) where is_calibrated is 1
     # for runs with isotonic_fitted == 1.0 (BEC-37 post-calibration), 0 otherwise.
     # Calibrated runs are preferred within a tier so BEC-37/BEC-38 fixes applied in
@@ -290,8 +301,13 @@ def _find_best_candidate(
     tier4 = []  # Any run with checkpoint (fallback)
 
     runs_without_ckpt = 0
+    skipped_champion = 0
 
     for run in runs:
+        if champion_run_id is not None and run.info.run_id == champion_run_id:
+            skipped_champion += 1
+            continue
+
         ckpt = _find_run_checkpoint(client, run.info.run_id)
         if ckpt is None:
             runs_without_ckpt += 1
@@ -355,9 +371,11 @@ def _find_best_candidate(
             return best_run, best_ckpt
 
     logger.error(
-        "[%s] NO CANDIDATE: evaluated %d runs, %d without checkpoint, all tiers empty",
+        "[%s] NO CANDIDATE: evaluated %d runs, %d skipped (champion), "
+        "%d without checkpoint, all tiers empty",
         cluster_label,
         len(runs),
+        skipped_champion,
         runs_without_ckpt,
     )
     return None, None
@@ -401,36 +419,17 @@ def promote_cluster_model(
         print(f"  No runs found for {cluster_id}")
         return False
 
-    # Find best candidate
-    candidate_run, best_ckpt = _find_best_candidate(
-        client, runs, promotion_cfg, cluster_id=cluster_id
-    )
-
-    if candidate_run is None:
-        print(f"  No checkpoint found for {cluster_id}")
-        return False
-
-    # Merge metrics and params for comparison
-    candidate_metrics = {**candidate_run.data.metrics, **candidate_run.data.params}
-    run_id = candidate_run.info.run_id
-    run_name = candidate_run.data.tags.get("mlflow.runName", run_id[:12])
-
     use_cascading = "evaluation" in promotion_cfg
-    if use_cascading:
-        score = candidate_metrics.get("val_stability_score", "N/A")
-        stage = candidate_metrics.get("val_elimination_stage", "N/A")
-        print(f"  {cluster_id}: candidate run {run_name} (stability_score={score}, stage={stage})")
-    else:
-        primary = promotion_cfg.get("primary_metric", "val_acc")
-        primary_val = candidate_metrics.get(primary, "N/A")
-        print(f"  {cluster_id}: candidate run {run_name} ({primary}={primary_val})")
 
-    # Load current champion metrics (if any)
+    # Load current champion metrics (if any) *before* finding the best candidate
+    # so we can exclude the champion run from the candidate pool (BEC-54).
     model_name = f"{MODEL_NAME_PREFIX}-{cluster_id}"
     champion_metrics: dict[str, Any] | None = None
+    current_champion_run_id: str | None = None
 
     try:
         mv = client.get_model_version_by_alias(model_name, "champion")
+        current_champion_run_id = mv.run_id
         champion_run = client.get_run(mv.run_id)
         champion_metrics = {**champion_run.data.metrics, **champion_run.data.params}
         if use_cascading:
@@ -443,6 +442,33 @@ def promote_cluster_model(
     except mlflow.exceptions.MlflowException as exc:
         logger.debug("[%s] no existing champion alias: %s", cluster_id, exc)
         print(f"    no existing champion for {model_name}")
+
+    # Find best candidate — exclude champion run so it cannot re-select itself
+    candidate_run, best_ckpt = _find_best_candidate(
+        client,
+        runs,
+        promotion_cfg,
+        cluster_id=cluster_id,
+        champion_run_id=current_champion_run_id if use_cascading else None,
+    )
+
+    if candidate_run is None:
+        print(f"  No checkpoint found for {cluster_id}")
+        return False
+
+    # Merge metrics and params for comparison
+    candidate_metrics = {**candidate_run.data.metrics, **candidate_run.data.params}
+    run_id = candidate_run.info.run_id
+    run_name = candidate_run.data.tags.get("mlflow.runName", run_id[:12])
+
+    if use_cascading:
+        score = candidate_metrics.get("val_stability_score", "N/A")
+        stage = candidate_metrics.get("val_elimination_stage", "N/A")
+        print(f"  {cluster_id}: candidate run {run_name} (stability_score={score}, stage={stage})")
+    else:
+        primary = promotion_cfg.get("primary_metric", "val_acc")
+        primary_val = candidate_metrics.get(primary, "N/A")
+        print(f"  {cluster_id}: candidate run {run_name} ({primary}={primary_val})")
 
     # Compare
     should_promote, reason = candidate_beats_champion(
