@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from src.db import get_engine, in_params
 from src.evaluation.regime import detect_regimes
 from src.keys import MLFLOW_TRACKING_URI
 from src.portfolio.metrics import compute_all_metrics
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -571,6 +574,182 @@ def run_all_backtests(config: dict) -> list[BacktestResult]:
     return results
 
 
+@dataclass
+class RegressionFlag:
+    """A single regression flag for a (profile, regime) cell."""
+
+    profile: str
+    regime: str
+    previous_sharpe: float
+    current_sharpe: float
+    drop_pct: float  # positive = degradation, e.g. 0.35 = 35% drop
+
+
+@dataclass
+class RegressionGuardResult:
+    """Outcome of the regression guard check.
+
+    Attributes:
+        flags: List of (profile, regime) cells that exceeded the drop threshold.
+        skipped: True when there is no previous run to compare against.
+        previous_run_date: Date of the baseline run used for comparison.
+    """
+
+    flags: list[RegressionFlag] = field(default_factory=list)
+    skipped: bool = False
+    previous_run_date: dt.date | None = None
+
+    @property
+    def has_regression(self) -> bool:
+        """True when at least one monitored cell exceeded the drop threshold."""
+        return bool(self.flags)
+
+
+# Cells watched by the regression guard: (profile, regime) tuples.
+# These correspond to the use-case in BEC-65 (moderate/sideways are most informative
+# but we also guard all regime×profile combos to avoid blind spots).
+_GUARD_CELLS: list[tuple[str, str]] = [
+    ("moderate", "sideways"),
+    ("moderate", "bull"),
+    ("moderate", "bear"),
+]
+
+# Default drop threshold: flag when Sharpe falls more than this fraction vs. previous cycle.
+DEFAULT_REGRESSION_THRESHOLD = 0.30
+
+
+def _sharpe_drop_pct(previous: float, current: float) -> float:
+    """Return the fractional Sharpe drop relative to ``previous``.
+
+    Returns 0.0 when either value is non-finite (skip rather than false-positive).
+    Negative previous Sharpe ratios are handled: if both are negative and current
+    is *less* negative, that's an improvement (returns negative drop, i.e. no flag).
+    """
+    if not np.isfinite(previous) or not np.isfinite(current):
+        return 0.0
+    if previous == 0.0:
+        return 0.0
+    # Use absolute previous as denominator so direction is consistent.
+    return (previous - current) / abs(previous)
+
+
+def check_regression_guard(
+    current_results: list[BacktestResult],
+    engine=None,  # type: ignore[assignment]
+    *,
+    threshold: float = DEFAULT_REGRESSION_THRESHOLD,
+    guard_cells: list[tuple[str, str]] | None = None,
+    current_run_date: dt.date | None = None,
+) -> RegressionGuardResult:
+    """Compare current backtest Sharpe ratios against the previous cycle.
+
+    Queries the ``backtest_results`` table for the most recent prior run_date
+    (before *current_run_date*) and compares Sharpe ratios for each watched
+    (profile, regime) cell.  Flags any cell where the Sharpe ratio dropped by
+    more than *threshold* (default 30 %).
+
+    Args:
+        current_results: Results from the current backtest run.
+        engine: SQLAlchemy engine (uses singleton when None).
+        threshold: Fractional drop that triggers a flag (0.30 = 30 %).
+        guard_cells: List of (profile, regime) tuples to watch.
+                     Defaults to ``_GUARD_CELLS``.
+        current_run_date: The run_date for the current results (defaults to today).
+
+    Returns:
+        RegressionGuardResult with any flags populated.
+    """
+    if guard_cells is None:
+        guard_cells = _GUARD_CELLS
+    current_run_date = current_run_date or dt.date.today()
+
+    # Build a lookup from current results: (profile, regime) -> sharpe
+    current_map: dict[tuple[str, str], float] = {
+        (r.profile, r.regime): r.sharpe_ratio for r in current_results
+    }
+
+    db_engine = engine or get_engine()
+
+    # Find the most recent prior run_date (strict: < current_run_date)
+    prior_date_row = None
+    try:
+        with db_engine.connect() as conn:
+            prior_date_row = conn.execute(
+                text("""
+                    SELECT MAX(run_date) AS prior_date
+                    FROM backtest_results
+                    WHERE run_date < :current_date
+                """).bindparams(current_date=current_run_date)
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Regression guard: could not query prior run_date: %s", exc)
+        result = RegressionGuardResult(skipped=True)
+        return result
+
+    if prior_date_row is None or prior_date_row[0] is None:
+        logger.info(
+            "Regression guard: no prior backtest run found before %s — skipping comparison.",
+            current_run_date,
+        )
+        return RegressionGuardResult(skipped=True)
+
+    prior_date: dt.date = prior_date_row[0]
+
+    # Load previous sharpe ratios for the watched cells
+    flags: list[RegressionFlag] = []
+    try:
+        with db_engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT profile, regime, sharpe_ratio
+                    FROM backtest_results
+                    WHERE run_date = :prior_date
+                """).bindparams(prior_date=prior_date)
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Regression guard: could not load prior results: %s", exc)
+        return RegressionGuardResult(skipped=True, previous_run_date=prior_date)
+
+    prior_map: dict[tuple[str, str], float | None] = {(row[0], row[1]): row[2] for row in rows}
+
+    for profile, regime in guard_cells:
+        prior_sharpe_raw = prior_map.get((profile, regime))
+        current_sharpe = current_map.get((profile, regime))
+
+        if prior_sharpe_raw is None or current_sharpe is None:
+            continue  # cell missing in one of the runs — skip
+
+        prior_sharpe = float(prior_sharpe_raw)
+        drop = _sharpe_drop_pct(prior_sharpe, current_sharpe)
+
+        if drop > threshold:
+            flags.append(
+                RegressionFlag(
+                    profile=profile,
+                    regime=regime,
+                    previous_sharpe=prior_sharpe,
+                    current_sharpe=current_sharpe,
+                    drop_pct=drop,
+                )
+            )
+            logger.warning(
+                "REGRESSION GUARD: %s/%s Sharpe dropped %.1f%% "
+                "(prev=%.3f → curr=%.3f) — exceeds %.0f%% threshold.",
+                profile,
+                regime,
+                drop * 100,
+                prior_sharpe,
+                current_sharpe,
+                threshold * 100,
+            )
+
+    return RegressionGuardResult(
+        flags=flags,
+        skipped=False,
+        previous_run_date=prior_date,
+    )
+
+
 def save_backtest_results(
     results: list[BacktestResult],
     config: dict,
@@ -693,6 +872,26 @@ def main() -> None:
 
     save_backtest_results(results, config)
 
+    # --- Regression guard ---
+    guard_result = check_regression_guard(results)
+    if guard_result.skipped:
+        print("\nRegression guard: no prior cycle found — comparison skipped.")
+    elif guard_result.has_regression:
+        print(
+            f"\n[REGRESSION GUARD] {len(guard_result.flags)} cell(s) degraded "
+            f"by >{DEFAULT_REGRESSION_THRESHOLD:.0%} vs. {guard_result.previous_run_date}:"
+        )
+        for flag in guard_result.flags:
+            print(
+                f"  {flag.profile}/{flag.regime}: Sharpe {flag.previous_sharpe:.3f} → "
+                f"{flag.current_sharpe:.3f} ({flag.drop_pct:+.1%} drop)"
+            )
+    else:
+        print(
+            f"\nRegression guard: OK — no Sharpe drop >{DEFAULT_REGRESSION_THRESHOLD:.0%} "
+            f"vs. {guard_result.previous_run_date}."
+        )
+
     # Log to MLflow
     def _log_finite(name: str, value: float) -> None:
         if np.isfinite(value):
@@ -711,6 +910,15 @@ def main() -> None:
             _log_finite(f"{prefix}_info", r.info_ratio)
             _log_finite(f"{prefix}_max_dd", r.max_drawdown)
             mlflow.set_tag(f"{prefix}_insufficient_sample", str(r.insufficient_sample))
+
+        # Log regression guard outcome
+        mlflow.set_tag("regression_guard_skipped", str(guard_result.skipped))
+        mlflow.set_tag("regression_guard_has_regression", str(guard_result.has_regression))
+        if guard_result.previous_run_date:
+            mlflow.set_tag("regression_guard_baseline", str(guard_result.previous_run_date))
+        for flag in guard_result.flags:
+            key = f"regression_{flag.profile}_{flag.regime}_drop_pct"
+            mlflow.log_metric(key, flag.drop_pct)
 
         bt_cfg = config.get("backtest", {})
         output_dir = bt_cfg.get("output_dir", "data/backtest_reports")
