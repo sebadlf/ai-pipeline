@@ -330,11 +330,18 @@ def evaluate_model(
     # Collect predictions
     prob_up, targets = collect_val_predictions(model, val_dataloader)
 
-    # Adaptive threshold: if base primary_threshold produces no signals, find a lower usable one
+    # Adaptive threshold: if signal rate at the base primary_threshold is below 5%,
+    # search downward for a threshold with sufficient signal density and precision.
+    # This handles post-isotonic-calibration models (BEC-37/BEC-51) whose compressed
+    # probability distributions produce near-zero recall at the nominal primary threshold,
+    # causing false "failed_recall" eliminations even for well-calibrated models.
+    _adaptive_min_signal_pct = 0.05
     effective_threshold = eval_config.primary_threshold
     if adaptive_threshold:
+        n_samples = len(prob_up)
         signals_at_base = int((prob_up >= eval_config.primary_threshold).sum())
-        if signals_at_base == 0:
+        signal_pct_at_base = signals_at_base / n_samples if n_samples > 0 else 0.0
+        if signal_pct_at_base < _adaptive_min_signal_pct:
             effective_threshold = compute_adaptive_threshold(
                 prob_up,
                 targets,
