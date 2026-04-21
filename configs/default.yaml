@@ -255,6 +255,45 @@ training:
           dropout: { low: 0.40, high: 0.65 }
         fixed_params:
           feature_mask_rate: 0.25
+      # BEC-56: New cluster names emitted by BEC-52 global KMeans.
+      # "CommunicationServices-Industrials" split into two separate clusters
+      # and "ConsumerDefensive", "Technology", and "Utilities" merged.
+      # Energy and Industrials surfaced with +0.26/+0.29 overfit gaps in cycle 5.
+      # Substring matching in get_cluster_optuna_config will also resolve these
+      # via legacy keys (e.g. "Utilities" ⊆ "ConsumerDefensive-Technology-Utilities"),
+      # but explicit entries take precedence and make intent unambiguous.
+      ConsumerDefensive-Technology-Utilities:
+        max_overfit_gap: 0.12
+        search_space:
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
+        fixed_params:
+          feature_mask_rate: 0.25
+      CommunicationServices:
+        max_overfit_gap: 0.12
+        search_space:
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
+        fixed_params:
+          feature_mask_rate: 0.25
+      Industrials:
+        max_overfit_gap: 0.12
+        search_space:
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
+        fixed_params:
+          feature_mask_rate: 0.25
+      Energy:
+        max_overfit_gap: 0.12
+        search_space:
+          hidden_size: [64]
+          num_layers: { low: 1, high: 1 }
+          dropout: { low: 0.40, high: 0.65 }
+        fixed_params:
+          feature_mask_rate: 0.25
   # Temporal splits (relative to today, with purge gaps)
   test_years: 1        # last 1 year = test
   val_years: 1         # 1 year before test = validation

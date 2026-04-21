@@ -151,13 +151,18 @@ def test_effective_config_for_cluster_no_override(base_config):
         "CommunicationServices-Industrials",
         "BasicMaterials",
         "Healthcare",
+        # BEC-56: new names emitted by BEC-52 global KMeans (cycle 5 gaps)
+        "ConsumerDefensive-Technology-Utilities",
+        "CommunicationServices",
+        "Industrials",
+        "Energy",
     ],
 )
 def test_default_yaml_applies_overfit_overrides(cluster_id):
     """Every overfitting-prone cluster listed in CLAUDE.md gets tightened overrides.
 
     Guards against accidental removal/typo in configs/default.yaml. The override
-    contract (BEC-38, BEC-42, BEC-53) is:
+    contract (BEC-38, BEC-42, BEC-53, BEC-56) is:
     - max_overfit_gap <= 0.12  (tightened from 0.15 in BEC-53)
     - hidden_size restricted to [64] only  (tightened from [64,96] in BEC-53)
     - feature_mask_rate >= 0.25  (raised from 0.15 in BEC-53)
@@ -194,10 +199,72 @@ def test_default_yaml_leaves_unlisted_clusters_on_base():
     config = load_config()
     base_gap = config["training"]["optuna"]["max_overfit_gap"]
 
-    # Technology and Energy were explicitly called out in BEC-42 as clusters
-    # whose val-test gap is already small; they should NOT be overridden.
-    for cluster_id in ("Technology", "Energy"):
+    # Technology has a consistently small val-test gap; it should NOT be overridden.
+    for cluster_id in ("Technology",):
         resolved = get_cluster_optuna_config(config, cluster_id)
         assert resolved["max_overfit_gap"] == base_gap, (
             f"{cluster_id} should inherit base max_overfit_gap"
         )
+
+
+def test_substring_matching_resolves_renamed_clusters():
+    """Substring matching applies legacy override keys to renamed cluster IDs.
+
+    Simulates a cluster rename where the override key (e.g. "Utilities") is a
+    substring of the new cluster name ("ConsumerDefensive-Technology-Utilities").
+    The legacy key should be picked up even without an exact entry.
+    """
+    config = {
+        "training": {
+            "optuna": {
+                "max_overfit_gap": 0.30,
+                "search_space": {
+                    "hidden_size": [64, 96, 128],
+                    "dropout": {"low": 0.2, "high": 0.65},
+                },
+                "fixed_params": {"feature_mask_rate": 0.10},
+                "per_cluster_overrides": {
+                    "Utilities": {
+                        "max_overfit_gap": 0.12,
+                        "search_space": {"hidden_size": [64]},
+                        "fixed_params": {"feature_mask_rate": 0.25},
+                    },
+                },
+            }
+        }
+    }
+
+    # Exact match works as before
+    exact = get_cluster_optuna_config(config, "Utilities")
+    assert exact["max_overfit_gap"] == 0.12
+
+    # Substring match: "Utilities" ⊆ new name → override should apply
+    renamed = get_cluster_optuna_config(config, "ConsumerDefensive-Technology-Utilities")
+    assert renamed["max_overfit_gap"] == 0.12
+    assert renamed["search_space"]["hidden_size"] == [64]
+    assert renamed["fixed_params"]["feature_mask_rate"] == 0.25
+
+    # No substring → base config unchanged
+    unrelated = get_cluster_optuna_config(config, "Technology")
+    assert unrelated["max_overfit_gap"] == 0.30
+
+
+def test_substring_matching_prefers_longest_key():
+    """When multiple override keys are substrings, the longest (most-specific) wins."""
+    config = {
+        "training": {
+            "optuna": {
+                "max_overfit_gap": 0.30,
+                "search_space": {},
+                "fixed_params": {},
+                "per_cluster_overrides": {
+                    "Services": {"max_overfit_gap": 0.20},
+                    "CommunicationServices": {"max_overfit_gap": 0.12},
+                },
+            }
+        }
+    }
+
+    resolved = get_cluster_optuna_config(config, "CommunicationServices")
+    # Exact match ("CommunicationServices") should win over "Services"
+    assert resolved["max_overfit_gap"] == 0.12
