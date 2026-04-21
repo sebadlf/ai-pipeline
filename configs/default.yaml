@@ -416,6 +416,9 @@ promotion:
     min_recall: 0.10                      # minimum recall at primary_threshold
     min_signals_per_window: 3             # minimum UP predictions per walk-forward window
     max_val_test_gap: 0.20                # max allowed val-test precision gap (Filter 5: generalization)
+    # BEC-61: block low-stability candidates (root cause of cycle-6 regression)
+    min_stability_floor: 0.15             # absolute floor: candidates below this never promote
+    min_stability_ratio: 0.5              # relative floor: candidates < ratio * champion.stability never promote
   walk_forward:
     window_size: 63                       # 3x target horizon (trading days)
     step_size: 21                         # = target horizon (trading days)

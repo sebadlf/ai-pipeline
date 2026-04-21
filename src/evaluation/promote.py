@@ -101,6 +101,50 @@ def cascading_compare(
             return True, f"no existing champion ({score_str})"
         return True, f"no existing champion (fallback, stage={cand_stage})"
 
+    # BEC-61: minimum-stability guard — block promotions when the candidate has
+    # near-zero stability, even if it would otherwise win the BEC-58 early iso
+    # tiebreaker or the within-margin iso_calibration tiebreaker. Cycle-6 saw
+    # 5/7 regressions caused by stability~0 candidates displacing stable champions.
+    # Two independent guards:
+    #   1. Absolute floor: stability_score < min_stability_floor → reject.
+    #   2. Relative floor: stability_score < ratio * champion.stability_score → reject.
+    # The guard only fires when the candidate has a stability score (otherwise it
+    # falls through to existing "missing score" handling below).
+    cand_stability_raw = cand_metrics.get("val_stability_score")
+    if cand_stability_raw is not None:
+        try:
+            cand_stability_val = float(cand_stability_raw)
+        except (TypeError, ValueError):
+            cand_stability_val = None
+        if cand_stability_val is not None:
+            if cand_stability_val < eval_config.min_stability_floor:
+                reason = (
+                    f"tiebreaker=low_stability: candidate stability_score "
+                    f"{cand_stability_val:.4f} < min_stability_floor "
+                    f"{eval_config.min_stability_floor:.4f}"
+                )
+                logger.info("cascading_compare low-stability guard fired: %s", reason)
+                return False, reason
+            champ_stability_raw = champ_metrics.get("val_stability_score")
+            if champ_stability_raw is not None:
+                try:
+                    champ_stability_val = float(champ_stability_raw)
+                except (TypeError, ValueError):
+                    champ_stability_val = None
+                if (
+                    champ_stability_val is not None
+                    and champ_stability_val > 0
+                    and cand_stability_val < eval_config.min_stability_ratio * champ_stability_val
+                ):
+                    reason = (
+                        f"tiebreaker=low_stability: candidate stability_score "
+                        f"{cand_stability_val:.4f} < "
+                        f"{eval_config.min_stability_ratio:.2f} * champion "
+                        f"{champ_stability_val:.4f}"
+                    )
+                    logger.info("cascading_compare low-stability guard fired: %s", reason)
+                    return False, reason
+
     # BEC-58: iso-asymmetric early exit — fires BEFORE cand_passed short-circuit.
     # When the current champion was never isotonic-calibrated (iso=0) and the
     # candidate is calibrated (iso=1) with reasonable stability, promote regardless
@@ -494,6 +538,19 @@ def promote_cluster_model(
     )
 
     if not should_promote:
+        # BEC-61: audit tag when the low-stability guard fires, so future cycles
+        # can inspect how often candidates are rejected for near-zero stability.
+        if "tiebreaker=low_stability" in reason:
+            try:
+                client.set_tag(run_id, "promotion.skipped_low_stability", "true")
+                client.set_tag(run_id, "promotion.skip_reason", reason)
+            except Exception as exc:  # pragma: no cover - non-critical telemetry
+                logger.warning(
+                    "[%s] failed to set skipped_low_stability tag on run %s: %s",
+                    cluster_id,
+                    run_id,
+                    exc,
+                )
         print(f"    SKIP: {reason}")
         return False
 
