@@ -165,7 +165,7 @@ def calibrate_temperature(
         signal_penalty = signal_penalty_alpha * max(0.0, min_signal_rate - signal_rate)
         return nll + signal_penalty
 
-    result = minimize_scalar(composite_objective, bounds=(0.5, 2.5), method="bounded")
+    result = minimize_scalar(composite_objective, bounds=(0.5, 4.0), method="bounded")
     optimal_temp = float(result.x)
 
     # Post-calibration diagnostics
