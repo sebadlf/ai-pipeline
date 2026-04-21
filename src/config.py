@@ -271,6 +271,11 @@ class ClusterConfig:
     #   "warn_only"  — log a warning but do not modify assignments.
     degenerate_cluster_threshold: float = 0.30
     degenerate_cluster_action: str = "subdivide"
+    # BEC-63: When true, validate cached clusters.parquet on every pipeline run
+    # and apply degenerate-cluster post-processing without a full rebuild.
+    # Degenerate clusters (silhouette_mean_cluster < threshold) are remediated
+    # in place; if all clusters are healthy the cached file is used unchanged.
+    rebuild_on_degenerate_cached: bool = True
 
     @classmethod
     def from_dict(cls, d: dict) -> ClusterConfig:
@@ -290,6 +295,7 @@ class ClusterConfig:
             cluster_thresholds=d.get("cluster_thresholds", {}),
             degenerate_cluster_threshold=d.get("degenerate_cluster_threshold", 0.30),
             degenerate_cluster_action=d.get("degenerate_cluster_action", "subdivide"),
+            rebuild_on_degenerate_cached=d.get("rebuild_on_degenerate_cached", True),
         )
 
 

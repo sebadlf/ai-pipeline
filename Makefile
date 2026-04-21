@@ -43,6 +43,12 @@ normalize:
 cluster:
 	uv run python -m src.features.clustering
 
+# BEC-63: Validate cached clusters.parquet and post-process degenerate clusters
+# without a full KMeans rebuild. Safe to call even when cluster is fresh —
+# it exits immediately when all clusters are healthy.
+validate-clusters:
+	uv run python -m src.features.clustering --validate-cached
+
 # =============================================================================
 # Stage 2: Model Training
 # =============================================================================
@@ -116,6 +122,7 @@ pipeline:
 	else \
 		echo "No new data and clusters exist, refreshing normalization only."; \
 		$(MAKE) normalize; \
+		$(MAKE) validate-clusters; \
 	fi
 	$(MAKE) train-clusters promote aggregate portfolio backtest
 
@@ -131,6 +138,7 @@ pipeline-prod:
 	else \
 		echo "No new data and clusters exist, refreshing normalization only."; \
 		$(MAKE) normalize; \
+		$(MAKE) validate-clusters; \
 	fi
 	$(MAKE) train-clusters promote aggregate portfolio backtest
 
