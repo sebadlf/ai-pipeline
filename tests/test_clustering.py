@@ -8,6 +8,8 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_samples, silhouette_score
 from sklearn.preprocessing import StandardScaler
 
+from src.features.clustering import _handle_degenerate_clusters
+
 
 @pytest.fixture
 def sample_clustering_features() -> pl.DataFrame:
@@ -285,3 +287,197 @@ def test_per_cluster_silhouette_columns_in_output(sample_clustering_features: pl
         cluster_rows = result_df.filter(pl.col("cluster_id") == cluster_id)
         means = cluster_rows["silhouette_mean_cluster"].unique()
         assert len(means) == 1, f"All rows in cluster {cluster_id} should have identical mean"
+
+
+# ---------------------------------------------------------------------------
+# Degenerate cluster handling (BEC-59)
+# ---------------------------------------------------------------------------
+
+
+def _make_degenerate_setup(
+    n_good: int = 20,
+    n_bad: int = 10,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, list[int], dict, dict, dict, KMeans, list[str]]:
+    """Create a synthetic dataset with one well-separated cluster and one degenerate cluster.
+
+    The "good" cluster has tight Gaussian spread; the "bad" cluster is
+    intentionally diffuse (random noise) so its silhouette is expected to be
+    lower.
+
+    Returns:
+        X, labels, unique_labels, cluster_sil_mean, cluster_sil_std,
+        label_to_name, dummy_kmeans, sectors
+    """
+    rng = np.random.default_rng(seed)
+    # Tight cluster around [10, 10]
+    X_good = rng.normal(loc=[10.0, 10.0], scale=0.3, size=(n_good, 2))
+    # Diffuse cloud centred at origin
+    X_bad = rng.uniform(low=-2.0, high=2.0, size=(n_bad, 2))
+
+    X = np.vstack([X_good, X_bad])
+    labels = np.array([0] * n_good + [1] * n_bad)
+    unique_labels = [0, 1]
+
+    sample_scores = silhouette_samples(X, labels)
+    cluster_sil_mean = {lbl: float(np.mean(sample_scores[labels == lbl])) for lbl in unique_labels}
+    cluster_sil_std = {lbl: float(np.std(sample_scores[labels == lbl])) for lbl in unique_labels}
+    label_to_name = {0: "GoodCluster", 1: "BadCluster"}
+
+    # Dummy KMeans — only cluster_centers_ is used by reassign
+    km = KMeans(n_clusters=2, random_state=42, n_init=10)
+    km.fit(X)
+    km.cluster_centers_ = np.array([X_good.mean(axis=0), X_bad.mean(axis=0)])
+
+    sectors = ["Technology"] * n_good + ["Healthcare"] * n_bad
+
+    return X, labels, unique_labels, cluster_sil_mean, cluster_sil_std, label_to_name, km, sectors
+
+
+def test_handle_degenerate_warn_only_returns_unchanged() -> None:
+    """warn_only policy must not mutate any assignments."""
+    X, labels, unique_labels, csm, css, ltn, km, sectors = _make_degenerate_setup()
+    labels_before = labels.copy()
+
+    labels_out, ul_out, csm_out, css_out, ltn_out = _handle_degenerate_clusters(
+        X_reduced=X,
+        labels=labels,
+        unique_labels=unique_labels,
+        cluster_sil_mean=csm,
+        cluster_sil_std=css,
+        label_to_name=ltn,
+        degenerate_labels=[1],
+        kmeans=km,
+        deg_action="warn_only",
+        deg_threshold=0.30,
+        min_cluster_size=5,
+        n_stocks=len(X),
+        sectors=sectors,
+    )
+
+    np.testing.assert_array_equal(labels_out, labels_before)
+    assert ul_out == unique_labels
+    assert csm_out == csm
+    assert ltn_out == ltn
+
+
+def test_handle_degenerate_reassign_removes_degenerate() -> None:
+    """reassign policy moves all degenerate-cluster symbols to the good cluster."""
+    X, labels, unique_labels, csm, css, ltn, km, sectors = _make_degenerate_setup()
+
+    labels_out, ul_out, csm_out, css_out, ltn_out = _handle_degenerate_clusters(
+        X_reduced=X,
+        labels=labels,
+        unique_labels=unique_labels,
+        cluster_sil_mean=csm,
+        cluster_sil_std=css,
+        label_to_name=ltn,
+        degenerate_labels=[1],
+        kmeans=km,
+        deg_action="reassign",
+        deg_threshold=0.30,
+        min_cluster_size=5,
+        n_stocks=len(X),
+        sectors=sectors,
+    )
+
+    # After reassign, only one unique label should remain (all go to cluster 0)
+    assert set(labels_out.tolist()) == {0}
+    assert ul_out == [0]
+    # Per-cluster stats must be updated
+    assert set(csm_out.keys()) == {0}
+    assert set(css_out.keys()) == {0}
+
+
+def test_handle_degenerate_subdivide_improves_silhouette() -> None:
+    """subdivide should split a degenerate cluster when two sub-groups exist."""
+    # Build a dataset where the "bad" cluster actually has two internal groups
+    rng = np.random.default_rng(7)
+    X_good = rng.normal(loc=[10.0, 10.0], scale=0.2, size=(20, 2))
+    # Two sub-groups at opposite ends — subdivision should yield higher silhouette
+    X_sub_a = rng.normal(loc=[-5.0, 0.0], scale=0.2, size=(8, 2))
+    X_sub_b = rng.normal(loc=[5.0, 0.0], scale=0.2, size=(8, 2))
+    X_bad = np.vstack([X_sub_a, X_sub_b])
+
+    X = np.vstack([X_good, X_bad])
+    n_bad = len(X_bad)
+    n_good = len(X_good)
+    labels = np.array([0] * n_good + [1] * n_bad)
+    unique_labels = [0, 1]
+
+    sample_scores = silhouette_samples(X, labels)
+    csm = {lbl: float(np.mean(sample_scores[labels == lbl])) for lbl in unique_labels}
+    css = {lbl: float(np.std(sample_scores[labels == lbl])) for lbl in unique_labels}
+    ltn = {0: "GoodCluster", 1: "DegenerateCluster"}
+
+    km = KMeans(n_clusters=2, random_state=42, n_init=10)
+    km.fit(X)
+
+    sectors = ["Technology"] * n_good + ["Healthcare"] * n_bad
+
+    labels_out, ul_out, csm_out, css_out, ltn_out = _handle_degenerate_clusters(
+        X_reduced=X,
+        labels=labels,
+        unique_labels=unique_labels,
+        cluster_sil_mean=csm,
+        cluster_sil_std=css,
+        label_to_name=ltn,
+        degenerate_labels=[1],
+        kmeans=km,
+        deg_action="subdivide",
+        deg_threshold=csm[1] + 0.5,  # Ensure cluster 1 is marked degenerate
+        min_cluster_size=5,
+        n_stocks=len(X),
+        sectors=sectors,
+    )
+
+    # Either 2 or 3 unique labels depending on whether the split was accepted
+    assert len(ul_out) >= 2
+    # All returned labels must have entries in the stat dicts
+    assert set(csm_out.keys()) == set(ul_out)
+    assert set(css_out.keys()) == set(ul_out)
+    # No label should be missing from label_to_name
+    for lbl in ul_out:
+        assert lbl in ltn_out
+
+
+def test_handle_degenerate_subdivide_skips_if_too_small() -> None:
+    """subdivide should skip the split when the sub-clusters would be too small."""
+    rng = np.random.default_rng(99)
+    # Only 6 stocks in the "bad" cluster — can't split into 2 × 5
+    X_good = rng.normal(loc=[10.0, 10.0], scale=0.1, size=(20, 2))
+    X_bad = rng.uniform(low=-1.0, high=1.0, size=(6, 2))
+
+    X = np.vstack([X_good, X_bad])
+    labels = np.array([0] * 20 + [1] * 6)
+    unique_labels = [0, 1]
+
+    sample_scores = silhouette_samples(X, labels)
+    csm = {lbl: float(np.mean(sample_scores[labels == lbl])) for lbl in unique_labels}
+    css = {lbl: float(np.std(sample_scores[labels == lbl])) for lbl in unique_labels}
+    ltn = {0: "GoodCluster", 1: "SmallBadCluster"}
+
+    km = KMeans(n_clusters=2, random_state=42, n_init=10)
+    km.fit(X)
+
+    sectors = ["Technology"] * 20 + ["Healthcare"] * 6
+
+    labels_out, ul_out, csm_out, _css_out, _ltn_out = _handle_degenerate_clusters(
+        X_reduced=X,
+        labels=labels.copy(),
+        unique_labels=unique_labels,
+        cluster_sil_mean=csm,
+        cluster_sil_std=css,
+        label_to_name=ltn,
+        degenerate_labels=[1],
+        kmeans=km,
+        deg_action="subdivide",
+        deg_threshold=csm[1] + 0.5,
+        min_cluster_size=5,  # 6 < 2*5 = 10, so split should be skipped
+        n_stocks=len(X),
+        sectors=sectors,
+    )
+
+    # Labels should be unchanged because the split was skipped
+    np.testing.assert_array_equal(labels_out, labels)
+    assert ul_out == unique_labels

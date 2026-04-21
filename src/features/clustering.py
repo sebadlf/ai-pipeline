@@ -428,6 +428,212 @@ def _find_optimal_k(
     return best_k, best_score
 
 
+def _handle_degenerate_clusters(
+    X_reduced: np.ndarray,
+    labels: np.ndarray,
+    unique_labels: list[int],
+    cluster_sil_mean: dict[int, float],
+    cluster_sil_std: dict[int, float],
+    label_to_name: dict[int, str],
+    degenerate_labels: list[int],
+    kmeans: KMeans,
+    deg_action: str,
+    deg_threshold: float,
+    min_cluster_size: int,
+    n_stocks: int,
+    sectors: list[str],
+) -> tuple[np.ndarray, list[int], dict[int, float], dict[int, float], dict[int, str]]:
+    """Remediate degenerate clusters according to the configured policy.
+
+    A degenerate cluster is one whose silhouette_mean_cluster is below
+    ``deg_threshold``. Three policies are supported:
+
+    ``subdivide``
+        Attempt mini-KMeans(K=2) on each degenerate cluster. The split is
+        accepted only when both new sub-clusters have silhouette ≥ the
+        original mean *and* each contains at least ``min_cluster_size``
+        symbols. New sub-cluster labels are appended; the parent label is
+        reused for consistency.
+
+    ``reassign``
+        Reassign every symbol in the degenerate cluster to its nearest
+        *non-degenerate* centroid (by Euclidean distance in PCA space).
+        If no non-degenerate centroid exists, the cluster is kept as-is.
+
+    ``warn_only``
+        Log a warning and return the inputs unchanged.
+
+    After any mutation the per-cluster silhouette stats are recomputed from
+    scratch so that downstream logging reflects the final state.
+
+    Args:
+        X_reduced: PCA-reduced feature matrix (n_stocks × n_components).
+        labels: Cluster label array (shape: n_stocks), mutated in place.
+        unique_labels: Sorted list of unique label integers.
+        cluster_sil_mean: Per-label mean silhouette scores.
+        cluster_sil_std: Per-label std silhouette scores.
+        label_to_name: Mapping from integer label to descriptive cluster name.
+        degenerate_labels: Labels identified as degenerate.
+        kmeans: Fitted KMeans object (provides cluster_centers_).
+        deg_action: One of "subdivide", "reassign", "warn_only".
+        deg_threshold: Silhouette threshold used for degenerate detection.
+        min_cluster_size: Minimum symbols per sub-cluster for subdivision.
+        n_stocks: Total number of stocks.
+        sectors: Per-stock sector list, aligned with X_reduced rows.
+
+    Returns:
+        Updated (labels, unique_labels, cluster_sil_mean, cluster_sil_std,
+        label_to_name) after remediation.
+    """
+    labels = labels.copy()
+    non_degen_labels = [lbl for lbl in unique_labels if lbl not in degenerate_labels]
+
+    if deg_action == "warn_only":
+        for lbl in degenerate_labels:
+            logger.warning(
+                "Degenerate cluster '%s' (silhouette=%.3f < %.2f) — warn_only, keeping as-is",
+                label_to_name[lbl],
+                cluster_sil_mean[lbl],
+                deg_threshold,
+            )
+        return labels, unique_labels, cluster_sil_mean, cluster_sil_std, label_to_name
+
+    mutated = False
+
+    if deg_action == "subdivide":
+        # Assign fresh label integers starting after the current max
+        next_label = max(unique_labels) + 1
+
+        for lbl in degenerate_labels:
+            mask = labels == lbl
+            indices = np.where(mask)[0]
+
+            if len(indices) < 2 * min_cluster_size:
+                # Too few symbols to subdivide meaningfully
+                logger.info(
+                    "Cluster '%s' has only %d symbols; cannot subdivide into 2 × %d — skipping",
+                    label_to_name[lbl],
+                    len(indices),
+                    min_cluster_size,
+                )
+                continue
+
+            X_sub = X_reduced[indices]
+            km_sub = KMeans(n_clusters=2, random_state=42, n_init=10)
+            sub_labels_local = km_sub.fit_predict(X_sub)
+
+            # Enforce minimum sub-cluster size
+            sub_counts = np.bincount(sub_labels_local)
+            if np.any(sub_counts < min_cluster_size):
+                logger.info(
+                    "Cluster '%s' subdivision violates min_cluster_size=%d — keeping as-is",
+                    label_to_name[lbl],
+                    min_cluster_size,
+                )
+                continue
+
+            # Accept only if each sub-cluster has silhouette ≥ original mean
+            sub_sil_samples = silhouette_samples(X_sub, sub_labels_local)
+            sub_sil_by_label = {
+                sl: float(np.mean(sub_sil_samples[sub_labels_local == sl])) for sl in range(2)
+            }
+            original_mean = cluster_sil_mean[lbl]
+            if not all(v >= original_mean for v in sub_sil_by_label.values()):
+                logger.info(
+                    "Cluster '%s' subdivision does not improve silhouette "
+                    "(original=%.3f, sub0=%.3f, sub1=%.3f) — keeping as-is",
+                    label_to_name[lbl],
+                    original_mean,
+                    sub_sil_by_label[0],
+                    sub_sil_by_label[1],
+                )
+                continue
+
+            # Commit the split: label 0 → existing lbl, label 1 → next_label
+            new_lbl = next_label
+            next_label += 1
+            for local_idx, sub_lbl in enumerate(sub_labels_local):
+                global_idx = indices[local_idx]
+                if sub_lbl == 1:
+                    labels[global_idx] = new_lbl
+
+            # Derive name for the new sub-cluster from its sector composition
+            new_mask = labels == new_lbl
+            new_sectors = sorted({sectors[i] for i in range(n_stocks) if new_mask[i]})
+            if len(new_sectors) <= 3:
+                new_base = "-".join(s.replace(" ", "") for s in new_sectors)
+            else:
+                new_base = "Miscellaneous"
+            label_to_name[new_lbl] = f"{new_base}_sub"
+
+            # Update the parent's name to reflect it is now a sub-cluster too
+            label_to_name[lbl] = f"{label_to_name[lbl]}_sub"
+
+            unique_labels = sorted(set(labels.tolist()))
+            mutated = True
+            logger.info(
+                "Subdivided cluster '%s' into '%s' (%d) and '%s' (%d)",
+                label_to_name[lbl],
+                label_to_name[lbl],
+                int(np.sum(labels == lbl)),
+                label_to_name[new_lbl],
+                int(np.sum(labels == new_lbl)),
+            )
+
+    elif deg_action == "reassign":
+        if not non_degen_labels:
+            logger.warning(
+                "No non-degenerate clusters to reassign to — keeping degenerate clusters as-is"
+            )
+        else:
+            non_degen_centers = np.array(
+                [kmeans.cluster_centers_[lbl] for lbl in non_degen_labels]
+                if len(kmeans.cluster_centers_) > max(non_degen_labels)
+                else []
+            )
+            # Compute non-degenerate cluster centroids directly from data
+            non_degen_centers = np.array(
+                [X_reduced[labels == lbl].mean(axis=0) for lbl in non_degen_labels]
+            )
+
+            for lbl in degenerate_labels:
+                mask = labels == lbl
+                indices = np.where(mask)[0]
+                for idx in indices:
+                    dists = np.linalg.norm(non_degen_centers - X_reduced[idx], axis=1)
+                    nearest_nd_label = non_degen_labels[int(np.argmin(dists))]
+                    labels[idx] = nearest_nd_label
+
+            unique_labels = sorted(set(labels.tolist()))
+            mutated = True
+            logger.info(
+                "Reassigned symbols from %d degenerate cluster(s) to nearest non-degenerate",
+                len(degenerate_labels),
+            )
+
+    # If labels were mutated, recompute silhouette stats for all clusters
+    if mutated:
+        n_unique_final = len(unique_labels)
+        if n_unique_final > 1 and n_stocks > n_unique_final:
+            sample_scores = silhouette_samples(X_reduced, labels)
+        else:
+            sample_scores = np.zeros(n_stocks)
+
+        cluster_sil_mean = {}
+        cluster_sil_std = {}
+        for label in unique_labels:
+            mask = labels == label
+            scores_for_cluster = sample_scores[mask]
+            cluster_sil_mean[label] = float(np.mean(scores_for_cluster))
+            cluster_sil_std[label] = float(np.std(scores_for_cluster))
+
+        # Remove entries for labels that no longer exist
+        for gone_lbl in set(label_to_name.keys()) - set(unique_labels):
+            label_to_name.pop(gone_lbl, None)
+
+    return labels, unique_labels, cluster_sil_mean, cluster_sil_std, label_to_name
+
+
 def run_clustering(
     config: dict,
     reference_date: dt.date | None = None,
@@ -628,7 +834,49 @@ def run_clustering(
         if base in single_names:
             label_to_name[label] = base
 
-    # Warn for degenerate clusters (low silhouette)
+    # Degenerate cluster handling (BEC-59): detect and remediate clusters
+    # with silhouette_mean_cluster below the configured threshold.
+    # Policy: "subdivide" | "reassign" | "warn_only"
+    deg_threshold = cluster_cfg.degenerate_cluster_threshold
+    deg_action = cluster_cfg.degenerate_cluster_action
+
+    degenerate_labels = [lbl for lbl in unique_labels if cluster_sil_mean[lbl] < deg_threshold]
+
+    if degenerate_labels:
+        logger.info(
+            "Found %d degenerate cluster(s) with silhouette_mean_cluster < %.2f: %s. Action: %s",
+            len(degenerate_labels),
+            deg_threshold,
+            [label_to_name[lbl] for lbl in degenerate_labels],
+            deg_action,
+        )
+        labels, unique_labels, cluster_sil_mean, cluster_sil_std, label_to_name = (
+            _handle_degenerate_clusters(
+                X_reduced=X_reduced,
+                labels=labels,
+                unique_labels=unique_labels,
+                cluster_sil_mean=cluster_sil_mean,
+                cluster_sil_std=cluster_sil_std,
+                label_to_name=label_to_name,
+                degenerate_labels=degenerate_labels,
+                kmeans=kmeans,
+                deg_action=deg_action,
+                deg_threshold=deg_threshold,
+                min_cluster_size=cluster_cfg.min_cluster_size,
+                n_stocks=n_stocks,
+                sectors=sectors,
+            )
+        )
+
+    # Recompute global silhouette score if degenerate handling mutated labels
+    if degenerate_labels and deg_action != "warn_only":
+        n_unique_final = len(unique_labels)
+        if n_unique_final > 1 and n_stocks > n_unique_final:
+            sil_score = float(silhouette_score(X_reduced, labels))
+        else:
+            sil_score = 0.0
+
+    # Warn for clusters still below warn threshold after remediation
     _SILHOUETTE_WARN_THRESHOLD = 0.15
     for label in unique_labels:
         cluster_name = label_to_name[label]
