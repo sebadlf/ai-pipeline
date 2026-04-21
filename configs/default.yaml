@@ -342,6 +342,9 @@ clustering:
   #   "warn_only"  — log a warning but keep assignments unchanged.
   degenerate_cluster_threshold: 0.30
   degenerate_cluster_action: subdivide
+  # BEC-63: validate cached clusters.parquet on every pipeline run and apply
+  # degenerate-cluster post-processing when silhouette_mean_cluster < threshold.
+  rebuild_on_degenerate_cached: true
   # Per-cluster buy_threshold overrides (populated after initial clustering run).
   # Keys are cluster_id strings; missing clusters use target.buy_threshold default.
   cluster_thresholds: {}

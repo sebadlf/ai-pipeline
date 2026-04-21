@@ -1033,15 +1033,320 @@ def save_clusters(
     print(f"Saved {len(result_df)} cluster assignments to database")
 
 
+def validate_and_fix_cached_clusters(
+    config: dict,
+    reference_date: dt.date | None = None,
+) -> tuple[bool, list[str], str]:
+    """Check cached clusters.parquet for degenerate clusters and post-process if needed.
+
+    Loads the cached parquet, recomputes per-cluster silhouette scores on
+    current feature data, and applies the configured degenerate-cluster action
+    (subdivide / reassign / warn_only) when any cluster falls below the
+    ``clustering.degenerate_cluster_threshold``.
+
+    This function is called from the pipeline when ``clusters.parquet`` is
+    reused from a previous run, ensuring that BEC-59 degenerate-cluster
+    handling fires even when a full KMeans rebuild is skipped.
+
+    Args:
+        config: Full config dict.
+        reference_date: Date for split computation. Defaults to today.
+
+    Returns:
+        Tuple of (was_modified, degenerate_cluster_names, action_taken).
+        ``was_modified`` is True when the parquet was updated on disk.
+        ``degenerate_cluster_names`` lists cluster_ids below the threshold.
+        ``action_taken`` is one of "merge", "subdivide", "reassign",
+        "warn_only", or "none".
+    """
+    cluster_cfg = ClusterConfig.from_dict(config.get("clustering", {}))
+    output_path = Path(cluster_cfg.output_parquet)
+
+    if not output_path.exists():
+        logger.info("No cached clusters.parquet found — skipping degenerate validation")
+        return False, [], "none"
+
+    if not cluster_cfg.rebuild_on_degenerate_cached:
+        logger.info("rebuild_on_degenerate_cached=false — skipping degenerate cache validation")
+        return False, [], "none"
+
+    logger.info("Validating cached clusters.parquet for degenerate clusters...")
+    cached_df = pl.read_parquet(str(output_path))
+
+    # Check whether silhouette_mean_cluster is present (stale schema guard).
+    if "silhouette_mean_cluster" not in cached_df.columns:
+        logger.warning(
+            "cached clusters.parquet lacks silhouette_mean_cluster column — "
+            "cannot validate; skipping"
+        )
+        return False, [], "none"
+
+    deg_threshold = cluster_cfg.degenerate_cluster_threshold
+
+    # Identify degenerate cluster_ids from the cached per-symbol silhouette stats.
+    # Each symbol in the same cluster has the same silhouette_mean_cluster value.
+    cluster_sil = (
+        cached_df.group_by("cluster_id")
+        .agg(pl.col("silhouette_mean_cluster").first().alias("sil_mean"))
+        .filter(pl.col("sil_mean").is_not_null())
+    )
+    degenerate_rows = cluster_sil.filter(pl.col("sil_mean") < deg_threshold)
+    degenerate_cluster_names = degenerate_rows["cluster_id"].to_list()
+
+    if not degenerate_cluster_names:
+        logger.info(
+            "All cached clusters have silhouette_mean_cluster >= %.2f — no action needed",
+            deg_threshold,
+        )
+        return False, [], "none"
+
+    logger.info(
+        "Found %d degenerate cached cluster(s): %s. Action: %s",
+        len(degenerate_cluster_names),
+        degenerate_cluster_names,
+        cluster_cfg.degenerate_cluster_action,
+    )
+
+    if cluster_cfg.degenerate_cluster_action == "warn_only":
+        for name in degenerate_cluster_names:
+            sil_val = float(cluster_sil.filter(pl.col("cluster_id") == name)["sil_mean"][0])
+            logger.warning(
+                "Cached cluster '%s' is degenerate (silhouette_mean_cluster=%.3f < %.2f) "
+                "— warn_only, keeping as-is",
+                name,
+                sil_val,
+                deg_threshold,
+            )
+        return False, degenerate_cluster_names, "warn_only"
+
+    # To apply subdivide / reassign we need the PCA-reduced feature matrix.
+    # Re-compute clustering features on current data (same path as run_clustering).
+    split_dates = compute_split_dates(config, reference_date)
+    engine = get_engine()
+    sectors_df = load_sectors(engine)
+
+    if sectors_df.is_empty():
+        logger.warning("No sector data — cannot recompute features for degenerate fix")
+        return False, degenerate_cluster_names, "none"
+
+    all_symbols = sectors_df["symbol"].to_list()
+    feat_df = compute_clustering_features(engine, all_symbols, split_dates.train_end, sectors_df)
+    feat_df = feat_df.join(sectors_df.select(["symbol", "sector"]), on="symbol", how="left")
+    feature_cols = [c for c in feat_df.columns if c not in {"symbol", "sector"}]
+
+    n_stocks = len(feat_df)
+    X = feat_df.select(feature_cols).to_numpy()
+
+    if cluster_cfg.include_sector_features:
+        sector_dummies = feat_df.select("sector").to_dummies()
+        X = np.hstack([X, sector_dummies.to_numpy().astype(float)])
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        col_medians = np.nanmedian(X, axis=0)
+    for j in range(X.shape[1]):
+        mask_nan = np.isnan(X[:, j])
+        X[mask_nan, j] = col_medians[j] if not np.isnan(col_medians[j]) else 0.0
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
+    n_components_before = X_scaled.shape[1]
+    max_components = min(n_stocks - 1, n_components_before)
+    if max_components >= 2:
+        pca = PCA(n_components=min(cluster_cfg.pca_variance_ratio, max_components))
+        X_reduced = pca.fit_transform(X_scaled)
+    else:
+        X_reduced = X_scaled
+
+    # Reconstruct labels array from cached cluster assignments.
+    symbols_order = feat_df["symbol"].to_list()
+    sectors_list = feat_df["sector"].to_list()
+
+    # Map symbol -> cached cluster_id
+    symbol_to_cluster: dict[str, str] = {
+        row["symbol"]: row["cluster_id"] for row in cached_df.iter_rows(named=True)
+    }
+    cluster_name_to_label: dict[str, int] = {}
+    label_to_name: dict[int, str] = {}
+    next_lbl = 0
+    int_labels = []
+    for sym in symbols_order:
+        cid = symbol_to_cluster.get(sym, "Unknown")
+        if cid not in cluster_name_to_label:
+            cluster_name_to_label[cid] = next_lbl
+            label_to_name[next_lbl] = cid
+            next_lbl += 1
+        int_labels.append(cluster_name_to_label[cid])
+
+    labels = np.array(int_labels)
+    unique_labels = sorted(set(labels.tolist()))
+
+    # Recompute silhouette stats on current feature data.
+    n_unique = len(unique_labels)
+    if n_unique > 1 and n_stocks > n_unique:
+        sample_scores = silhouette_samples(X_reduced, labels)
+    else:
+        sample_scores = np.zeros(n_stocks)
+
+    cluster_sil_mean: dict[int, float] = {}
+    cluster_sil_std: dict[int, float] = {}
+    for lbl in unique_labels:
+        mask = labels == lbl
+        cluster_sil_mean[lbl] = float(np.mean(sample_scores[mask]))
+        cluster_sil_std[lbl] = float(np.std(sample_scores[mask]))
+
+    # Identify degenerate labels using freshly computed silhouette on current data.
+    degenerate_labels = [lbl for lbl in unique_labels if cluster_sil_mean[lbl] < deg_threshold]
+
+    if not degenerate_labels:
+        logger.info(
+            "Recomputed silhouette on current data: all cached clusters are healthy "
+            "(threshold=%.2f) — no modification needed",
+            deg_threshold,
+        )
+        return False, [], "none"
+
+    logger.info(
+        "Recomputed silhouette on current data: %d degenerate cluster(s): %s. Applying '%s'...",
+        len(degenerate_labels),
+        [label_to_name[lbl] for lbl in degenerate_labels],
+        cluster_cfg.degenerate_cluster_action,
+    )
+
+    # Dummy KMeans — only used to provide cluster_centers_ for reassign path.
+    km_dummy = KMeans(n_clusters=max(2, n_unique), random_state=42, n_init=1)
+    km_dummy.fit(X_reduced)
+
+    labels, unique_labels, cluster_sil_mean, cluster_sil_std, label_to_name = (
+        _handle_degenerate_clusters(
+            X_reduced=X_reduced,
+            labels=labels,
+            unique_labels=unique_labels,
+            cluster_sil_mean=cluster_sil_mean,
+            cluster_sil_std=cluster_sil_std,
+            label_to_name=label_to_name,
+            degenerate_labels=degenerate_labels,
+            kmeans=km_dummy,
+            deg_action=cluster_cfg.degenerate_cluster_action,
+            deg_threshold=deg_threshold,
+            min_cluster_size=cluster_cfg.min_cluster_size,
+            n_stocks=n_stocks,
+            sectors=sectors_list,
+        )
+    )
+
+    # Recompute global silhouette for the updated partition.
+    n_unique_final = len(unique_labels)
+    if n_unique_final > 1 and n_stocks > n_unique_final:
+        sil_score_final = float(silhouette_score(X_reduced, labels))
+    else:
+        sil_score_final = 0.0
+
+    # Rebuild result DataFrame from updated labels.
+    results = []
+    for idx, symbol in enumerate(symbols_order):
+        lbl = labels[idx]
+        results.append(
+            {
+                "symbol": symbol,
+                "sector": sectors_list[idx],
+                "cluster_id": label_to_name[lbl],
+                "silhouette_score": sil_score_final,
+                "silhouette_mean_cluster": cluster_sil_mean[lbl],
+                "silhouette_std_cluster": cluster_sil_std[lbl],
+            }
+        )
+
+    result_df = pl.DataFrame(results)
+    result_df.write_parquet(str(output_path))
+
+    engine_db = get_engine()
+    run_date = reference_date or dt.date.today()
+    with engine_db.begin() as conn:
+        for row in result_df.iter_rows(named=True):
+            stmt = text("""
+                INSERT INTO cluster_assignments
+                    (run_date, symbol, sector, cluster_id, silhouette_score,
+                     silhouette_mean_cluster, silhouette_std_cluster)
+                VALUES (:run_date, :symbol, :sector, :cluster_id, :silhouette_score,
+                        :silhouette_mean_cluster, :silhouette_std_cluster)
+                ON CONFLICT (run_date, symbol) DO UPDATE SET
+                    sector = EXCLUDED.sector,
+                    cluster_id = EXCLUDED.cluster_id,
+                    silhouette_score = EXCLUDED.silhouette_score,
+                    silhouette_mean_cluster = EXCLUDED.silhouette_mean_cluster,
+                    silhouette_std_cluster = EXCLUDED.silhouette_std_cluster
+            """)
+            conn.execute(
+                stmt,
+                {
+                    "run_date": run_date,
+                    "symbol": row["symbol"],
+                    "sector": row["sector"],
+                    "cluster_id": row["cluster_id"],
+                    "silhouette_score": row["silhouette_score"],
+                    "silhouette_mean_cluster": row.get("silhouette_mean_cluster"),
+                    "silhouette_std_cluster": row.get("silhouette_std_cluster"),
+                },
+            )
+
+    action_label = cluster_cfg.degenerate_cluster_action  # "subdivide" | "reassign"
+    logger.info(
+        "Degenerate cache fix complete — action=%s, updated parquet: %s",
+        action_label,
+        output_path,
+    )
+    print(
+        f"  [degenerate-fix] Post-processed {len(degenerate_labels)} degenerate cached "
+        f"cluster(s) via '{action_label}'. Updated {output_path}"
+    )
+    return True, [label_to_name.get(lbl, str(lbl)) for lbl in degenerate_labels], action_label
+
+
 def main() -> None:
     """Run stock clustering pipeline."""
     from src.keys import PIPELINE_ENV
 
     parser = argparse.ArgumentParser(description="Cluster stocks globally")
     parser.add_argument("--config", default=None, help="Path to config YAML")
+    parser.add_argument(
+        "--validate-cached",
+        action="store_true",
+        help=(
+            "BEC-63: Validate cached clusters.parquet for degenerate clusters and "
+            "post-process in place without a full rebuild. Exits 0 when no action "
+            "is needed or after successful remediation."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+
+    # BEC-63: --validate-cached path — check the existing parquet and remediate
+    # degenerate clusters without running a full KMeans rebuild.
+    if args.validate_cached:
+        was_modified, degenerate_names, action_taken = validate_and_fix_cached_clusters(config)
+        # Log the outcome to MLflow regardless of whether anything changed.
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_experiment("clustering")
+        with mlflow.start_run(run_name="cluster-degenerate-check"):
+            mlflow.log_param("post_process_action", action_taken)
+            mlflow.log_param(
+                "degenerate_clusters_detected",
+                str(degenerate_names) if degenerate_names else "[]",
+            )
+            mlflow.log_metric("degenerate_cluster_count", len(degenerate_names))
+            mlflow.log_metric("cache_modified", int(was_modified))
+            if was_modified:
+                cluster_cfg_val = config.get("clustering", {})
+                mlflow.log_artifact(cluster_cfg_val.get("output_parquet", "data/clusters.parquet"))
+        print(
+            f"Degenerate cluster check complete: "
+            f"action={action_taken}, detected={degenerate_names}, modified={was_modified}"
+        )
+        return
 
     # Determine the universe of ingested symbols for the BEC-44 audit.
     audit_engine = get_engine()
