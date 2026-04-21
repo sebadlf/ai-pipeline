@@ -298,10 +298,37 @@ class TestCascadingCompare:
         assert beats is False
         assert "failed filters" in reason
 
-    def test_calibrated_candidate_beats_uncalibrated_champion(self, cascading_cfg: dict) -> None:
-        """BEC-39: an isotonic-calibrated candidate wins over a pre-calibration champion
+    def test_calibrated_candidate_beats_uncalibrated_champion_within_margin(
+        self, cascading_cfg: dict
+    ) -> None:
+        """BEC-39/BEC-54: an isotonic-calibrated candidate wins over a non-calibrated champion
+        when scores are within tiebreak margin.
 
-        even when the legacy champion has a higher raw stability score.
+        iso_calibration is a tiebreaker that dominates within the margin zone (BEC-54 rework).
+        It does NOT override a clearly-better champion score outside the margin.
+        """
+        cand = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.695,  # within 0.01 margin of champion
+            "isotonic_fitted": 1.0,
+        }
+        champ = {
+            "val_passed_all_filters": "true",
+            "val_stability_score": 0.700,
+            # No isotonic_fitted metric → legacy pre-BEC-37 run
+        }
+        beats, reason = cascading_compare(cand, champ, cascading_cfg)
+        assert beats is True
+        assert "isotonic-calibrated" in reason
+        assert "tiebreaker=iso_calibration" in reason
+
+    def test_calibrated_candidate_does_not_override_clearly_better_champion(
+        self, cascading_cfg: dict
+    ) -> None:
+        """BEC-54: iso_calibration does not override a champion with a clearly higher score.
+
+        When champion score is well above the tiebreak margin, stability_score decides,
+        not calibration status.
         """
         cand = {
             "val_passed_all_filters": "true",
@@ -314,9 +341,8 @@ class TestCascadingCompare:
             # No isotonic_fitted metric → legacy pre-BEC-37 run
         }
         beats, reason = cascading_compare(cand, champ, cascading_cfg)
-        assert beats is True
-        assert "isotonic-calibrated" in reason
-        assert "tiebreaker=iso_calibration" in reason
+        assert beats is False
+        assert "stability_score" in reason
 
     def test_iso_preference_with_equal_stability_scores(self, cascading_cfg: dict) -> None:
         """BEC-50: with equal stability scores, iso-calibrated candidate beats non-calibrated.
@@ -518,6 +544,58 @@ class TestFindBestCandidateTierFallback:
         client = _make_client_with_checkpoints({"first", "second"})
         run, ckpt = _find_best_candidate(client, [first, second], cfg, cluster_id="C")
         assert run is first
+        assert ckpt == "model.ckpt"
+
+    def test_champion_excluded_from_candidate_pool(self) -> None:
+        """BEC-54: champion run is excluded so it cannot re-select itself.
+
+        When the champion is the only tier-1 run, the next-best tier-1 run wins,
+        not the champion itself (which would result in a same-run comparison and
+        suppress iso_calibration tiebreakers like BEC-50).
+        """
+        cfg = {"evaluation": {"primary_threshold": 0.60}}
+        champion = _make_run(
+            "champion",
+            metrics={"val_stability_score": 0.70, "val_precision_up": 0.70},
+            params={"val_passed_all_filters": "true"},
+            end_time=200,
+        )
+        other = _make_run(
+            "other",
+            metrics={
+                "val_stability_score": 0.68,
+                "val_precision_up": 0.68,
+                "isotonic_fitted": 1.0,
+            },
+            params={"val_passed_all_filters": "true"},
+            end_time=100,
+        )
+        client = _make_client_with_checkpoints({"champion", "other"})
+        run, ckpt = _find_best_candidate(
+            client,
+            [champion, other],
+            cfg,
+            cluster_id="C",
+            champion_run_id="champion",
+        )
+        assert run is other, "champion should be excluded; other tier-1 run should be selected"
+        assert ckpt == "model.ckpt"
+
+    def test_champion_exclusion_not_applied_in_legacy_mode(self) -> None:
+        """BEC-54: champion_run_id exclusion is skipped in legacy (non-cascading) mode."""
+        cfg = {"primary_metric": "val_acc"}
+        champion = _make_run("champion", end_time=200)
+        other = _make_run("other", end_time=100)
+        client = _make_client_with_checkpoints({"champion", "other"})
+        # Even passing champion_run_id, legacy mode ignores it and returns first-with-ckpt
+        run, ckpt = _find_best_candidate(
+            client,
+            [champion, other],
+            cfg,
+            cluster_id="C",
+            champion_run_id="champion",
+        )
+        assert run is champion
         assert ckpt == "model.ckpt"
 
 
