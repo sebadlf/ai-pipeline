@@ -62,6 +62,9 @@ class PrecisionEvalResult:
     # Adaptive threshold (effective threshold used, may differ from configured primary)
     effective_threshold: float = 0.65
 
+    # Threshold-aware adjusted min_recall used in Filter 2 (BEC-57)
+    adjusted_min_recall: float = 0.10
+
 
 def collect_val_predictions(
     model: torch.nn.Module,
@@ -412,8 +415,18 @@ def evaluate_model(
         elimination_stage = "failed_stability"
         passed = False
 
-    # Filter 2: Minimum recall
-    if passed and recall_at_primary < eval_config.min_recall:
+    # Filter 2: Minimum recall (threshold-aware)
+    # When the adaptive threshold lowered effective_threshold below primary_threshold,
+    # scale min_recall proportionally so the filter isn't over-restrictive for
+    # compressed-probability models (BEC-57).  The ratio is capped at 1.0 to avoid
+    # accidentally tightening the filter when effective_threshold > primary_threshold.
+    recall_scale = (
+        min(1.0, effective_threshold / eval_config.primary_threshold)
+        if eval_config.primary_threshold > 0
+        else 1.0
+    )
+    adjusted_min_recall = eval_config.min_recall * recall_scale
+    if passed and recall_at_primary < adjusted_min_recall:
         elimination_stage = "failed_recall"
         passed = False
 
@@ -467,6 +480,7 @@ def evaluate_model(
         brier_score=brier_score,
         val_test_precision_gap=val_test_gap,
         effective_threshold=effective_threshold,
+        adjusted_min_recall=adjusted_min_recall,
         elimination_stage=elimination_stage,
         passed_all_filters=passed,
     )
@@ -516,8 +530,9 @@ def log_eval_to_mlflow(
     client.log_metric(run_id, "val_brier_score", result.brier_score)
     client.log_metric(run_id, "val_test_precision_gap", result.val_test_precision_gap)
 
-    # Adaptive threshold
+    # Adaptive threshold and threshold-aware recall floor (BEC-57)
     client.log_metric(run_id, "val_effective_threshold", result.effective_threshold)
+    client.log_metric(run_id, "val_adjusted_min_recall", result.adjusted_min_recall)
 
     # Elimination result (as params, not metrics — for MLflow UI filtering)
     client.log_param(run_id, "val_elimination_stage", result.elimination_stage)

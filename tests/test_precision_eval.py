@@ -479,3 +479,164 @@ class TestPromotionEvalConfig:
         assert cfg.wf_window_size == 42
         assert cfg.stability_penalty == 2.0
         assert cfg.tiebreak_margin == 0.02
+
+
+# --------------------------------------------------------------------------- #
+# Threshold-aware min_recall filter (BEC-57)                                  #
+# --------------------------------------------------------------------------- #
+
+
+class TestThresholdAwareMinRecall:
+    """Verify that the min_recall filter scales proportionally when the adaptive
+    threshold lowers effective_threshold below primary_threshold (BEC-57)."""
+
+    def _make_mock_model(self, prob_up: np.ndarray):
+        """Return a lightweight mock that emits fixed prob_up values."""
+        model = MagicMock()
+        model.eval = MagicMock()
+
+        n = len(prob_up)
+        probs_tensor = torch.zeros(n, 2)
+        probs_tensor[:, 1] = torch.tensor(prob_up, dtype=torch.float32)
+        probs_tensor[:, 0] = 1 - probs_tensor[:, 1]
+        targets_tensor = torch.zeros(n, dtype=torch.long)
+
+        model.predict_proba = MagicMock(return_value=probs_tensor)
+        batch = (torch.zeros(n, 10, 5), targets_tensor)
+        dataloader = [batch]
+        return model, dataloader
+
+    def test_adjusted_min_recall_proportional_to_threshold_ratio(self) -> None:
+        """adjusted_min_recall = min_recall * (effective_threshold / primary_threshold)."""
+        rng = np.random.RandomState(0)
+        # Build compressed-distribution model: only 1% above 0.65, bulk at 0.50-0.60
+        prob_up = np.concatenate([rng.uniform(0.65, 0.70, 1), rng.uniform(0.50, 0.60, 99)])
+        model, dataloader = self._make_mock_model(prob_up)
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,
+            min_signals_per_window=2,
+            wf_window_size=5,
+            wf_step_size=2,
+            max_std_ratio=0.50,
+            stability_penalty=1.0,
+            tiebreak_margin=0.01,
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+        # Adaptive threshold should have fired (only 1% above 0.65)
+        assert result.effective_threshold < 0.65
+        # adjusted_min_recall must be proportionally scaled
+        expected = eval_config.min_recall * (
+            result.effective_threshold / eval_config.primary_threshold
+        )
+        assert result.adjusted_min_recall == pytest.approx(expected)
+
+    def test_adjusted_min_recall_equals_min_recall_at_primary_threshold(self) -> None:
+        """When effective_threshold == primary_threshold, adjusted_min_recall is unchanged."""
+        rng = np.random.RandomState(1)
+        # 20% of samples above 0.65 → adaptive threshold stays at 0.65
+        prob_up = np.concatenate([rng.uniform(0.65, 0.90, 20), rng.uniform(0.30, 0.64, 80)])
+        model, dataloader = self._make_mock_model(prob_up)
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,
+            min_signals_per_window=2,
+            wf_window_size=5,
+            wf_step_size=2,
+            max_std_ratio=0.50,
+            stability_penalty=1.0,
+            tiebreak_margin=0.01,
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+        assert result.effective_threshold == pytest.approx(0.65)
+        assert result.adjusted_min_recall == pytest.approx(0.10)
+
+    def test_lowered_threshold_allows_borderline_recall_to_pass(self) -> None:
+        """BEC-57 scenario: recall=0.08 at effective_threshold=0.50 should pass
+        when adjusted_min_recall = 0.10 * (0.50/0.65) ≈ 0.077."""
+        # 100 samples: 50 above threshold=0.50, of which 4 are true UP (targets=1)
+        # Base rate: 50 positives in dataset → recall = 4/50 = 0.08
+        n = 100
+        n_positive = 50
+        prob_up = np.concatenate(
+            [
+                np.full(50, 0.55),  # signals above 0.50 (below 0.65)
+                np.full(50, 0.40),  # below threshold
+            ]
+        )
+        targets = np.zeros(n, dtype=int)
+        targets[:4] = 1  # 4 true positives out of 50 positives in dataset
+        # Fill remaining positives at positions 60-109 (below threshold)
+        targets[50 : 50 + (n_positive - 4)] = 1
+
+        model = MagicMock()
+        model.eval = MagicMock()
+        probs_tensor = torch.zeros(n, 2)
+        probs_tensor[:, 1] = torch.tensor(prob_up, dtype=torch.float32)
+        probs_tensor[:, 0] = 1 - probs_tensor[:, 1]
+        targets_tensor = torch.tensor(targets, dtype=torch.long)
+        model.predict_proba = MagicMock(return_value=probs_tensor)
+        dataloader = [(torch.zeros(n, 10, 5), targets_tensor)]
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,
+            min_signals_per_window=2,
+            wf_window_size=5,
+            wf_step_size=2,
+            max_std_ratio=0.99,  # permissive stability to isolate recall filter
+            stability_penalty=0.0,
+            tiebreak_margin=0.01,
+            max_val_test_gap=1.0,  # disable generalization filter
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+        # effective_threshold must have been lowered (only ~0% signals at 0.65)
+        assert result.effective_threshold < 0.65
+        # adjusted_min_recall < 0.10 (scaled proportionally)
+        assert result.adjusted_min_recall < 0.10
+        # recall at effective_threshold = 4/50 = 0.08, which should now exceed
+        # the adjusted floor and NOT trigger failed_recall
+        assert result.recall_at_primary == pytest.approx(4 / 50)
+        assert result.elimination_stage != "failed_recall", (
+            f"expected recall filter to pass but got stage={result.elimination_stage}, "
+            f"recall={result.recall_at_primary:.4f}, "
+            f"adjusted_min_recall={result.adjusted_min_recall:.4f}"
+        )
