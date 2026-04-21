@@ -65,6 +65,9 @@ class PrecisionEvalResult:
     # Threshold-aware adjusted min_recall used in Filter 2 (BEC-57)
     adjusted_min_recall: float = 0.10
 
+    # Rank-based recall (top-K or percentile) — robust to calibration shrinkage (BEC-62)
+    rank_recall: float = 0.0
+
 
 def collect_val_predictions(
     model: torch.nn.Module,
@@ -230,6 +233,77 @@ def compute_fp_severity(
     severity = abs(avg_fp - buy_threshold)
 
     return avg_fp, avg_tp, severity
+
+
+def compute_top_k_recall(
+    prob_up: np.ndarray,
+    targets: np.ndarray,
+    k_fraction: float = 0.05,
+) -> float:
+    """Compute recall of UP labels within the top-K predictions by probability.
+
+    Takes the top ``max(1, round(k_fraction * len(prob_up)))`` predictions ranked
+    by descending prob_up and returns what fraction of all true UP labels fall in
+    that set.  This is robust to calibration shrinkage because it uses rank order
+    rather than an absolute probability threshold.
+
+    Args:
+        prob_up: Array of P(UP) per sample.
+        targets: Binary target array (1=UP, 0=NOT_UP).
+        k_fraction: Fraction of samples to include in the top-K set (default 5%).
+
+    Returns:
+        Recall of UP labels within the top-K set.  Returns 0.0 when there are no
+        positive labels.
+    """
+    n = len(prob_up)
+    if n == 0:
+        return 0.0
+    n_positive = int(targets.sum())
+    if n_positive == 0:
+        return 0.0
+
+    k = max(1, round(k_fraction * n))
+    top_k_idx = np.argpartition(prob_up, -k)[-k:]
+    tp_in_top_k = int(targets[top_k_idx].sum())
+    return tp_in_top_k / n_positive
+
+
+def compute_percentile_recall(
+    prob_up: np.ndarray,
+    targets: np.ndarray,
+    percentile: float = 0.90,
+) -> float:
+    """Compute recall of UP labels within predictions above the given percentile.
+
+    Selects predictions whose prob_up exceeds the ``percentile``-th percentile of
+    the probability distribution and returns what fraction of all true UP labels
+    fall in that set.  Robust to calibration shrinkage because the cutoff adapts
+    to the actual distribution.
+
+    Args:
+        prob_up: Array of P(UP) per sample.
+        targets: Binary target array (1=UP, 0=NOT_UP).
+        percentile: Probability percentile cutoff in [0, 1] (default 0.90 = p90).
+
+    Returns:
+        Recall of UP labels above the percentile cutoff.  Returns 0.0 when there
+        are no positive labels or no predictions above the cutoff.
+    """
+    n = len(prob_up)
+    if n == 0:
+        return 0.0
+    n_positive = int(targets.sum())
+    if n_positive == 0:
+        return 0.0
+
+    cutoff = float(np.quantile(prob_up, percentile))
+    above_mask = prob_up > cutoff
+    if not above_mask.any():
+        return 0.0
+
+    tp_above = int((above_mask & (targets == 1)).sum())
+    return tp_above / n_positive
 
 
 def compute_auc_pr(prob_up: np.ndarray, targets: np.ndarray) -> float:
@@ -403,6 +477,20 @@ def evaluate_model(
         else:
             recall_at_primary = 0.0
 
+    # Rank-based recall (BEC-62): compute top-K or percentile recall — robust to
+    # calibration-induced probability shrinkage where absolute-threshold recall
+    # collapses to near-zero regardless of model quality.
+    recall_metric = getattr(eval_config, "recall_metric", "top_k")
+    k_fraction = getattr(eval_config, "recall_top_k_fraction", 0.05)
+    percentile = getattr(eval_config, "recall_percentile", 0.90)
+    if recall_metric == "top_k":
+        rank_recall = compute_top_k_recall(prob_up, targets, k_fraction=k_fraction)
+    elif recall_metric == "percentile":
+        rank_recall = compute_percentile_recall(prob_up, targets, percentile=percentile)
+    else:
+        # "absolute_threshold" — legacy behaviour
+        rank_recall = recall_at_primary
+
     # Cascading elimination
     elimination_stage = "passed"
     passed = True
@@ -415,18 +503,25 @@ def evaluate_model(
         elimination_stage = "failed_stability"
         passed = False
 
-    # Filter 2: Minimum recall (threshold-aware)
-    # When the adaptive threshold lowered effective_threshold below primary_threshold,
-    # scale min_recall proportionally so the filter isn't over-restrictive for
-    # compressed-probability models (BEC-57).  The ratio is capped at 1.0 to avoid
-    # accidentally tightening the filter when effective_threshold > primary_threshold.
-    recall_scale = (
-        min(1.0, effective_threshold / eval_config.primary_threshold)
-        if eval_config.primary_threshold > 0
-        else 1.0
-    )
-    adjusted_min_recall = eval_config.min_recall * recall_scale
-    if passed and recall_at_primary < adjusted_min_recall:
+    # Filter 2: Minimum recall
+    # For "top_k" and "percentile" modes the rank_recall is compared directly against
+    # min_recall — no threshold-scaling needed because these metrics are threshold-free.
+    # For legacy "absolute_threshold" mode we keep the BEC-57 proportional scaling so
+    # that existing behaviour is preserved when recall_metric is not set.
+    if recall_metric == "absolute_threshold":
+        recall_scale = (
+            min(1.0, effective_threshold / eval_config.primary_threshold)
+            if eval_config.primary_threshold > 0
+            else 1.0
+        )
+        adjusted_min_recall = eval_config.min_recall * recall_scale
+        recall_for_filter = recall_at_primary
+    else:
+        # Rank-based metrics are not tied to any threshold, so no scaling applies.
+        adjusted_min_recall = eval_config.min_recall
+        recall_for_filter = rank_recall
+
+    if passed and recall_for_filter < adjusted_min_recall:
         elimination_stage = "failed_recall"
         passed = False
 
@@ -481,6 +576,7 @@ def evaluate_model(
         val_test_precision_gap=val_test_gap,
         effective_threshold=effective_threshold,
         adjusted_min_recall=adjusted_min_recall,
+        rank_recall=rank_recall,
         elimination_stage=elimination_stage,
         passed_all_filters=passed,
     )
@@ -533,6 +629,9 @@ def log_eval_to_mlflow(
     # Adaptive threshold and threshold-aware recall floor (BEC-57)
     client.log_metric(run_id, "val_effective_threshold", result.effective_threshold)
     client.log_metric(run_id, "val_adjusted_min_recall", result.adjusted_min_recall)
+
+    # Rank-based recall metric (BEC-62)
+    client.log_metric(run_id, "val_rank_recall", result.rank_recall)
 
     # Elimination result (as params, not metrics — for MLflow UI filtering)
     client.log_param(run_id, "val_elimination_stage", result.elimination_stage)

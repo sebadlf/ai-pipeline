@@ -12,7 +12,9 @@ from src.evaluation.precision_eval import (
     compute_adaptive_threshold,
     compute_auc_pr,
     compute_fp_severity,
+    compute_percentile_recall,
     compute_precision_at_thresholds,
+    compute_top_k_recall,
     compute_walk_forward_precision,
     evaluate_model,
 )
@@ -523,6 +525,7 @@ class TestThresholdAwareMinRecall:
             max_std_ratio=0.50,
             stability_penalty=1.0,
             tiebreak_margin=0.01,
+            recall_metric="absolute_threshold",  # BEC-57 legacy mode
         )
         sample_dates = np.array(
             [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)],
@@ -561,6 +564,7 @@ class TestThresholdAwareMinRecall:
             max_std_ratio=0.50,
             stability_penalty=1.0,
             tiebreak_margin=0.01,
+            recall_metric="absolute_threshold",  # BEC-57 legacy mode
         )
         sample_dates = np.array(
             [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)],
@@ -615,6 +619,7 @@ class TestThresholdAwareMinRecall:
             stability_penalty=0.0,
             tiebreak_margin=0.01,
             max_val_test_gap=1.0,  # disable generalization filter
+            recall_metric="absolute_threshold",  # BEC-57 legacy mode
         )
         sample_dates = np.array(
             [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)],
@@ -640,3 +645,143 @@ class TestThresholdAwareMinRecall:
             f"recall={result.recall_at_primary:.4f}, "
             f"adjusted_min_recall={result.adjusted_min_recall:.4f}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# compute_top_k_recall and compute_percentile_recall (BEC-62)                 #
+# --------------------------------------------------------------------------- #
+
+
+class TestTopKRecall:
+    def test_basic_top_k_recall(self) -> None:
+        """Top-3 out of 10 predictions; 2 true UPs in top set → recall = 2/3."""
+        prob_up = np.array([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05])
+        targets = np.array([1, 1, 0, 0, 0, 0, 0, 0, 1, 0])  # 3 positives
+        # k = max(1, round(0.30 * 10)) = 3 → top-3 by prob: idx 0,1,2 → targets 1,1,0 → 2 TPs
+        recall = compute_top_k_recall(prob_up, targets, k_fraction=0.30)
+        assert recall == pytest.approx(2 / 3)
+
+    def test_all_positives_in_top_k(self) -> None:
+        """When all UP labels land in the top-K set, recall = 1.0."""
+        prob_up = np.array([0.9, 0.8, 0.1, 0.05])
+        targets = np.array([1, 1, 0, 0])
+        recall = compute_top_k_recall(prob_up, targets, k_fraction=0.50)
+        assert recall == pytest.approx(1.0)
+
+    def test_no_positives_returns_zero(self) -> None:
+        prob_up = np.array([0.9, 0.8, 0.7])
+        targets = np.array([0, 0, 0])
+        assert compute_top_k_recall(prob_up, targets) == 0.0
+
+    def test_empty_arrays_return_zero(self) -> None:
+        assert compute_top_k_recall(np.array([]), np.array([])) == 0.0
+
+    def test_nonzero_when_absolute_recall_is_zero(self) -> None:
+        """Core BEC-62 scenario: absolute-threshold recall=0 but top-K recall > 0.
+
+        Construct a case where all probs are below a hard threshold (e.g. 0.65),
+        making absolute recall = 0.00, but the top-K set contains UP labels,
+        so top-K recall = 0.30.
+        """
+        # 10 samples, all probs compressed to [0.50, 0.60] — never reach 0.65
+        prob_up = np.array([0.60, 0.58, 0.56, 0.54, 0.52, 0.50, 0.50, 0.50, 0.50, 0.50])
+        targets = np.array([1, 1, 1, 0, 0, 0, 0, 0, 0, 0])  # 3 UPs
+
+        # Absolute-threshold recall at 0.65: 0 signals → recall = 0.0
+        _, recall_abs, _ = compute_precision_at_thresholds(prob_up, targets, [0.65])
+        assert recall_abs[0.65] == pytest.approx(0.0)
+
+        # Top-K recall at k=30%: top-3 predictions = [0.60, 0.58, 0.56] → targets [1,1,1]
+        recall_topk = compute_top_k_recall(prob_up, targets, k_fraction=0.30)
+        assert recall_topk == pytest.approx(1.0)  # all 3 UPs are in top-3
+
+    def test_filter_accepts_candidate_with_top_k_recall_above_min(self) -> None:
+        """BEC-62 acceptance criterion: top-K recall > min_recall allows promotion
+        even when absolute-threshold recall is 0.00."""
+        n = 100
+        # All probs below the minimum adaptive threshold (0.50) so that
+        # absolute-threshold recall is definitively 0.00 regardless of adaptive search.
+        rng = np.random.RandomState(42)
+        prob_up = rng.uniform(0.40, 0.49, n)
+        # 10 UPs all in the top-10% by probability
+        sorted_idx = np.argsort(prob_up)[::-1]
+        targets = np.zeros(n, dtype=int)
+        targets[sorted_idx[:10]] = 1  # top-10 predictions are true UPs
+
+        model = MagicMock()
+        model.eval = MagicMock()
+        probs_tensor = torch.zeros(n, 2)
+        probs_tensor[:, 1] = torch.tensor(prob_up, dtype=torch.float32)
+        probs_tensor[:, 0] = 1 - probs_tensor[:, 1]
+        targets_tensor = torch.tensor(targets, dtype=torch.long)
+        model.predict_proba = MagicMock(return_value=probs_tensor)
+        dataloader = [(torch.zeros(n, 10, 5), targets_tensor)]
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,  # 10% recall floor
+            min_signals_per_window=2,
+            wf_window_size=5,
+            wf_step_size=2,
+            max_std_ratio=0.99,  # permissive to isolate recall filter
+            stability_penalty=0.0,
+            tiebreak_margin=0.01,
+            max_val_test_gap=1.0,  # disable generalization filter
+            recall_metric="top_k",
+            recall_top_k_fraction=0.10,  # top-10% = 10 predictions = 10 UPs → recall=1.0
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+
+        # Absolute recall at 0.65 must be 0
+        assert result.recall_at_primary == pytest.approx(0.0)
+        # rank_recall (top-K) must be high
+        assert result.rank_recall > 0.10
+        # Filter 2 must NOT trigger failed_recall
+        assert result.elimination_stage != "failed_recall", (
+            f"Top-K recall={result.rank_recall:.3f} should have cleared the filter "
+            f"but elimination_stage={result.elimination_stage}"
+        )
+
+
+class TestPercentileRecall:
+    def test_basic_percentile_recall(self) -> None:
+        """Predictions above p80 contain 2 out of 3 UPs → recall ≈ 0.67."""
+        prob_up = np.array([0.9, 0.8, 0.7, 0.6, 0.5])
+        targets = np.array([1, 1, 0, 1, 0])  # 3 UPs
+        # p80 cutoff: np.quantile([0.5,0.6,0.7,0.8,0.9], 0.8) = 0.82
+        # above 0.82: only 0.9 → 1 TP → recall = 1/3
+        recall = compute_percentile_recall(prob_up, targets, percentile=0.80)
+        assert recall == pytest.approx(1 / 3)
+
+    def test_no_positives_returns_zero(self) -> None:
+        prob_up = np.array([0.9, 0.8, 0.7])
+        targets = np.array([0, 0, 0])
+        assert compute_percentile_recall(prob_up, targets) == 0.0
+
+    def test_empty_arrays_return_zero(self) -> None:
+        assert compute_percentile_recall(np.array([]), np.array([])) == 0.0
+
+    def test_nonzero_when_absolute_recall_is_zero(self) -> None:
+        """Percentile recall > 0 even when all probs are below hard threshold."""
+        prob_up = np.array([0.60, 0.58, 0.56, 0.54, 0.52, 0.50, 0.50, 0.50, 0.50, 0.50])
+        targets = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0])  # 2 UPs
+
+        # Absolute recall at 0.65: 0.0
+        _, recall_abs, _ = compute_precision_at_thresholds(prob_up, targets, [0.65])
+        assert recall_abs[0.65] == pytest.approx(0.0)
+
+        # Percentile recall at p80: should be > 0 because the UPs have highest probs
+        recall_pct = compute_percentile_recall(prob_up, targets, percentile=0.80)
+        assert recall_pct > 0.0
