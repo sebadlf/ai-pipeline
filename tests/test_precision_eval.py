@@ -774,6 +774,189 @@ class TestTopKRecall:
         )
 
 
+class TestDualThresholdScoring:
+    """BEC-67: evaluate_model picks the threshold with the better stability-weighted score.
+
+    Acceptance criterion: candidate with recall=0.01 @ 0.65 but recall=0.18 @ 0.55
+    is promoted via the dual-threshold path.
+    """
+
+    def _make_mock_model(self, prob_up: np.ndarray, targets: np.ndarray):
+        """Return a lightweight mock that emits fixed prob_up/targets values."""
+        model = MagicMock()
+        model.eval = MagicMock()
+
+        n = len(prob_up)
+        probs_tensor = torch.zeros(n, 2)
+        probs_tensor[:, 1] = torch.tensor(prob_up, dtype=torch.float32)
+        probs_tensor[:, 0] = 1 - probs_tensor[:, 1]
+        targets_tensor = torch.tensor(targets, dtype=torch.long)
+
+        model.predict_proba = MagicMock(return_value=probs_tensor)
+        batch = (torch.zeros(n, 10, 5), targets_tensor)
+        dataloader = [batch]
+        return model, dataloader
+
+    def test_dual_threshold_promotes_via_adaptive_path(self) -> None:
+        """Candidate with recall=~0.01 @ 0.65 and recall>=0.18 @ 0.55 must be promoted.
+
+        This is the BEC-67 acceptance criterion: the dual-threshold path picks 0.55
+        because it yields a better stability-weighted score.
+        """
+        rng = np.random.RandomState(99)
+        n = 200
+
+        # Construct: ~1% signals above 0.65 (tiny recall), ~18%+ signals in [0.55, 0.65)
+        # Place 2 true UPs above 0.65 and 36 true UPs in [0.55, 0.65)
+        n_above = 2  # signals above 0.65 → recall≈0.01 at 0.65
+        n_mid = 38  # signals in [0.55, 0.65)
+        n_below = n - n_above - n_mid  # rest below 0.55
+
+        prob_above = rng.uniform(0.65, 0.80, n_above)
+        prob_mid = rng.uniform(0.55, 0.649, n_mid)
+        prob_below = rng.uniform(0.30, 0.54, n_below)
+
+        prob_up = np.concatenate([prob_above, prob_mid, prob_below])
+
+        targets = np.zeros(n, dtype=int)
+        targets[:n_above] = 1  # 2 true UPs at high prob
+        targets[n_above : n_above + n_mid] = 1  # 38 true UPs in mid range
+
+        # Verify the scenario: recall at 0.65 ≈ 0.01, recall at 0.55 ≈ 0.18+
+        prec_d, rec_d, sig_d = compute_precision_at_thresholds(prob_up, targets, [0.55, 0.65])
+        assert rec_d[0.65] <= 0.05, f"Setup error: recall at 0.65 should be tiny, got {rec_d[0.65]}"
+        assert rec_d[0.55] >= 0.15, (
+            f"Setup error: recall at 0.55 should be >=0.15, got {rec_d[0.55]}"
+        )
+
+        model, dataloader = self._make_mock_model(prob_up, targets)
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.10,
+            min_signals_per_window=2,
+            wf_window_size=10,
+            wf_step_size=5,
+            max_std_ratio=0.60,  # permissive stability
+            stability_penalty=0.5,
+            tiebreak_margin=0.01,
+            max_val_test_gap=1.0,
+            recall_metric="absolute_threshold",  # use absolute recall so threshold choice matters
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+
+        # The dual-threshold path should have selected a threshold below 0.65
+        assert result.best_threshold_used < 0.65, (
+            f"Expected dual-threshold path to pick threshold < 0.65, "
+            f"got best_threshold_used={result.best_threshold_used}"
+        )
+        # Both per-threshold recalls must be logged;
+        # recall at 0.65 is tiny (2 TPs out of 40 positives = 0.05)
+        assert result.recall_at_primary_threshold <= 0.05
+        assert result.recall_at_adaptive_threshold >= 0.15
+        # Model should not be eliminated for recall at the chosen threshold
+        assert result.elimination_stage != "failed_recall", (
+            f"Expected model to pass recall filter via dual-threshold, "
+            f"got stage={result.elimination_stage}"
+        )
+
+    def test_dual_threshold_stays_at_primary_when_primary_scores_better(self) -> None:
+        """When primary threshold yields better stability score, it is kept."""
+        rng = np.random.RandomState(7)
+        n = 100
+        # 20% of samples above 0.65 with high precision → primary threshold is clearly best
+        prob_up = np.concatenate([rng.uniform(0.65, 0.90, 20), rng.uniform(0.30, 0.64, 80)])
+        targets = np.zeros(n, dtype=int)
+        targets[:18] = 1  # 18 TPs out of 20 signals at 0.65 → precision 0.90
+
+        model, dataloader = self._make_mock_model(prob_up, targets)
+
+        eval_config = PromotionEvalConfig(
+            thresholds=[0.50, 0.55, 0.60, 0.65],
+            primary_threshold=0.65,
+            min_recall=0.05,
+            min_signals_per_window=2,
+            wf_window_size=10,
+            wf_step_size=5,
+            max_std_ratio=0.60,
+            stability_penalty=0.5,
+            tiebreak_margin=0.01,
+            max_val_test_gap=1.0,
+            recall_metric="absolute_threshold",
+        )
+        sample_dates = np.array(
+            [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)],
+            dtype="datetime64[D]",
+        )
+
+        result = evaluate_model(
+            model=model,
+            val_dataloader=dataloader,
+            eval_config=eval_config,
+            sample_dates=sample_dates,
+            adaptive_threshold=True,
+        )
+
+        # Signal rate at 0.65 is 20% — well above 5% — so adaptive threshold = primary
+        assert result.effective_threshold == pytest.approx(0.65)
+        assert result.best_threshold_used == pytest.approx(0.65)
+
+    def test_mlflow_logging_includes_dual_threshold_fields(self) -> None:
+        """log_eval_to_mlflow logs val_recall_primary, val_recall_adaptive, best_threshold."""
+        from src.evaluation.precision_eval import PrecisionEvalResult, log_eval_to_mlflow
+
+        result = PrecisionEvalResult(
+            precision_at_threshold={0.50: 0.6, 0.65: 0.3},
+            recall_at_threshold={0.50: 0.4, 0.65: 0.01},
+            signal_count_at_threshold={0.50: 40, 0.65: 2},
+            auc_pr=0.55,
+            wf_precision_per_window=[0.6, 0.5],
+            wf_precision_mean=0.55,
+            wf_precision_std=0.05,
+            stability_score=0.48,
+            avg_fp_return=-0.01,
+            avg_tp_return=0.03,
+            fp_severity=0.035,
+            recall_at_primary=0.18,
+            signal_count_at_primary=18,
+            coverage_ratio=0.8,
+            brier_score=0.22,
+            val_test_precision_gap=0.05,
+            effective_threshold=0.55,
+            adjusted_min_recall=0.085,
+            rank_recall=0.20,
+            elimination_stage="passed",
+            passed_all_filters=True,
+            recall_at_primary_threshold=0.01,
+            recall_at_adaptive_threshold=0.18,
+            best_threshold_used=0.55,
+        )
+
+        client = MagicMock()
+        run_id = "test-run-123"
+        log_eval_to_mlflow(result, client, run_id)
+
+        logged_metrics = {call[0][1]: call[0][2] for call in client.log_metric.call_args_list}
+        assert "val_recall_primary" in logged_metrics
+        assert "val_recall_adaptive" in logged_metrics
+        assert "val_best_threshold_used" in logged_metrics
+        assert logged_metrics["val_recall_primary"] == pytest.approx(0.01)
+        assert logged_metrics["val_recall_adaptive"] == pytest.approx(0.18)
+        assert logged_metrics["val_best_threshold_used"] == pytest.approx(0.55)
+
+
 class TestPercentileRecall:
     def test_basic_percentile_recall(self) -> None:
         """Predictions above p80 contain 2 out of 3 UPs → recall ≈ 0.67."""
