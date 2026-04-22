@@ -1,7 +1,7 @@
 """Tests for promotion score comparison logic."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import mlflow.exceptions
 import pytest
@@ -12,6 +12,8 @@ from src.evaluation.promote import (
     build_score_tuple,
     candidate_beats_champion,
     cascading_compare,
+    check_promotion_regression_guard,
+    promote_cluster_model,
 )
 
 # --------------------------------------------------------------------------- #
@@ -854,3 +856,216 @@ class TestCountRegisteredChampions:
         client.get_model_version_by_alias.side_effect = mlflow.exceptions.MlflowException("missing")
         registered = _count_registered_champions(client, ["A", "B"])
         assert registered == []
+
+
+# --------------------------------------------------------------------------- #
+# BEC-68: Regression guard blocks champion promotion                           #
+# --------------------------------------------------------------------------- #
+
+
+def _make_guard_result(block: bool, skipped: bool = False):
+    """Build a minimal RegressionGuardResult stub."""
+    from src.evaluation.backtest import RegressionFlag, RegressionGuardResult
+
+    if skipped:
+        return RegressionGuardResult(skipped=True, block_promotion=False)
+    if block:
+        flag = RegressionFlag(
+            profile="moderate",
+            regime="sideways",
+            previous_sharpe=1.0,
+            current_sharpe=0.5,
+            drop_pct=0.5,
+        )
+        return RegressionGuardResult(flags=[flag], skipped=False, block_promotion=True)
+    return RegressionGuardResult(flags=[], skipped=False, block_promotion=False)
+
+
+class TestCheckPromotionRegressionGuard:
+    def test_returns_false_when_guard_skipped(self) -> None:
+        """When the guard has no prior cycle to compare, promotion is allowed."""
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            return_value=_make_guard_result(block=False, skipped=True),
+        ):
+            blocked = check_promotion_regression_guard()
+        assert blocked is False
+
+    def test_returns_false_when_no_regression(self) -> None:
+        """No regression detected → promotion is allowed."""
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            return_value=_make_guard_result(block=False),
+        ):
+            blocked = check_promotion_regression_guard()
+        assert blocked is False
+
+    def test_returns_true_when_regression_detected(self) -> None:
+        """Regression detected → block_promotion=True → function returns True."""
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            return_value=_make_guard_result(block=True),
+        ):
+            blocked = check_promotion_regression_guard()
+        assert blocked is True
+
+    def test_on_blocked_callback_called_with_description(self) -> None:
+        """When blocked, the on_blocked callback is invoked with a non-empty description."""
+        callback = MagicMock()
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            return_value=_make_guard_result(block=True),
+        ):
+            check_promotion_regression_guard(on_blocked=callback)
+        callback.assert_called_once()
+        description = callback.call_args[0][0]
+        assert "regression" in description.lower() or "sharpe" in description.lower()
+        assert len(description) > 20
+
+    def test_on_blocked_not_called_when_not_blocked(self) -> None:
+        """Callback is NOT invoked when the guard passes."""
+        callback = MagicMock()
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            return_value=_make_guard_result(block=False),
+        ):
+            check_promotion_regression_guard(on_blocked=callback)
+        callback.assert_not_called()
+
+    def test_db_failure_defaults_to_allow(self) -> None:
+        """When the guard query fails (e.g., no DB), promotion is allowed (fail-open)."""
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            side_effect=RuntimeError("DB down"),
+        ):
+            blocked = check_promotion_regression_guard()
+        assert blocked is False
+
+    def test_callback_exception_does_not_propagate(self) -> None:
+        """A raising callback must not abort the guard call (non-critical notification)."""
+
+        def bad_callback(desc: str) -> None:
+            raise RuntimeError("Linear MCP unavailable")
+
+        with patch(
+            "src.evaluation.promote.query_latest_regression_guard",
+            return_value=_make_guard_result(block=True),
+        ):
+            # Should not raise
+            blocked = check_promotion_regression_guard(on_blocked=bad_callback)
+        assert blocked is True
+
+
+class TestPromoteClusterModelRegressionGuard:
+    """BEC-68: promote_cluster_model skips registration when regression guard fires."""
+
+    def _make_mlflow_client_for_promotion(self):
+        """Build a minimal MLflow client stub that would normally allow promotion."""
+        client = MagicMock()
+
+        # No existing champion
+        client.get_model_version_by_alias.side_effect = mlflow.exceptions.MlflowException(
+            "no champion"
+        )
+
+        # One run with a checkpoint
+        run = SimpleNamespace(
+            info=SimpleNamespace(run_id="run123", end_time=1000, start_time=900),
+            data=SimpleNamespace(
+                metrics={"val_stability_score": 0.70, "val_passed_all_filters": "true"},
+                params={},
+                tags={},
+            ),
+        )
+        client.search_runs.return_value = [run]
+
+        def list_artifacts(run_id, path=None):
+            if path is None:
+                return [SimpleNamespace(path="model.ckpt", is_dir=False)]
+            return []
+
+        client.list_artifacts.side_effect = list_artifacts
+        client.set_tag.return_value = None
+
+        return client
+
+    def test_registration_blocked_when_guard_fires(self) -> None:
+        """promote_cluster_model returns False and skips create_model_version when blocked."""
+        client = self._make_mlflow_client_for_promotion()
+        promotion_cfg = {
+            "evaluation": {
+                "thresholds": [0.60],
+                "primary_threshold": 0.60,
+                "min_recall": 0.10,
+                "min_signals_per_window": 5,
+            },
+            "walk_forward": {"window_size": 63, "step_size": 21, "max_std_ratio": 0.25},
+            "ranking": {"tiebreak_margin": 0.01},
+        }
+
+        with patch(
+            "src.evaluation.promote.check_promotion_regression_guard",
+            return_value=True,
+        ):
+            result = promote_cluster_model(client, "cluster_A", promotion_cfg)
+
+        assert result is False
+        client.create_model_version.assert_not_called()
+
+    def test_registration_proceeds_when_guard_passes(self) -> None:
+        """promote_cluster_model calls create_model_version when guard passes."""
+        client = self._make_mlflow_client_for_promotion()
+        mv_stub = SimpleNamespace(version="1")
+        client.create_model_version.return_value = mv_stub
+        promotion_cfg = {
+            "evaluation": {
+                "thresholds": [0.60],
+                "primary_threshold": 0.60,
+                "min_recall": 0.10,
+                "min_signals_per_window": 5,
+            },
+            "walk_forward": {"window_size": 63, "step_size": 21, "max_std_ratio": 0.25},
+            "ranking": {"tiebreak_margin": 0.01},
+        }
+
+        with patch(
+            "src.evaluation.promote.check_promotion_regression_guard",
+            return_value=False,
+        ):
+            result = promote_cluster_model(client, "cluster_A", promotion_cfg)
+
+        assert result is True
+        client.create_model_version.assert_called_once()
+
+    def test_on_regression_blocked_callback_forwarded(self) -> None:
+        """The on_regression_blocked kwarg is passed through to check_promotion_regression_guard."""
+        client = self._make_mlflow_client_for_promotion()
+        promotion_cfg = {
+            "evaluation": {
+                "thresholds": [0.60],
+                "primary_threshold": 0.60,
+                "min_recall": 0.10,
+                "min_signals_per_window": 5,
+            },
+            "walk_forward": {"window_size": 63, "step_size": 21, "max_std_ratio": 0.25},
+            "ranking": {"tiebreak_margin": 0.01},
+        }
+        my_callback = MagicMock()
+
+        captured_kwargs: dict = {}
+
+        def fake_guard(on_blocked=None):
+            captured_kwargs["on_blocked"] = on_blocked
+            return False  # don't block so the test flow can proceed
+
+        with patch(
+            "src.evaluation.promote.check_promotion_regression_guard",
+            side_effect=fake_guard,
+        ):
+            mv_stub = SimpleNamespace(version="1")
+            client.create_model_version.return_value = mv_stub
+            promote_cluster_model(
+                client, "cluster_A", promotion_cfg, on_regression_blocked=my_callback
+            )
+
+        assert captured_kwargs["on_blocked"] is my_callback

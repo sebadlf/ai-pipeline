@@ -18,6 +18,7 @@ from src.evaluation.backtest import (
     RegressionGuardResult,
     _sharpe_drop_pct,
     check_regression_guard,
+    query_latest_regression_guard,
     run_portfolio_backtest,
 )
 
@@ -454,3 +455,128 @@ class TestCheckRegressionGuard:
 
     def test_default_threshold_is_30_pct(self) -> None:
         assert DEFAULT_REGRESSION_THRESHOLD == 0.30
+
+    # --- BEC-68: block_promotion signal ---
+
+    def test_block_promotion_true_when_regression_detected(self) -> None:
+        """check_regression_guard sets block_promotion=True when a cell exceeds the threshold."""
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        # 50% drop → exceeds 30% threshold → block_promotion
+        results = _make_results({("moderate", "sideways"): 0.5})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.has_regression is True
+        assert guard.block_promotion is True
+
+    def test_block_promotion_false_when_no_regression(self) -> None:
+        """block_promotion is False when no cell exceeds the threshold."""
+        prior = dt.date(2025, 1, 1)
+        engine = _make_engine_mock(
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        # 20% drop → below 30% threshold → no block
+        results = _make_results({("moderate", "sideways"): 0.85})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.has_regression is False
+        assert guard.block_promotion is False
+
+    def test_block_promotion_false_when_skipped(self) -> None:
+        """block_promotion is False (safe default) when guard is skipped."""
+        engine = _make_engine_mock(prior_date=None, prior_rows=[])
+        results = _make_results({("moderate", "sideways"): 1.2})
+        guard = check_regression_guard(results, engine=engine)
+        assert guard.skipped is True
+        assert guard.block_promotion is False
+
+
+class TestQueryLatestRegressionGuard:
+    """BEC-68: query_latest_regression_guard loads results from DB without in-memory list."""
+
+    def _make_two_cycle_engine(
+        self,
+        latest_date: dt.date,
+        latest_rows: list[tuple],
+        prior_date: dt.date,
+        prior_rows: list[tuple],
+    ) -> MagicMock:
+        """Build a mock engine that returns 3 queries: latest_date, latest rows, prior rows."""
+        engine = MagicMock()
+        conn_ctx = MagicMock()
+        conn = MagicMock()
+        conn_ctx.__enter__ = MagicMock(return_value=conn)
+        conn_ctx.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = conn_ctx
+
+        latest_date_result = MagicMock()
+        latest_date_result.fetchone.return_value = (latest_date,)
+
+        latest_rows_result = MagicMock()
+        latest_rows_result.fetchall.return_value = latest_rows
+
+        prior_date_result = MagicMock()
+        prior_date_result.fetchone.return_value = (prior_date,)
+
+        prior_rows_result = MagicMock()
+        prior_rows_result.fetchall.return_value = prior_rows
+
+        conn.execute.side_effect = [
+            latest_date_result,
+            latest_rows_result,
+            prior_date_result,
+            prior_rows_result,
+        ]
+        return engine
+
+    def test_skipped_when_no_runs_in_db(self) -> None:
+        engine = MagicMock()
+        conn_ctx = MagicMock()
+        conn = MagicMock()
+        conn_ctx.__enter__ = MagicMock(return_value=conn)
+        conn_ctx.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = conn_ctx
+
+        empty_result = MagicMock()
+        empty_result.fetchone.return_value = (None,)
+        conn.execute.return_value = empty_result
+
+        guard = query_latest_regression_guard(engine=engine)
+        assert guard.skipped is True
+        assert guard.block_promotion is False
+
+    def test_block_promotion_when_latest_sharpe_drops_50_pct(self) -> None:
+        """query_latest_regression_guard sets block_promotion when latest cycle degraded."""
+        latest = dt.date(2025, 2, 1)
+        prior = dt.date(2025, 1, 1)
+        engine = self._make_two_cycle_engine(
+            latest_date=latest,
+            latest_rows=[("moderate", "sideways", 0.5)],  # current
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],  # previous: 50% drop
+        )
+        guard = query_latest_regression_guard(
+            engine=engine,
+            guard_cells=[("moderate", "sideways")],
+        )
+        assert guard.has_regression is True
+        assert guard.block_promotion is True
+
+    def test_no_block_when_sharpe_stable_across_cycles(self) -> None:
+        """No block_promotion when latest cycle Sharpe is stable vs. prior cycle."""
+        latest = dt.date(2025, 2, 1)
+        prior = dt.date(2025, 1, 1)
+        engine = self._make_two_cycle_engine(
+            latest_date=latest,
+            latest_rows=[("moderate", "sideways", 1.1)],  # slight improvement
+            prior_date=prior,
+            prior_rows=[("moderate", "sideways", 1.0)],
+        )
+        guard = query_latest_regression_guard(
+            engine=engine,
+            guard_cells=[("moderate", "sideways")],
+        )
+        assert guard.has_regression is False
+        assert guard.block_promotion is False

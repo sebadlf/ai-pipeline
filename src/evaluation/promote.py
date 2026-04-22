@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import mlflow
@@ -23,11 +24,74 @@ import polars as pl
 from mlflow.tracking import MlflowClient
 
 from src.config import ClusterConfig, PromotionEvalConfig, load_config
+from src.evaluation.backtest import query_latest_regression_guard
 from src.keys import MLFLOW_TRACKING_URI
 
 logger = logging.getLogger(__name__)
 
 MODEL_NAME_PREFIX = "trading-forecaster"
+
+
+# --------------------------------------------------------------------------- #
+# Regression guard hook                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def check_promotion_regression_guard(
+    on_blocked: Callable[[str], None] | None = None,
+) -> bool:
+    """Query the backtest regression guard and block promotion when triggered.
+
+    Reads the latest backtest results via ``check_regression_guard``. When
+    ``block_promotion=True`` the function logs an error and, if provided, calls
+    *on_blocked* with a human-readable description so callers can file a Linear
+    issue or take other remedial action.
+
+    Args:
+        on_blocked: Optional callable invoked with a description string when the
+            guard fires. Designed for injecting the Linear MCP call from the
+            pipeline coordinator without coupling library code to MCP tooling.
+
+    Returns:
+        True when promotion should be blocked, False otherwise.
+    """
+    try:
+        guard = query_latest_regression_guard()
+    except Exception as exc:  # noqa: BLE001
+        # If we can't query the guard (e.g., no DB connection during unit tests),
+        # default to allow so we don't accidentally break cold-start runs.
+        logger.warning("Regression guard query failed — defaulting to allow promotion: %s", exc)
+        return False
+
+    if guard.skipped or not guard.block_promotion:
+        return False
+
+    flag_lines = "\n".join(
+        f"  {f.profile}/{f.regime}: Sharpe {f.previous_sharpe:.3f} → "
+        f"{f.current_sharpe:.3f} ({f.drop_pct:+.1%} drop)"
+        for f in guard.flags
+    )
+    description = (
+        f"Regression guard blocked champion promotion on {guard.previous_run_date}.\n"
+        f"The following (profile, regime) cells exceeded the 30% Sharpe drop threshold:\n"
+        f"{flag_lines}\n\n"
+        f"Resolve the regression before re-running promotion."
+    )
+
+    logger.error(
+        "[REGRESSION GUARD] Promotion blocked — %d cell(s) degraded vs. %s:\n%s",
+        len(guard.flags),
+        guard.previous_run_date,
+        flag_lines,
+    )
+
+    if on_blocked is not None:
+        try:
+            on_blocked(description)
+        except Exception as exc:  # noqa: BLE001 — non-critical notification
+            logger.warning("on_blocked callback raised: %s", exc)
+
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -446,6 +510,8 @@ def promote_cluster_model(
     cluster_id: str,
     promotion_cfg: dict,
     prefix: str = "cluster",
+    *,
+    on_regression_blocked: Callable[[str], None] | None = None,
 ) -> bool:
     """Evaluate and conditionally promote the best model for a cluster.
 
@@ -454,6 +520,9 @@ def promote_cluster_model(
         cluster_id: Cluster identifier.
         promotion_cfg: Promotion config section from default.yaml.
         prefix: Experiment name prefix.
+        on_regression_blocked: Optional callback invoked with a description when
+            the regression guard fires. Allows the pipeline coordinator to file
+            a Linear issue without coupling library code to MCP tooling.
 
     Returns:
         True if a model was promoted, False otherwise.
@@ -552,6 +621,18 @@ def promote_cluster_model(
                     exc,
                 )
         print(f"    SKIP: {reason}")
+        return False
+
+    # --- BEC-68: Pre-registration regression guard ---
+    # Query the backtest regression guard; refuse to register when block_promotion=True.
+    # This prevents a Sharpe-degraded champion from polluting the registry.
+    # Guard is intentionally called once per promote_cluster_model invocation so
+    # that ALL clusters in the same promotion run share the same decision.
+    if check_promotion_regression_guard(on_blocked=on_regression_blocked):
+        print(
+            f"    BLOCKED [{cluster_id}]: regression guard fired — "
+            f"champion registration refused. See logs for details."
+        )
         return False
 
     # Register and set champion alias
