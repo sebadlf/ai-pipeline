@@ -39,3 +39,6 @@ build/
 
 # Obsidian local workspace config (not vault content)
 ai-pipeline-vault/.obsidian/
+
+# Claude Code runtime session lockfile
+.claude/scheduled_tasks.lock

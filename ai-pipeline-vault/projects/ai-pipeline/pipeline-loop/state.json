@@ -1,0 +1,8 @@
+{
+  "cycle_number": 7,
+  "consecutive_abandons": 0,
+  "consecutive_insufficient_evidence": 0,
+  "abandoned_issue_ids": [],
+  "pipeline_run_completed_at": null,
+  "last_cleanup_at": null
+}

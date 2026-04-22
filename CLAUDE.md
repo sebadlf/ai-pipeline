@@ -197,6 +197,20 @@ ai-pipeline/
 | `portfolio_allocations` | Stage 5 output: optimized weights per profile |
 | `backtest_results` | Stage 6 output: metrics per (profile, regime) |
 
+### Schema changes — migrate the live DB
+
+`src/db.py` declares the SQLAlchemy schema but the pipeline does **not** auto-migrate the live Postgres table. If you add/remove/rename columns in `db.py`, you must apply the matching `ALTER TABLE` to the running database or the next pipeline run will crash with `psycopg.errors.UndefinedColumn` (see BEC-49 → cycle-7 incident).
+
+Workflow for schema changes:
+1. Edit `src/db.py` with the new column definition.
+2. Apply the migration to the live DB, e.g.:
+   ```bash
+   docker exec trading-postgres psql -U trading -d trading \
+     -c "ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <col> <type>;"
+   ```
+3. For fresh dev databases, `metadata.create_all()` in `src/db.py` will create the full schema — but it won't add columns to an existing table.
+4. Include the `ALTER TABLE` in the PR description so reviewers can reproduce the migration.
+
 ## Key connections
 
 - Ingestion writes to Postgres via SQLAlchemy (OHLCV + adj close, treasury 12 tenors, VIX, key metrics, financial ratios, sector performance, GICS sectors)
