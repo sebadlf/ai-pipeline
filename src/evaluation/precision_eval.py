@@ -68,6 +68,12 @@ class PrecisionEvalResult:
     # Rank-based recall (top-K or percentile) — robust to calibration shrinkage (BEC-62)
     rank_recall: float = 0.0
 
+    # Dual-threshold scoring (BEC-67): recall at primary and adaptive thresholds,
+    # plus which threshold was ultimately chosen for stability-weighted scoring.
+    recall_at_primary_threshold: float = 0.0
+    recall_at_adaptive_threshold: float = 0.0
+    best_threshold_used: float = 0.65
+
 
 def collect_val_predictions(
     model: torch.nn.Module,
@@ -413,13 +419,13 @@ def evaluate_model(
     # probability distributions produce near-zero recall at the nominal primary threshold,
     # causing false "failed_recall" eliminations even for well-calibrated models.
     _adaptive_min_signal_pct = 0.05
-    effective_threshold = eval_config.primary_threshold
+    adaptive_threshold_value = eval_config.primary_threshold  # may be overridden below
     if adaptive_threshold:
         n_samples = len(prob_up)
         signals_at_base = int((prob_up >= eval_config.primary_threshold).sum())
         signal_pct_at_base = signals_at_base / n_samples if n_samples > 0 else 0.0
         if signal_pct_at_base < _adaptive_min_signal_pct:
-            effective_threshold = compute_adaptive_threshold(
+            adaptive_threshold_value = compute_adaptive_threshold(
                 prob_up,
                 targets,
                 base_threshold=eval_config.primary_threshold,
@@ -436,19 +442,88 @@ def evaluate_model(
     # AUC-PR
     auc_pr = compute_auc_pr(prob_up, targets)
 
-    # Walk-forward stability at effective threshold (adapted or base)
-    wf_precisions, wf_mean, wf_std, wf_total_windows = compute_walk_forward_precision(
-        prob_up,
-        targets,
-        sample_dates,
-        threshold=effective_threshold,
-        window_size=eval_config.wf_window_size,
-        step_size=eval_config.wf_step_size,
-        min_signals=eval_config.min_signals_per_window,
-    )
+    # -----------------------------------------------------------------------
+    # Dual-threshold scoring (BEC-67): evaluate at BOTH the primary threshold
+    # and the adaptive threshold, then pick the one with the better
+    # stability-weighted score.  When adaptive_threshold=False or when both
+    # thresholds are identical, only one evaluation is needed.
+    # -----------------------------------------------------------------------
 
-    # Coverage ratio: fraction of windows with enough signals
-    coverage_ratio = len(wf_precisions) / wf_total_windows if wf_total_windows > 0 else 0.0
+    def _eval_at_threshold(t: float) -> tuple[list[float], float, float, int, float, float]:
+        """Return (wf_precisions, wf_mean, wf_std, wf_total, recall, n_signals) for threshold t."""
+        prec_list, wf_m, wf_s, wf_tot = compute_walk_forward_precision(
+            prob_up,
+            targets,
+            sample_dates,
+            threshold=t,
+            window_size=eval_config.wf_window_size,
+            step_size=eval_config.wf_step_size,
+            min_signals=eval_config.min_signals_per_window,
+        )
+        r = recall_dict.get(t, 0.0)
+        n_sig = signal_dict.get(t, 0)
+        if t not in recall_dict:
+            predicted_up = prob_up >= t
+            n_predicted = int(predicted_up.sum())
+            n_sig = n_predicted
+            n_positive = int(targets.sum())
+            if n_predicted > 0 and n_positive > 0:
+                tp = int((predicted_up & (targets == 1)).sum())
+                r = tp / n_positive
+            else:
+                r = 0.0
+        return prec_list, wf_m, wf_s, wf_tot, r, n_sig
+
+    def _stability_score_for(wf_mean: float, wf_std: float, coverage: float) -> float:
+        score = wf_mean - eval_config.stability_penalty * wf_std
+        if coverage < 1.0:
+            score *= coverage
+        return score
+
+    # Evaluate primary threshold
+    pri_precs, pri_mean, pri_std, pri_tot, recall_at_pri_t, sigs_at_pri_t = _eval_at_threshold(
+        eval_config.primary_threshold
+    )
+    pri_coverage = len(pri_precs) / pri_tot if pri_tot > 0 else 0.0
+    pri_score = _stability_score_for(pri_mean, pri_std, pri_coverage)
+
+    # Evaluate adaptive threshold (may equal primary if no adaptation needed)
+    same_threshold = adaptive_threshold_value == eval_config.primary_threshold
+    if same_threshold:
+        adp_precs, adp_mean, adp_std, adp_tot = pri_precs, pri_mean, pri_std, pri_tot
+        recall_at_adp_t, sigs_at_adp_t = recall_at_pri_t, sigs_at_pri_t
+        adp_coverage = pri_coverage
+        adp_score = pri_score
+    else:
+        adp_precs, adp_mean, adp_std, adp_tot, recall_at_adp_t, sigs_at_adp_t = _eval_at_threshold(
+            adaptive_threshold_value
+        )
+        adp_coverage = len(adp_precs) / adp_tot if adp_tot > 0 else 0.0
+        adp_score = _stability_score_for(adp_mean, adp_std, adp_coverage)
+
+    # Pick the threshold with the better stability-weighted score.
+    # When the adaptive threshold was actually triggered (different from primary), prefer
+    # it on a tie (>=) — this preserves the BEC-51 spirit that the adapted threshold is
+    # the model's actual operating point when the primary threshold has too few signals.
+    use_adaptive = (
+        not same_threshold and adp_score >= pri_score
+    ) or (same_threshold and adp_score > pri_score)
+    if use_adaptive:
+        effective_threshold = adaptive_threshold_value
+        wf_precisions = adp_precs
+        wf_mean = adp_mean
+        wf_std = adp_std
+        recall_at_primary = recall_at_adp_t
+        signals_at_primary = sigs_at_adp_t
+        coverage_ratio = adp_coverage
+    else:
+        effective_threshold = eval_config.primary_threshold
+        wf_precisions = pri_precs
+        wf_mean = pri_mean
+        wf_std = pri_std
+        recall_at_primary = recall_at_pri_t
+        signals_at_primary = sigs_at_pri_t
+        coverage_ratio = pri_coverage
 
     # Brier score: calibration quality
     brier_score = float(np.mean((prob_up - targets.astype(np.float64)) ** 2))
@@ -461,21 +536,6 @@ def evaluate_model(
         threshold=effective_threshold,
         buy_threshold=buy_threshold,
     )
-
-    # Effective threshold metrics (uses adaptive threshold if active)
-    recall_at_primary = recall_dict.get(effective_threshold, 0.0)
-    signals_at_primary = signal_dict.get(effective_threshold, 0)
-    # If effective_threshold is not in the swept thresholds, compute directly
-    if effective_threshold not in recall_dict:
-        predicted_up = prob_up >= effective_threshold
-        n_predicted = int(predicted_up.sum())
-        signals_at_primary = n_predicted
-        n_positive = int(targets.sum())
-        if n_predicted > 0 and n_positive > 0:
-            tp = int((predicted_up & (targets == 1)).sum())
-            recall_at_primary = tp / n_positive
-        else:
-            recall_at_primary = 0.0
 
     # Rank-based recall (BEC-62): compute top-K or percentile recall — robust to
     # calibration-induced probability shrinkage where absolute-threshold recall
@@ -579,6 +639,10 @@ def evaluate_model(
         rank_recall=rank_recall,
         elimination_stage=elimination_stage,
         passed_all_filters=passed,
+        # BEC-67: dual-threshold scoring diagnostics
+        recall_at_primary_threshold=recall_at_pri_t,
+        recall_at_adaptive_threshold=recall_at_adp_t,
+        best_threshold_used=effective_threshold,
     )
 
 
@@ -632,6 +696,11 @@ def log_eval_to_mlflow(
 
     # Rank-based recall metric (BEC-62)
     client.log_metric(run_id, "val_rank_recall", result.rank_recall)
+
+    # Dual-threshold scoring diagnostics (BEC-67)
+    client.log_metric(run_id, "val_recall_primary", result.recall_at_primary_threshold)
+    client.log_metric(run_id, "val_recall_adaptive", result.recall_at_adaptive_threshold)
+    client.log_metric(run_id, "val_best_threshold_used", result.best_threshold_used)
 
     # Elimination result (as params, not metrics — for MLflow UI filtering)
     client.log_param(run_id, "val_elimination_stage", result.elimination_stage)
