@@ -384,10 +384,24 @@ class PromotionEvalConfig:
         eval_cfg = promotion_cfg.get("evaluation", {})
         wf_cfg = promotion_cfg.get("walk_forward", {})
         rank_cfg = promotion_cfg.get("ranking", {})
+
+        # BEC-66: backward-compatibility alias for the pre-BEC-62 config key.
+        # If the old key is present and the new key is absent, migrate silently with
+        # a one-time deprecation warning so existing configs keep working.
+        min_recall_default = 0.10
+        if "min_recall_at_primary_threshold" in eval_cfg and "min_recall" not in eval_cfg:
+            logger.warning(
+                "Config key 'promotion.evaluation.min_recall_at_primary_threshold' is deprecated "
+                "and will be removed in a future release. "
+                "Rename it to 'promotion.evaluation.min_recall' (recall_metric=top_k is now the "
+                "default, making the primary-threshold qualifier obsolete)."
+            )
+            min_recall_default = eval_cfg["min_recall_at_primary_threshold"]
+
         return cls(
             thresholds=eval_cfg.get("thresholds", [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]),
             primary_threshold=eval_cfg.get("primary_threshold", 0.65),
-            min_recall=eval_cfg.get("min_recall", 0.10),
+            min_recall=eval_cfg.get("min_recall", min_recall_default),
             min_signals_per_window=eval_cfg.get("min_signals_per_window", 5),
             max_val_test_gap=eval_cfg.get("max_val_test_gap", 0.20),
             wf_window_size=wf_cfg.get("window_size", 63),
