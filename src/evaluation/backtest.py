@@ -593,11 +593,15 @@ class RegressionGuardResult:
         flags: List of (profile, regime) cells that exceeded the drop threshold.
         skipped: True when there is no previous run to compare against.
         previous_run_date: Date of the baseline run used for comparison.
+        block_promotion: True when the regression is severe enough to refuse
+            champion registration. Set by ``check_regression_guard`` when any
+            watched cell exceeds the drop threshold.
     """
 
     flags: list[RegressionFlag] = field(default_factory=list)
     skipped: bool = False
     previous_run_date: dt.date | None = None
+    block_promotion: bool = False
 
     @property
     def has_regression(self) -> bool:
@@ -631,6 +635,85 @@ def _sharpe_drop_pct(previous: float, current: float) -> float:
         return 0.0
     # Use absolute previous as denominator so direction is consistent.
     return (previous - current) / abs(previous)
+
+
+def query_latest_regression_guard(
+    engine=None,  # type: ignore[assignment]
+    *,
+    threshold: float = DEFAULT_REGRESSION_THRESHOLD,
+    guard_cells: list[tuple[str, str]] | None = None,
+) -> RegressionGuardResult:
+    """Compare the two most recent backtest cycles stored in the DB.
+
+    This variant is designed for callers (e.g., Stage 3 promotion) that do not
+    have the current ``BacktestResult`` objects in memory.  It loads the latest
+    run_date from ``backtest_results`` as the *current* cycle and the run_date
+    before it as the *previous* cycle, then delegates to ``check_regression_guard``.
+
+    Args:
+        engine: SQLAlchemy engine (uses singleton when None).
+        threshold: Fractional drop that triggers a flag (0.30 = 30 %).
+        guard_cells: List of (profile, regime) tuples to watch.
+                     Defaults to ``_GUARD_CELLS``.
+
+    Returns:
+        RegressionGuardResult with any flags populated.
+    """
+    if guard_cells is None:
+        guard_cells = _GUARD_CELLS
+
+    db_engine = engine or get_engine()
+
+    # Find the most recent run_date in the table (this is the "current" cycle).
+    try:
+        with db_engine.connect() as conn:
+            latest_row = conn.execute(
+                text("SELECT MAX(run_date) AS latest_date FROM backtest_results")
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Regression guard (query): could not find latest run_date: %s", exc)
+        return RegressionGuardResult(skipped=True)
+
+    if latest_row is None or latest_row[0] is None:
+        logger.info("Regression guard (query): no backtest runs in DB — skipping.")
+        return RegressionGuardResult(skipped=True)
+
+    latest_date: dt.date = latest_row[0]
+
+    # Load current results from DB for the latest run_date.
+    try:
+        with db_engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT profile, regime, sharpe_ratio
+                    FROM backtest_results
+                    WHERE run_date = :run_date
+                """).bindparams(run_date=latest_date)
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Regression guard (query): could not load latest results: %s", exc)
+        return RegressionGuardResult(skipped=True)
+
+    # Build BacktestResult stubs for the current cycle.
+    current_results: list[BacktestResult] = []
+    for row in rows:
+        r = BacktestResult()
+        r.profile = str(row[0])
+        r.regime = str(row[1])
+        r.sharpe_ratio = float(row[2]) if row[2] is not None else float("nan")
+        current_results.append(r)
+
+    if not current_results:
+        logger.info("Regression guard (query): no rows for latest run_date %s.", latest_date)
+        return RegressionGuardResult(skipped=True)
+
+    return check_regression_guard(
+        current_results,
+        engine=db_engine,
+        threshold=threshold,
+        guard_cells=guard_cells,
+        current_run_date=latest_date,
+    )
 
 
 def check_regression_guard(
@@ -743,10 +826,20 @@ def check_regression_guard(
                 threshold * 100,
             )
 
+    block = bool(flags)
+    if block:
+        logger.warning(
+            "REGRESSION GUARD: block_promotion=True — %d cell(s) exceeded the %.0f%% "
+            "Sharpe drop threshold vs. %s. Champion registration will be refused.",
+            len(flags),
+            threshold * 100,
+            prior_date,
+        )
     return RegressionGuardResult(
         flags=flags,
         skipped=False,
         previous_run_date=prior_date,
+        block_promotion=block,
     )
 
 
