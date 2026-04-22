@@ -1,0 +1,98 @@
+# Pipeline Loop Log
+
+Append-only audit log. One line per event. Written by slash commands under `.claude/commands/pipeline-*.md`.
+
+- `2026-04-20T12:47:28Z` **INFO** pipeline run completed cycle=1
+- `2026-04-20T12:54:08Z` **INFO** analyze cycle=1 verdict=improve suggested=5
+- `2026-04-20T12:57:56Z` **INFO** propose cycle=1 created=5 skipped_dedup=0
+- `2026-04-20T14:26:32Z` **INFO** implement merged BEC-34 pr=5 cycle=1
+- `2026-04-20T14:33:10Z` **INFO** implement merged BEC-35 pr=6 cycle=unknown
+- `2026-04-20T14:33:18Z` **INFO** implement merged BEC-35 pr=6 cycle=1
+- `2026-04-20T14:40:19Z` **INFO** implement merged BEC-36 pr=7 cycle=current
+- `2026-04-20T14:49:44Z` **INFO** implement merged BEC-37 pr=8 cycle=current
+- `2026-04-20T14:59:43Z` **INFO** implement merged BEC-38 pr=9 cycle=1
+- `2026-04-20T16:27:38Z` **INFO** pipeline run completed cycle=2
+- `2026-04-20T16:38:54Z` **INFO** analyze cycle=2 verdict=improve suggested=5
+- `2026-04-20T16:43:19Z` **INFO** propose cycle=2 created=5 skipped_dedup=0
+- `2026-04-20T16:50:00Z` **INFO** implement merged BEC-39 pr=10 cycle=current
+- `2026-04-20T16:59:46Z` **INFO** implement merged BEC-43 pr=11 cycle=2
+- `2026-04-20T17:06:34Z` **INFO** implement merged BEC-42 pr=12 cycle=current
+- `2026-04-20T17:20:37Z` **INFO** implement merged BEC-41 pr=13 cycle=
+- `2026-04-20T17:20:41Z` **INFO** implement merged BEC-41 pr=13 cycle=2
+- `2026-04-20T17:32:58Z` **INFO** implement merged BEC-44 pr=14 cycle=2
+- `2026-04-20T17:43:58Z` **INFO** implement merged BEC-40 pr=15 cycle=2
+- `2026-04-20T20:16:12Z` **INFO** pipeline run completed cycle=3
+- `2026-04-20T20:28:56Z` **INFO** analyze cycle=3 verdict=improve suggested=5 cleanup_recommended=false
+- `2026-04-20T23:12:01Z` **INFO** implement merged BEC-45 pr=16 cycle=3
+- `2026-04-20T23:14:27Z` **INFO** spawn phase=propose cycle=3 model=opus
+- `2026-04-20T23:16:46Z` **INFO** propose cycle=3 created=5 skipped_dedup=0
+- `2026-04-20T23:19:25Z` **INFO** spawn phase=implement cycle=3 model=opus issue=BEC-46 priority=1
+- `2026-04-20T23:25:39Z` **INFO** implement merged BEC-46 pr=17 cycle=3
+- `2026-04-20T23:27:22Z` **INFO** spawn phase=implement cycle=3 model=sonnet issue=BEC-47 priority=2
+- `2026-04-20T23:32:02Z` **INFO** implement merged BEC-47 pr=18 cycle=unknown
+- `2026-04-20T23:34:16Z` **INFO** spawn phase=implement cycle=3 model=sonnet issue=BEC-48 priority=3
+- `2026-04-20T23:38:35Z` **INFO** implement merged BEC-48 pr=19 cycle=current
+- `2026-04-20T23:40:22Z` **INFO** spawn phase=implement cycle=3 model=sonnet issue=BEC-50 priority=4
+- `2026-04-20T23:43:38Z` **INFO** implement merged BEC-50 pr=20 cycle=current
+- `2026-04-20T23:45:15Z` **INFO** spawn phase=implement cycle=3 model=sonnet issue=BEC-49 priority=4
+- `2026-04-20T23:49:42Z` **INFO** implement merged BEC-49 pr=21 cycle=current
+- `2026-04-20T23:51:20Z` **INFO** spawn phase=run cycle=4 model=sonnet
+- `2026-04-21T05:32:20Z` **INFO** pipeline run completed cycle=4 (adopted from run phase agent that stalled)
+- `2026-04-21T05:34:17Z` **INFO** spawn phase=analyze cycle=4 model=opus
+- `2026-04-21T05:41:57Z` **INFO** analyze cycle=4 verdict=improve suggested=5 cleanup_recommended=false
+- `2026-04-21T05:44:16Z` **INFO** spawn phase=propose cycle=4 model=opus
+- `2026-04-21T05:45:24Z` **INFO** propose cycle=4 created=5 skipped_dedup=0
+- `2026-04-21T05:47:34Z` **INFO** spawn phase=implement cycle=4 model=sonnet issue=BEC-51 priority=2
+- `2026-04-21T05:52:58Z` **INFO** implement merged BEC-51 pr=22 cycle=current
+- `2026-04-21T05:55:20Z` **INFO** spawn phase=implement cycle=4 model=sonnet issue=BEC-54 priority=2
+- `2026-04-21T06:01:01Z` **INFO** implement merged BEC-54 pr=23 cycle=N/A
+- `2026-04-21T06:03:20Z` **INFO** spawn phase=implement cycle=4 model=sonnet issue=BEC-52 priority=3
+- `2026-04-21T06:06:51Z` **INFO** implement merged BEC-52 pr=24 cycle=current
+- `2026-04-21T06:09:18Z` **INFO** spawn phase=implement cycle=4 model=sonnet issue=BEC-53 priority=3
+- `2026-04-21T06:12:42Z` **INFO** implement merged BEC-53 pr=25 cycle=current
+- `2026-04-21T06:14:22Z` **INFO** spawn phase=implement cycle=4 model=sonnet issue=BEC-55 priority=3
+- `2026-04-21T06:19:36Z` **INFO** implement merged BEC-55 pr=26 cycle=1
+- `2026-04-21T06:21:23Z` **INFO** spawn phase=run cycle=5 model=sonnet
+- `2026-04-21T06:32:00Z` **INFO** pipeline run started cycle=5, PID=32118, features phase in progress
+- `2026-04-21T12:13:19Z` **INFO** pipeline run completed cycle=5 (total ~5.5h, all cycle-4 fixes exercised)
+- `2026-04-21T12:15:20Z` **INFO** spawn phase=analyze cycle=5 model=opus
+- `2026-04-21T12:23:58Z` **INFO** analyze cycle=5 verdict=improve suggested=5 cleanup_recommended=false
+- `2026-04-21T12:26:27Z` **INFO** spawn phase=propose cycle=5 model=opus
+- `2026-04-21T12:27:55Z` **INFO** propose cycle=5 created=5 skipped_dedup=0
+- `2026-04-21T12:30:01Z` **INFO** spawn phase=implement cycle=5 model=sonnet issue=BEC-56 priority=2
+- `2026-04-21T12:34:35Z` **INFO** implement merged BEC-56 pr=27 cycle=5
+- `2026-04-21T12:36:21Z` **INFO** spawn phase=implement cycle=5 model=sonnet issue=BEC-57 priority=2
+- `2026-04-21T12:40:24Z` **INFO** implement merged BEC-57 pr=28 cycle=6
+- `2026-04-21T12:42:19Z` **INFO** spawn phase=implement cycle=5 model=sonnet issue=BEC-58 priority=3
+- `2026-04-21T12:45:30Z` **INFO** implement merged BEC-58 pr=29 cycle=current
+- `2026-04-21T12:47:21Z` **INFO** spawn phase=implement cycle=5 model=sonnet issue=BEC-59 priority=3
+- `2026-04-21T12:52:27Z` **INFO** implement merged BEC-59 pr=30 cycle=6
+- `2026-04-21T12:54:19Z` **INFO** spawn phase=implement cycle=5 model=sonnet issue=BEC-60 priority=3
+- `2026-04-21T12:57:16Z` **INFO** implement merged BEC-60 pr=31 cycle=unknown
+- `2026-04-21T12:59:25Z` **INFO** spawn phase=run cycle=6 model=sonnet
+- `2026-04-21T18:36:50Z` **INFO** pipeline run completed cycle=6
+- `2026-04-21T18:37:26Z` **INFO** spawn phase=analyze cycle=6 model=opus
+- `2026-04-21T18:43:43Z` **INFO** analyze cycle=6 verdict=improve suggested=5 cleanup_recommended=false
+- `2026-04-21T18:46:21Z` **INFO** spawn phase=propose cycle=6 model=opus
+- `2026-04-21T18:48:16Z` **INFO** propose cycle=6 created=5 skipped_dedup=0
+- `2026-04-21T18:50:26Z` **INFO** spawn phase=implement cycle=6 model=opus issue=BEC-61 priority=1
+- `2026-04-21T18:57:08Z` **INFO** implement merged BEC-61 pr=32 cycle=7
+- `2026-04-21T18:59:22Z` **INFO** spawn phase=implement cycle=6 model=sonnet issue=BEC-62 priority=2
+- `2026-04-21T19:06:11Z` **INFO** implement merged BEC-62 pr=33 cycle=current
+- `2026-04-21T19:08:23Z` **INFO** spawn phase=implement cycle=6 model=sonnet issue=BEC-63 priority=2
+- `2026-04-21T19:14:23Z` **INFO** implement merged BEC-63 pr=34 cycle=current
+- `2026-04-21T19:16:28Z` **INFO** spawn phase=implement cycle=6 model=sonnet issue=BEC-64 priority=2
+- `2026-04-21T19:21:52Z` **INFO** implement merged BEC-64 pr=35 cycle=current
+- `2026-04-21T19:24:23Z` **INFO** spawn phase=implement cycle=6 model=sonnet issue=BEC-65 priority=3
+- `2026-04-21T19:28:33Z` **INFO** implement merged BEC-65 pr=36 cycle=?
+- `2026-04-21T19:30:13Z` **INFO** spawn phase=run cycle=7 model=sonnet
+- `2026-04-22T12:21:39Z` **ERROR** make pipeline failed cycle=7: validate-clusters crash — UndefinedColumn 'silhouette_mean_cluster' in cluster_assignments table (BEC-49 schema added column to db.py but live DB never migrated). Deterministic, not retried.
+- `2026-04-22T12:22:35Z` **ERROR** EXIT reason=pipeline_failed cycle=7 — cluster_assignments missing silhouette columns; needs ALTER TABLE. Loop paused for human.
+- `2026-04-22T16:40:53Z` **INFO** schema migration applied: ALTER cluster_assignments ADD silhouette_mean_cluster, silhouette_std_cluster — cycle 7 unblocked
+- `2026-04-22T19:13:05Z` **INFO** spawn phase=implement cycle=7 model=sonnet issue=BEC-66 priority=2 track=A
+- `2026-04-22T19:16:29Z` **INFO** implement merged BEC-66 pr=37 cycle=7 track=A
+- `2026-04-22T19:16:38Z` **INFO** spawn phase=implement cycle=7 model=sonnet issue=BEC-67 priority=2 track=A
+- `2026-04-22T19:24:06Z` **INFO** implement merged BEC-67 pr=38 cycle=7 track=A
+- `2026-04-22T19:24:21Z` **INFO** spawn phase=implement cycle=7 model=sonnet issue=BEC-68 priority=2 track=A
+- `2026-04-22T19:30:15Z` **INFO** implement merged BEC-68 pr=39 cycle=7 track=A
+- `2026-04-22T19:44:55Z` **INFO** state cleanup: removed stale BEC-67 from abandoned_issue_ids (BEC-67 merged via PR #38); reset-abandon-streak called
