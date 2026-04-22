@@ -505,9 +505,9 @@ def evaluate_model(
     # When the adaptive threshold was actually triggered (different from primary), prefer
     # it on a tie (>=) — this preserves the BEC-51 spirit that the adapted threshold is
     # the model's actual operating point when the primary threshold has too few signals.
-    use_adaptive = (
-        not same_threshold and adp_score >= pri_score
-    ) or (same_threshold and adp_score > pri_score)
+    use_adaptive = (not same_threshold and adp_score >= pri_score) or (
+        same_threshold and adp_score > pri_score
+    )
     if use_adaptive:
         effective_threshold = adaptive_threshold_value
         wf_precisions = adp_precs
