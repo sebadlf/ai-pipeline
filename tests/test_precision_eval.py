@@ -482,6 +482,25 @@ class TestPromotionEvalConfig:
         assert cfg.stability_penalty == 2.0
         assert cfg.tiebreak_margin == 0.02
 
+    def test_from_dict_deprecated_alias_min_recall_at_primary_threshold(self) -> None:
+        """BEC-66: old key maps to min_recall with a deprecation warning."""
+        cfg = PromotionEvalConfig.from_dict(
+            {"evaluation": {"min_recall_at_primary_threshold": 0.15}}
+        )
+        assert cfg.min_recall == 0.15
+
+    def test_from_dict_new_key_wins_over_deprecated_alias(self) -> None:
+        """BEC-66: when both keys present, min_recall takes precedence."""
+        cfg = PromotionEvalConfig.from_dict(
+            {
+                "evaluation": {
+                    "min_recall": 0.12,
+                    "min_recall_at_primary_threshold": 0.30,
+                }
+            }
+        )
+        assert cfg.min_recall == 0.12
+
 
 # --------------------------------------------------------------------------- #
 # Threshold-aware min_recall filter (BEC-57)                                  #
@@ -547,7 +566,7 @@ class TestThresholdAwareMinRecall:
         )
         assert result.adjusted_min_recall == pytest.approx(expected)
 
-    def test_adjusted_min_recall_equals_min_recall_at_primary_threshold(self) -> None:
+    def test_adjusted_min_recall_unchanged_when_no_adaptive_threshold(self) -> None:
         """When effective_threshold == primary_threshold, adjusted_min_recall is unchanged."""
         rng = np.random.RandomState(1)
         # 20% of samples above 0.65 → adaptive threshold stays at 0.65
